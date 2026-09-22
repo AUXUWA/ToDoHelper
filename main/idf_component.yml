@@ -1,0 +1,12 @@
+version: "0.1.2"
+
+dependencies:
+  idf:
+    version: ">=6.1.0"
+  esp32_s31_korvo:
+    path: "../../common_components/esp32_s31_korvo"
+  usb_host_hid: "^1.0.1"
+  esp_mmap_assets: "^2.0.0"
+  espressif/esp_lv_decoder:
+    version: "0.4.0"
+    public: true

@@ -1,0 +1,16 @@
+{
+  "codename": "P1_medium",
+  "ttf_path": "/assets/Lato-Medium.ttf",
+  "bin_path": "/assets\\ui_font_P1_medium.bin",
+  "c_path": "/assets\\ui_font_P1_medium.c",
+  "cfg_path": "/assets\\ui_font_P1_medium.fcfg",
+  "size": 24,
+  "bpp": 4,
+  "letters": 0,
+  "ranges": [
+    "0x20-0x7f"
+  ],
+  "symbols": "",
+  "customparams": "--no-compress --no-prefilter",
+  "uploaded": false
+}

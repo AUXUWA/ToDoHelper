@@ -1,0 +1,16 @@
+{
+  "codename": "H2_bold",
+  "ttf_path": "/assets/Lato-Bold.ttf",
+  "bin_path": "/assets\\ui_font_H2_bold.bin",
+  "c_path": "/assets\\ui_font_H2_bold.c",
+  "cfg_path": "/assets\\ui_font_H2_bold.fcfg",
+  "size": 42,
+  "bpp": 4,
+  "letters": 0,
+  "ranges": [
+    "0x20-0x7f"
+  ],
+  "symbols": "",
+  "customparams": "--no-compress --no-prefilter",
+  "uploaded": false
+}

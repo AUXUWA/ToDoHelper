@@ -1,0 +1,158 @@
+--- a/managed_components/espressif__esp_lvgl_adapter/CMakeLists.txt
++++ b/managed_components/espressif__esp_lvgl_adapter/CMakeLists.txt
+@@ -7,7 +7,11 @@
+ idf_build_get_property(target IDF_TARGET)
+ if(${target} STREQUAL "esp32p4" OR ${target} STREQUAL "esp32s31")
+     list(APPEND ADAPTER_PRIV_REQ esp_driver_ppa)
+-    if(IDF_VERSION_MAJOR GREATER 6 OR (IDF_VERSION_MAJOR EQUAL 6 AND IDF_VERSION_MINOR GREATER_EQUAL 2))
++    # The DMA2D async driver was renamed from esp_async_fbcpy to
++    # esp_async_color_convert; detect it by the header that is actually
++    # installed instead of relying on the IDF version number (IDF 6.1
++    # already ships esp_async_color_convert.h).
++    if(EXISTS "$ENV{IDF_PATH}/components/esp_driver_dma/include/esp_async_color_convert.h")
+         list(APPEND ADAPTER_PRIV_REQ esp_driver_dma)
+     endif()
+ endif()
+--- a/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/common/display_bridge_common.c
++++ b/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/common/display_bridge_common.c
+@@ -614,7 +614,7 @@
+ 
+ #if SOC_DMA2D_SUPPORTED
+ #include "esp_idf_version.h"
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ #include "esp_async_color_convert.h"
+ #else
+ #include "esp_async_fbcpy.h"
+@@ -628,7 +628,7 @@
+ #if CONFIG_SOC_DMA2D_SUPPORTED
+ static inline esp_err_t s_dma2d_install(void **out_handle)
+ {
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+     async_color_convert_config_t cfg = {
+         .dma_burst_size = 128,
+     };
+@@ -641,7 +641,7 @@
+ 
+ static inline void s_dma2d_uninstall(void *handle)
+ {
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+     esp_async_color_convert_uninstall((async_color_convert_handle_t)handle);
+ #else
+     esp_async_fbcpy_uninstall((esp_async_fbcpy_handle_t)handle);
+@@ -868,7 +868,7 @@
+  *
+  * IRAM: Executed in ISR context for fast response
+  */
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ bool IRAM_ATTR display_bridge_dma2d_done_callback(async_color_convert_handle_t mcp,
+                                                   async_color_convert_event_data_t *event_data,
+                                                   void *cb_args)
+@@ -908,7 +908,7 @@
+     /* Clear completion semaphore */
+     xSemaphoreTake((SemaphoreHandle_t)hw->dma2d_done_sem, 0);
+ 
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+     ret = esp_async_color_convert(hw->fbcpy_handle,
+                                   (const async_color_convert_request_t *)trans_desc,
+                                   display_bridge_dma2d_done_callback,
+--- a/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/common/display_bridge_common.h
++++ b/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/common/display_bridge_common.h
+@@ -33,7 +33,7 @@
+ 
+ #if SOC_DMA2D_SUPPORTED
+ #include "esp_idf_version.h"
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ #include "esp_async_color_convert.h"
+ #else
+ #include "esp_async_fbcpy.h"
+@@ -452,7 +452,7 @@
+  *
+  * @note This function is 100% identical in v8 and v9
+  */
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ bool display_bridge_dma2d_done_callback(async_color_convert_handle_t mcp,
+                                         async_color_convert_event_data_t *event_data,
+                                         void *cb_args);
+--- a/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/v8/lvgl_bridge_v8.c
++++ b/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/v8/lvgl_bridge_v8.c
+@@ -50,7 +50,7 @@
+ 
+ #if SOC_DMA2D_SUPPORTED
+ #include "esp_idf_version.h"
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ #include "esp_async_color_convert.h"
+ #else
+ #include "esp_async_fbcpy.h"
+@@ -67,7 +67,7 @@
+ #define COLOR_BYTES_RGB888         (3)     /* Bytes per pixel for RGB888 */
+ 
+ #if SOC_DMA2D_SUPPORTED
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ #define DMA2D_PIXEL_FORMAT_FIELD(_color_bytes) \
+     .src_color_format = ((_color_bytes) == COLOR_BYTES_RGB565 ? ESP_COLOR_FOURCC_RGB16 : ESP_COLOR_FOURCC_RGB24), \
+     .dst_color_format = ((_color_bytes) == COLOR_BYTES_RGB565 ? ESP_COLOR_FOURCC_RGB16 : ESP_COLOR_FOURCC_RGB24)
+@@ -1481,7 +1481,7 @@
+         size_t flush_size = src_stride_px * rect_h * lvgl_color_format_bytes;
+         display_cache_msync_range(color_map, flush_size, hw_resource.data_cache_line_size);
+ 
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+         async_color_convert_request_t blit = {
+             .src_buffer  = color_map,
+             .dst_buffer  = impl->draw_fb,
+@@ -2088,7 +2088,7 @@
+         int offset_x = r.x1;
+         if (display_bridge_dma2d_window_is_compatible(impl->disp_fb, hor_res, offset_x, copy_w_px, color_bytes) &&
+                 display_bridge_dma2d_window_is_compatible(impl->draw_fb, hor_res, offset_x, copy_w_px, color_bytes)) {
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+             async_color_convert_request_t tr = {
+                 .src_buffer  = impl->disp_fb,
+                 .dst_buffer  = impl->draw_fb,
+--- a/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/v9/lvgl_bridge_v9.c
++++ b/managed_components/espressif__esp_lvgl_adapter/src/display/bridge/v9/lvgl_bridge_v9.c
+@@ -51,7 +51,7 @@
+ 
+ #if SOC_DMA2D_SUPPORTED
+ #include "esp_idf_version.h"
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ #include "esp_async_color_convert.h"
+ #else
+ #include "esp_async_fbcpy.h"
+@@ -68,7 +68,7 @@
+ #define COLOR_BYTES_RGB888         (3)     /* Bytes per pixel for RGB888 */
+ 
+ #if SOC_DMA2D_SUPPORTED
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+ #define DMA2D_PIXEL_FORMAT_FIELD(_color_bytes) \
+     .src_color_format = ((_color_bytes) == COLOR_BYTES_RGB565 ? ESP_COLOR_FOURCC_RGB16 : ESP_COLOR_FOURCC_RGB24), \
+     .dst_color_format = ((_color_bytes) == COLOR_BYTES_RGB565 ? ESP_COLOR_FOURCC_RGB16 : ESP_COLOR_FOURCC_RGB24)
+@@ -1532,7 +1532,7 @@
+ 
+         display_cache_msync_range(color_map, (size_t)src_stride * rect_h, hw_resource.data_cache_line_size);
+ 
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+         async_color_convert_request_t blit = {
+             .src_buffer  = color_map,
+             .dst_buffer  = impl->draw_fb,
+@@ -2162,7 +2162,7 @@
+         int offset_x = r.x1;
+         if (display_bridge_dma2d_window_is_compatible(impl->disp_fb, hor_res, offset_x, copy_w_px, color_bytes) &&
+                 display_bridge_dma2d_window_is_compatible(impl->draw_fb, hor_res, offset_x, copy_w_px, color_bytes)) {
+-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+             async_color_convert_request_t tr = {
+                 .src_buffer  = impl->disp_fb,
+                 .dst_buffer  = impl->draw_fb,

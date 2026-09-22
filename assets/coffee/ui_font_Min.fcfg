@@ -1,0 +1,16 @@
+{
+  "codename": "Min",
+  "ttf_path": "/assets/Lato-Regular.ttf",
+  "bin_path": "/assets\\ui_font_Min.bin",
+  "c_path": "/assets\\ui_font_Min.c",
+  "cfg_path": "/assets\\ui_font_Min.fcfg",
+  "size": 12,
+  "bpp": 4,
+  "letters": 0,
+  "ranges": [
+    "0x20-0x7f"
+  ],
+  "symbols": "",
+  "customparams": "--no-compress --no-prefilter",
+  "uploaded": false
+}
