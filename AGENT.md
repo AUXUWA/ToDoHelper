@@ -1,74 +1,89 @@
 # AGENT.md
 
-面向在本仓库工作的 AI/开发者的工作说明：**当前已实现的驱动与 App 功能**、本机环境、常用命令、
-必须保留的补丁、验证基线、排错速查。上游 README 的概述不再重复，这里只写「实际是什么状态、怎么在这里把事做成」。
+面向在本仓库工作的 AI/开发者的工作说明：**当前已实现的功能**、本机环境、常用命令、
+必须保留的补丁与配置、验证基线、排错速查。上游 README 的概述不再重复，这里只写
+「实际是什么状态、怎么在这里把事做成」。
+
+> **本仓库已从 Korvo 产测固件（factory_demo）重构为 ToDoHelper 桌面助手。**
+> 需求见 `docs/TODOHELPER_REQUIREMENTS.md`，框架设计见 `docs/TODOHELPER_FRAMEWORK.md`，
+> 组件接口与 HTTP API 见 `docs/API.md`，**交接说明见 `docs/HANDOVER.md`**。
+> 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
 
 ---
 
 ## 1. 项目是什么
 
-- 来源：`espressif/esp-dev-kits` 的 `examples/esp32-s31-korvo/examples/factory_demo`（本机克隆在 `D:\project\ESP-IDFv6.1\esp-dev-kits`）。
-- 内容：ESP32-S31-Korvo 板子的产测固件（RGB 屏 + GT1151 触摸的 LVGL 咖啡机 UI、OV3660/SC101 DVP 摄像头预览、音频录制回放、按键/WS2812/USB HID、SD 卡读写探测）。
-- 芯片目标：**esp32s31**（preview 目标）。
-- 应用名：`esp32_s31_korvo_factory_demo`。
+- 目标：基于 ESP32-S31-Korvo 板卡实现桌面助手（ToDoHelper）。
+- 芯片目标：**esp32s31**（ESP32-S31，RISC-V，preview 目标）。
+- 应用名：**`todohelper`**（产物 `build/todohelper.bin`）。
+- 框架：ESP-IDF **v6.1.0**；UI 为 LVGL **9.5.0** + `espressif__esp_lvgl_adapter` 0.5.3（**已打本地补丁**，见 §7）。
+- 硬件来源：`espressif/esp-dev-kits` 的 `examples/esp32-s31-korvo`。板级 BSP 位于工程外
+  `..\common_components\esp32_s31_korvo`（**只读，禁止修改**）。
 
-## 2. 已实现的驱动与 App 功能
+**已实现的功能范围**（详见 `docs/API.md` 与需求文档 FR1~FR7）：
 
-> 依据当前代码（`main/`、`ui/`、`components/` 与工程外的 Korvo BSP）整理。**改动驱动或功能后请同步本节。**
+| 功能 | 状态 |
+|---|---|
+| WiFi 扫描/连接/NVS 保存/开机自动重连/断线退避重试 | ✅ |
+| 待办清单：设备端列表+勾选、`cache/todos.json` 持久化、完整 REST API | ✅ |
+| 局域网 HTTP Server + mDNS（`todohelper.local`）+ 内嵌浏览器待办页 + SSE 推送 | ✅ |
+| 天气（Open-Meteo，**免 API Key**）+ 城市地理编码 + IP 定位 + 定时刷新 + 缓存降级 | ✅ |
+| 日历：SNTP 校时 + POSIX 时区 + 月历（**无 RTC，断电不保持**） | ✅ |
+| 单词：内置示例词库 + 翻卡 + 三档评分 + 间隔复习 + 进度持久化 | ✅ |
+| 待机小眼睛：纯程序化绘制，11 种表情 | ✅ |
+| 设置页：亮度/待机/时区/单词数/HTTP token/设备信息 | ✅ |
+| AI 对话（DeepSeek，流式）+ 小眼睛联动 | ✅ |
+| 语音：录音回放真实可用；ASR/TTS 走**可配置 HTTP 端点**（选型未定） | ⚠️ 半成品 |
 
-### 2.1 板级驱动（Korvo BSP：`..\common_components\esp32_s31_korvo`）
+---
 
-| 模块 | 实现方式 | 关键参数 |
-|---|---|---|
-| RGB 屏 | `esp_lcd_new_rgb_panel` → `esp_lv_adapter_register_display` / `esp_lv_adapter_start` | 800×480、16-bit 并口、PCLK 26MHz、H(BP40/FP20)、V(BP10/FP5)；背光/使能脚为 NC |
-| 电容触摸 | `esp_lcd_touch_new_i2c_gt1151` → `esp_lv_adapter_register_touch` | GT1151，I2C SDA=GPIO0 / SCL=GPIO1；RST/INT 为 NC |
-| 摄像头 | DVP + SCCB，`esp_video_init()`，对外 `bsp_camera_open/start/get_frame/return_frame/set_orientation` | 8-bit DVP（D0-7=GPIO46~53、PCLK54、XCLK55、VSYNC56、HSYNC57），XCLK 20MHz、SCCB 10kHz，默认 1280×720、2 帧缓冲 |
-| 音频 | `i2s_new_channel` + esp_codec_dev 双句柄（`bsp_audio_codec_microphone_init` / `bsp_audio_codec_speaker_init`） | 默认 48kHz / 16bit / 2ch；MCLK2、SCLK3、LRCLK4、DSIN6、SDOUT5、PA_CTRL=GPIO7 |
-| SD 卡 | SDMMC 4-bit（`bsp_sdcard_mount` / `bsp_sdcard_unmount`） | D0-3=GPIO20~23、CLK24、CMD25、电源开关 GPIO39（低有效）；挂载点 `/sdcard`、HIGHSPEED、16KB alloc |
-| 按键 | ADC 单线梯形 4 键 + espressif/button（`bsp_iot_button_create`） | ADC=GPIO42；VOLUP 0.38V / VOLDOWN 0.82V / MODE 1.34V / SET 1.87V |
-| WS2812 | led_strip（RMT），`bsp_led_set_rgb` / `bsp_led_clear` | GPIO37，单颗状态灯 |
+## 2. 组件结构（实际状态）
 
-注意：**GPIO20~25 与 SPI NAND flash 脚位复用**，同一块板只能装其中一个。
+```text
+components/
+  sys_utils/          L0  日志/共享事件循环/时间/sys_status/sys_notify/NVS 配置/错误码
+  http_router/        L1  HTTP 路由表 + 统一响应 {code,msg,data} + 404/405/501 + 鉴权钩子
+  storage_manager/    L1  SD(SDMMC 4bit) → 片内 LittleFS 回退、原子写、缓存 API
+  bsp/                L1  th_bsp_ 门面（显示/软件调光/按键/待机看门狗/LED/SD/音频）
+  ui_assets/          L2  assets 分区打包（本组件的 CMakeLists 拥有）+ 图标按基名解析
+  ui_core/            L2  页面注册表/导航/状态栏/递归锁/事件编组/主题/字体链/卡片提示
+  wifi_manager/       L3  FR1（含 /api/v1/wifi/* 路由）
+  todo_manager/       L3  FR2（含 /api/v1/todos* 路由、JSON 导入导出）
+  calendar_service/   L3  FR4（SNTP + 时区 + 月历）
+  weather_service/    L3  FR3（可插拔 provider，默认 Open-Meteo + IP 定位）
+  word_service/       L3  FR5（词库装载 + 间隔复习）
+  sync_server/        L4  httpd 生命周期 + 设备 API + SSE + 内嵌 Web 页 + mDNS + 鉴权
+  idle_face/          L4  FR6 待机眼睛（自带 UI_PAGE_IDLE_FACE 注册 + 通知触发表情）
+  ui_pages/           L4  11 个页面（组合层，可依赖任意非 UI 组件）
+  ai_service/         L5  FR7 DeepSeek（阻塞/流式/历史/中断）
+  voice_service/      L5  FR7 录音回放 + ASR/TTS 端点桥接
+  esp_cam_sensor/     —   本地组件，覆盖托管组件（BSP 需要）
+main/
+  app_main.c              表驱动模块编排（12 个模块），无可选模块失败阻塞 UI
+assets/ui/                扁平 PNG 资源（w_*.png），打包进 assets 分区
+tools/gen_cjk_font.py     生成内嵌 CJK 子集字体
+docs/                     需求 / 框架 / API / 交接
+```
 
-### 2.2 App 层（`main/`）
+### 2.1 分层依赖规则
 
-| 文件 | 职责 | 实现要点 |
-|---|---|---|
-| `main.c` | 总编排 + 工厂自检界面 | 顺序：摄像头（先占用共享 I2C）→ `bsp_display_start_with_config` → `coffee_assets_init` → 按键/LED → 音频 → USB HID → `ui_init()`。LVGL 800×480、buffer 高 160、`TEAR_AVOID_MODE_TRIPLE_PARTIAL`、开 PPA 加速、显示任务栈 16KB；100ms 定时器把各模块快照刷到 UI；咖啡机 UI ↔ 工厂界面通过独立任务切换 |
-| `factory_demo_camera.c` | 摄像头预览渲染到 LVGL canvas | esp_video / V4L2 取帧（`linux/videodev2.h`）→ PPA `ppa_do_scale_rotate_mirror`(SRM) 缩放/旋转到 240×240 RGB565 → LVGL canvas；`esp_cache_msync` 维护 cache 一致性；支持镜像/翻转、JPEG 质量、渲染开关、首帧等待(3s)；状态机 IDLE/STARTING/PREVIEW/ERROR |
-| `factory_demo_audio.c` | 录音 / 回放自检 | esp_codec_dev 打开 mic 与 speaker，48kHz/16bit/2ch，任务内 `esp_codec_dev_read` / `esp_codec_dev_write` 搬运，输入增益与输出音量可调；状态机 IDLE/RECORDING/PLAYING/ERROR + 快照（已录字节/容量） |
-| `factory_demo_usb_hid.c` | USB HID Host 自检 | `usb_host_install` + `hid_host_install`，解析键盘/鼠标 usage（`hid_usage_keyboard.h` / `hid_usage_mouse.h`）；维护连接/断开/输入计数、鼠标坐标与左右键、设备名、最近输入；状态机 IDLE/WAITING/CONNECTED/DISCONNECTED/ERROR |
-| `coffee_assets.c` | UI 资源加载 | esp_mmap_assets 从 `coffee_pjpg` 分区（0x810000）mmap PNG/字体，`coffee_assets_init()` / `coffee_assets_get_src()` 供 LVGL 使用 |
+```text
+L5 ai_service, voice_service
+L4 sync_server, idle_face, ui_pages
+L3 wifi_manager, todo_manager, weather_service, calendar_service, word_service
+L2 ui_assets, ui_core
+L1 http_router, storage_manager, bsp
+L0 sys_utils
+--------------------------------------------------> 依赖只能向下
+```
 
-### 2.3 UI（`ui/`，SquareLine Studio 1.5.4 导出）
+- L3 组件之间**不得**互相 `REQUIRES`：用事件或 `sys_notify()` 通信；
+- **HTTP 路由反向注册**：业务组件向 L1 `http_router` 注册，`sync_server` 只负责起服务；
+- **跨层通知**：L3 想通知 UI/Web 时调 L0 `sys_notify()`，不要调 `sync_server_*`；
+- `ui_pages` 是**组合层**，可以依赖任意非 UI 组件（只要不成环）；`ui_core` / `ui_assets` /
+  `idle_face` 不得被业务组件依赖。
 
-- **12 个屏幕**：Splash_screen、Home、Home_espresso、Home_ristretto、Customize、Customize2、Ready、Brewing、Brewing_Done、Add_water、Add_coffee、Settings。
-- **15 个自定义组件**：button、ready_button、cta_container、header、home_sliders、homeslider、parameter、progress、selector、separator、slider1、slider3、steps 等。
-- 工厂自检界面不是 SquareLine 生成的，而是 `main.c` 里手写 LVGL 卡片（摄像头画布、音频、SD、按键/LED、USB HID 状态区）。
-
-### 2.4 依赖组件（`managed_components/`）
-
-| 组件 | 版本 | 用途 |
-|---|---|---|
-| `lvgl__lvgl` | 9.5.0 | GUI 框架 |
-| `espressif__esp_lvgl_adapter` | 0.5.3（**已打补丁**，见第 7 节） | LVGL ↔ LCD/触摸适配、撕裂控制、PPA/DMA2D 加速 |
-| `espressif__esp_lv_decoder` / `espressif__esp_lv_fs` | 0.4.0 / 1.0.1 | 图片解码（PNG/JPEG）与文件系统接入 |
-| `espressif__esp_mmap_assets` | 2.0.1 | UI 资源打包与 mmap |
-| `espressif__esp_video` + `espressif__esp_sccb_intf` | 2.4.1 | V4L2 摄像头框架 / SCCB |
-| `components/esp_cam_sensor`（本地覆盖托管组件） | 2.4.0 | 摄像头传感器驱动（ov3660、sc101iot 等） |
-| `espressif__esp_codec_dev` | 1.6.2 | 音频编解码驱动 |
-| `espressif__esp_lcd_touch_gt1151` / `esp_lcd_touch` | 1.1.1 | 触摸驱动 |
-| `espressif__button` / `espressif__knob` | 4.2.1 / 1.1.0 | 按键 / 旋钮事件 |
-| `espressif__led_strip` | 3.0.3 | WS2812 |
-| `espressif__usb_host_hid` + `espressif__usb` | 1.2.1 / 1.5.0 | USB HID Host 协议栈 |
-| `espressif__esp_new_jpeg` / `libpng` / `zlib` / `freetype` | — | 图像编解码与字体支撑 |
-
-### 2.5 与驱动相关的配置开关（来自 `sdkconfig.defaults`）
-
-- 目标与存储：`IDF_TARGET=esp32s31`、QIO + 16MB flash、PSRAM 250MHz + `SPIRAM_XIP_FROM_PSRAM`、FreeRTOS 1000Hz
-- 显示/UI：`ESP_LVGL_ADAPTER_ENABLE_FS/DECODER/FPS_STATS`、`LV_USE_CLIB_{MALLOC,STRING,SPRINTF}`、字体 18/24/32/46、`LV_CACHE_DEF_SIZE=4MB`
-- 摄像头：`CAMERA_OV3660`（240×240 RGB565 DVP）、`CAMERA_SC101IOT`（640×480 YUV422）
-- USB：`USB_HOST_HUBS_SUPPORTED`
+---
 
 ## 3. 本机环境（已实测确认，勿凭猜测改动）
 
@@ -81,10 +96,16 @@
 | 板子串口 | **COM34** = Silicon Labs CP210x = ESP32-S31 板（MAC `1c:29:04:d0:71:b6`） |
 | 另一串口 | COM26 = CH340，**不是**本板（且常被其它程序占用） |
 | 工具链 | riscv32-esp-elf `esp-15.2.0_20251204`（esp32s31 走 RISC-V） |
+| 组件源 | `IDF_COMPONENT_LOCAL_STORAGE_URL=file://C:\Espressif\tools`（本地镜像，部分组件不可得） |
 
-`idf.py` **不在 Git Bash 的 PATH 里**；且 IDF v6.1 在 Git Bash 下会打印
-`MSys/Mingw is no longer supported` 警告（`MSYSTEM` 被 MSYS 运行时注入子进程）。
-构建/烧录请走 PowerShell，或按下面第 4 节从 Bash 调用 PowerShell。
+**本地镜像里没有的组件**（决定了技术选型，见 §9）：
+`esp_websocket_client`（→ 用 SSE 代替 WebSocket）、`esp-sr` / `esp_tts`（→ 离线 ASR/TTS 不可用）。
+可用的有：`joltwallet/littlefs`、`espressif/mdns`、`espressif/cjson`、`espressif/mqtt`。
+
+`idf.py` **不在 Git Bash 的 PATH 里**；IDF v6.1 在 Git Bash 下会打印
+`MSys/Mingw is no longer supported` 警告（`MSYSTEM` 被注入子进程）。**构建请走 PowerShell**。
+
+---
 
 ## 4. 常用命令
 
@@ -110,57 +131,76 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
 ```
 
 要点：
-- 先 `Remove-Item Env:MSYSTEM` 再加载 profile，可去掉那条 MSYS 警告（不是错误，但会污染日志）。
-- 编译耗时较长（本机约 2200 个编译目标、全量冷启动约数分钟，有 ccache 后增量很快），
+
+- 先 `Remove-Item Env:MSYSTEM` 再加载 profile，可去掉那条 MSYS 警告。
+- 编译耗时较长（约 2200 个目标，冷启动数分钟，有 ccache 后增量很快），
   后台跑并重定向日志：`> build/dsh_build.log 2>&1`。
-- 若要限制构建产物写在工程内（受沙箱/权限约束时），可额外设置
-  `$env:CCACHE_DIR='D:\project\ESP-IDFv6.1\ToDoHelper\build\.ccache'`。
+- 若要限制构建产物写在工程内：`$env:CCACHE_DIR='D:\project\ESP-IDFv6.1\ToDoHelper\build\.ccache'`。
+- **`idf.py reconfigure`**：改动 `assets/ui/` 下文件、增删组件、改 `idf_component.yml` 后需要
+  （`assets` 镜像的依赖是 configure 期求值的 `GLOB_RECURSE`）。
 
 ### 4.3 只烧录 / 只擦除 / 清理
 
 ```powershell
 idf.py -p COM34 flash            # 只烧录（会自动先构建）
-idf.py -p COM34 erase-flash      # 全擦
+idf.py -p COM34 erase-flash      # 全擦（会清掉 NVS 里的 WiFi/Key 配置）
 idf.py fullclean                 # 删 build/（managed_components 不动）
 idf.py reconfigure               # 重跑 CMake + 组件管理器
 ```
 
-## 5. 工程结构与关键文件
+### 4.4 重新生成内嵌中文字体（可选）
+
+```powershell
+& 'C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe' tools\gen_cjk_font.py
+# 需要 fontTools + brotli：pip install fonttools brotli
+# 默认：源 C:\Windows\Fonts\NotoSansSC-VF.ttf（OFL，可再分发），
+#       把可变字体钉到 wght=400，取 GB2312 一级（3755 常用字）+ ASCII + 标点，
+#       输出 components/ui_core/fonts/ui_cjk.ttf（约 1.2 MB）。
+# 加 --level2 得到 6763 字（约 3.8 MB）。改完字体必须 idf.py build 重新嵌入。
+```
+
+---
+
+## 5. 关键文件
 
 ```
 ToDoHelper/
-├─ CMakeLists.txt              # EXTRA_COMPONENT_DIRS 指向 ../common_components
+├─ CMakeLists.txt              # EXTRA_COMPONENT_DIRS 指向 ../common_components；project(todohelper)
 ├─ partitions.csv              # nvs 0x9000/0x6000, phy_init 0xf000/0x1000,
-│                              # factory 0x10000/0x800000, coffee_pjpg 0x810000/0x600000
-├─ sdkconfig.defaults          # 真正的默认配置来源（IDF_TARGET/PSRAM/LVGL/摄像头/分区表…）
-├─ sdkconfig                   # 生成物，不要手改；要改默认值改 sdkconfig.defaults
+│                              # factory 0x10000/0x800000, storage(littlefs) 0x810000/0x200000,
+│                              # assets(spiffs) 0xa10000/0x5f0000
+├─ sdkconfig.defaults          # 真正的默认配置来源（**含两条不可删的必需项**，见 §9）
+├─ sdkconfig                   # 生成物，不要手改
 ├─ dependencies.lock           # 组件管理器锁文件（target: esp32s31）
-├─ main/                       # main.c(UI 装配) + factory_demo_{audio,camera,usb_hid}.c
-│                              # + coffee_assets.c；CMakeLists 用 spiffs_create_partition_assets
-│                              # 把 ../assets/coffee 打包成 coffee_pjpg 分区
-├─ ui/                         # SquareLine Studio 1.5.4 导出的咖啡机 UI（ui.c/screens/fonts/…）
-├─ assets/coffee/              # 85 个 png/ttf，LVGL 资源（经 esp_mmap_assets/mm）
-├─ components/esp_cam_sensor/  # 本地组件，覆盖托管组件 espressif/esp_cam_sensor 2.4.0
-├─ managed_components/         # 组件管理器下载的依赖（≈22 个）；除第 7 节补丁外勿手改
-├─ patches/                    # 本工程必需的本地补丁（见第 7 节）
-└─ build/                      # 构建产物；本次排障日志：dsh_build2.log / dsh_flash.log
+├─ main/app_main.c             # 模块编排表（12 个模块）
+├─ components/                 # 见 §2
+├─ assets/ui/                  # 扁平 PNG（w_*.png）；**不能有子目录**
+├─ tools/gen_cjk_font.py       # CJK 子集字体生成脚本
+├─ managed_components/         # 托管依赖；除 §7 补丁外勿手改
+├─ patches/                    # esp_lvgl_adapter IDF6.1 支持补丁（必需）
+├─ docs/                       # 需求 / 框架 / API / 交接（HANDOVER.md）
+└─ build/                      # 构建产物；排障日志 dsh_build*.log
 ```
 
 工程外但必需：`D:\project\ESP-IDFv6.1\common_components\esp32_s31_korvo`（Korvo BSP，由
 `EXTRA_COMPONENT_DIRS` 和 `main/idf_component.yml` 的 `path:` 引用）。**不要修改它**。
 
+---
+
 ## 6. 依赖与版本约束
 
-> 各依赖的**用途与已确认版本**见第 2.4 节；本节只讲约束来源与解析结果。
-
-- `main/idf_component.yml` → `idf: ">=6.1.0"`，并对 `usb_host_hid`、`esp_mmap_assets`、
-  `espressif/esp_lv_decoder` 有直接约束。
+- `main/idf_component.yml` → `idf: ">=6.1.0"`、Korvo BSP（path）、`espressif/esp_lv_decoder` 0.4.0。
+- 业务组件的托管依赖放在各自 `components/<name>/idf_component.yml`：
+  `joltwallet/littlefs`（storage_manager）、`espressif/mdns`（sync_server）、
+  `espressif/cjson`（todo/weather/word/sync/ai/voice/wifi）、`esp_mmap_assets`（ui_assets）。
+- **ESP-IDF v6.1 已无内置 `json` 组件**，cJSON 必须走 `espressif/cjson`（组件名为 `cjson`）。
 - Korvo BSP（工程外）的约束：`espressif/esp_lvgl_adapter: ^0.5.0`、`esp_video: 2.4.1`、
   `esp_cam_sensor: 2.4.*`、`esp_codec_dev: ^1.5.9`、`led_strip: ^3.0.3`、`button: ^4`、
-  `esp_lcd_touch_gt1151: ^1`。
-- 因此 `esp_lvgl_adapter` 被解析到 **0.5.3**（0.5.x 的最新版），LVGL 为 **9.5.0**。
-- 想换版本：改 `main/idf_component.yml` 增加显式约束，然后 `idf.py reconfigure`；
-  注意受 BSP 的 `^0.5.0` 限制，不修改工程外的 BSP 就无法升到 0.6.x。
+  `esp_lcd_touch_gt1151: ^1` → 因此 `esp_lvgl_adapter` 固定 0.5.3、LVGL 固定 9.5.0。
+- 想换版本：改 `main/idf_component.yml` 增加显式约束后 `idf.py reconfigure`；
+  注意 BSP 的 `^0.5.0` 限制，不修改工程外的 BSP 就无法升到 0.6.x。
+
+---
 
 ## 7. 必须保留的补丁（重要）
 
@@ -218,13 +258,12 @@ grep -c "ESP_IDF_VERSION_VAL(6, 1, 0)" \
 grep "esp_async_color_convert.h" managed_components/espressif__esp_lvgl_adapter/CMakeLists.txt
 ```
 
-**回滚/重新生成**：删除 `managed_components/espressif__esp_lvgl_adapter` 后 `idf.py reconfigure`，
-组件管理器会重新下载官方 0.5.3（再按需重新打补丁）。
-
-**替代方案（不推荐）**：升级到 `esp_lvgl_adapter` 0.6.4+（官方已改为按头文件存在与否自动判别，
-与本补丁思路一致），但 Korvo BSP 的 `^0.5.0` 约束会与之冲突，需同时改工程外的 BSP。
+---
 
 ## 8. 验证基线（判定「编译成功」）
+
+> ⚠️ **注意：截至当前，本工程从未烧录到真机、从未上过屏。** 以下仅是**编译基线**，
+> 运行期行为全部未验证。第一次上机时请按 `docs/HANDOVER.md` §5 的清单逐项确认。
 
 日志出现：
 
@@ -232,43 +271,89 @@ grep "esp_async_color_convert.h" managed_components/espressif__esp_lvgl_adapter/
 Project build complete.
 ```
 
-本次成功构建的数值（可用于回归对比）：
+**ToDoHelper 当前基线**（可作回归对比基准）：
 
 | 项 | 值 |
 |---|---|
-| app bin | `build/esp32_s31_korvo_factory_demo.bin`，`0x193a60` 字节（约 1.58 MB） |
-| app 分区余量 | 0x800000 分区，剩 80% |
+| app bin | `build/todohelper.bin`，`0x3fc2c0` 字节（约 4.17 MB，含 1.2 MB 内嵌中文字体） |
+| app 分区余量 | `0x800000` 分区，剩 **50%** |
 | bootloader | `build/bootloader/bootloader.bin`，`0x5a80`，余 6% |
-| 编译警告 | 0 |
-| 资源分区 | `build/mmap_build/coffee/coffee_pjpg/coffee_pjpg.bin`（约 227 KB） |
+| 编译警告 | 0（`-Werror` 全开） |
+| 资源分区 | `build/mmap_build/ui/assets/assets.bin`（8 个 PNG，约 8.9 KB） |
+| 组件数 | 16 个自有组件 + 1 个本地覆盖组件（`esp_cam_sensor`） |
 
 烧录成功判据：每个镜像后出现 `Hash of data verified.`，结尾 `Hard resetting via RTS pin...` + `Done`。
 
 烧录地址（`idf.py flash` 自动处理）：
-`0x2000` bootloader、`0x8000` 分区表、`0x10000` app、`0x810000` coffee_pjpg。
+`0x2000` bootloader、`0x8000` 分区表、`0x10000` app、`0x810000` storage(littlefs)、`0xa10000` assets。
+
+---
 
 ## 9. 注意事项与坑
 
-- **不要修改** `..\common_components\esp32_s31_korvo`：它在工程目录之外，且被其它示例共用。
-- 改动 `managed_components/` 下任何文件，都要把 diff 追加进 `patches/` 并在本节登记，
-  否则依赖被重新下载后问题会「神秘复现」。
-- `sdkconfig` 是生成物；改默认配置请改 `sdkconfig.defaults`
-  （当前含 `CONFIG_IDF_TARGET="esp32s31"`、`SPIRAM_SPEED_250M`、`SPIRAM_XIP_FROM_PSRAM`、
-  QIO/16MB flash、`CONFIG_CAMERA_OV3660`/`SC101IOT`、LVGL 字体与缓存等）。
+### 9.1 两条**不可删**的 `sdkconfig.defaults` 配置
+
+1. **`CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y`（且 `LOG_MAXIMUM_EQUALS_DEFAULT=n`）**
+   原因：esp32s31 + `CONFIG_SPIRAM_XIP_FROM_PSRAM` 下，当 `LOG_MAXIMUM_LEVEL == LOG_DEFAULT_LEVEL`
+   时 IDF 会把 `ESP_LOGD/ESP_LOGV` 的格式串放进 `.rodata_wlog_*` 段，而生成的 `sections.ld`
+   把这两个段排在 `_rodata_reserved_end` **之后**，于是紧随其后的 `.ext_ram.dummy` 段必须把
+   位置计数器往回移，链接直接失败：
+   ```
+   sections.ld:1280 cannot move location counter backwards (from 5022b8f0 to 50227480)
+   collect2.exe: error: ld returned 1 exit status
+   ```
+   提高到 VERBOSE 后这些串留在普通 rodata，链接正常。**运行时输出不变**（`LOG_DEFAULT_LEVEL`
+   仍是 INFO），额外好处是可以运行时用 `sys_log_set_level()` 把单个 TAG 提到 DEBUG。
+
+2. **FreeType 相关四项**（`LV_USE_FREETYPE` / `ESP_LVGL_ADAPTER_ENABLE_FREETYPE` /
+   `..._SMALL_RENDER_POOL` / `..._MINIMAL_BUILD` / `TODOHELPER_FONT_FREETYPE`）
+   `SMALL_RENDER_POOL` 把 FreeType 渲染池压到 4 KB 并去掉 LVGL 那个"32 KB FreeType 绘制栈"
+   的构建期检查；`MINIMAL_BUILD` 去掉用不到的字体驱动与压缩流支持。关掉它们会因为
+   绘制栈检查或栈不足而链接/运行失败。
+
+### 9.2 素材与字体
+
+- **`assets/ui/` 必须是扁平目录**：`esp_mmap_assets` 的打包脚本用 `os.listdir()`
+  只扫一层，且只打包 `MMAP_FILE_SUPPORT_FORMAT` 里列出的后缀。所以天气图标命名为
+  `w_sunny.png` 这种"前缀分类"形式。**字体（.ttf）不能放这里**，改用
+  `idf_component_register(EMBED_FILES ...)` 内嵌（见 `ui_core`）。
+- 增删素材后镜像可能不刷新，执行一次 **`idf.py reconfigure`**。
+- 字体解析顺序（`ui_core/src/ui_fonts.c`）：`<storage>/todohelper/fonts/ui.ttf` →
+  内嵌 `ui_cjk.ttf` → LVGL 内置 Source Han Sans SC 16 → Montserrat。**任何情况下都有中文字形**。
+
+### 9.3 硬件约束
+
+- **GPIO20~25 与 SPI NAND flash 脚位复用，同一块板只能装其中一个**：用 SD 卡就不能用 SPI
+  NAND，反之亦然。这决定了字体/词库/素材放 SD 还是片内分区。
+- 屏幕与触摸**不**占用 GPIO20~25（RGB 并口 + I2C GPIO0/1），冲突对象只有 SPI NAND。
+- **无 RTC**：断电后时间不保持，`sys_time_ts()` 在 SNTP 成功前返回 **0**，
+  UI 必须显示"时间未同步"（需求 FR4）。
+- **无 GPS / 无温度传感器**：天气全部来自网络 API，定位只能"手动城市 / IP 定位"。
+- **背光脚为 NC**：亮度用 `lv_layer_top()` 上的黑色遮罩做软件调光（已去掉 CLICKABLE，
+  变暗后触摸仍可用）。
+
+### 9.4 其它
+
+- **不要修改** `..\common_components\esp32_s31_korvo`（工程外，被其它示例共用）。
+- 改动 `managed_components/` 下任何文件，都要把 diff 追加进 `patches/` 并在本节登记。
+- `sdkconfig` 是生成物；改默认配置请改 `sdkconfig.defaults`（改完删 `sdkconfig` 再 build
+  才会从默认值重新生成）。
 - 重新设目标若提示 preview，用 `idf.py --preview set-target esp32s31`；本工程 `sdkconfig`
-  已就绪，正常情况下无需重设。
-- Git Bash 下直接跑 `idf.py` 仅有无害警告，但路径/工具链语义以 PowerShell 为准；排障时优先 PowerShell。
-- 串口：认 **COM34**（CP210x）。`COM26`(CH340) 不是本板，占用时会报
-  `Could not open COM26 ... port is busy`。
-- 构建产物与日志都在 `build/`，体积大；不要把 `build/` 内容当作源码提交。
+  已就绪，正常无需重设。
+- 构建产物与日志都在 `build/`，体积大；不要把 `build/` 内容当源码提交。
+
+---
 
 ## 10. 排错速查
 
 | 症状 | 处理 |
 |---|---|
-| `fatal error: esp_async_fbcpy.h: No such file` | 第 7 节补丁被覆盖，重新 `patch -p1` 并 `idf.py build` |
-| `idf.py: command not found` | 未加载 IDF 环境，见第 4 节 |
-| `MSys/Mingw is no longer supported` | 无害警告；PowerShell 中先 `Remove-Item Env:MSYSTEM` |
+| `fatal error: esp_async_fbcpy.h: No such file` | §7 补丁被覆盖，重新 `patch -p1` 并 `idf.py build` |
+| `sections.ld:1280 cannot move location counter backwards` | `sdkconfig.defaults` 的 `LOG_MAXIMUM_LEVEL_VERBOSE` 丢了，见 §9.1 |
+| `Failed to resolve component 'json'` | IDF v6.1 无内置 json；改成 `cjson` 并声明 `espressif/cjson` |
+| 中文显示成方框 | 内嵌字体没生成/没重新构建；跑 `tools/gen_cjk_font.py` 后 `idf.py build` |
+| 天气图标不显示 | `assets/ui/` 里有子目录，或改了素材没 `idf.py reconfigure` |
+| `idf.py: command not found` | 未加载 IDF 环境，见 §4 |
 | `Could not open COMxx ... busy` | 关掉占用串口的监视器/其它工具；确认用的是 COM34 |
 | 组件管理器重新下载依赖 | 打补丁后 `idf.py reconfigure && idf.py build` |
 | 需要从零复现 | `idf.py fullclean` → 应用补丁 → `idf.py build` |

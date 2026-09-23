@@ -1,4 +1,57 @@
-# ToDoHelper 项目需求与组件化设计 v0.4
+# ToDoHelper 项目需求与组件化设计 v0.5
+
+> **v0.5 变更（框架与 P0/P1/P2 代码已落地后回改，供接手者对照）**
+>
+> 本文档原为**设计意图**；实际实现完成后按"代码实际行为 > `AGENT.md` > 本文档"的原则回改。
+> **完整的实现状态、未完成项与风险清单见 `docs/HANDOVER.md`；组件与 HTTP 接口清单见 `docs/API.md`。**
+> 以下为**实现与 v0.4 设计的全部偏离**，正文未逐条改写的地方以本节为准：
+>
+> 1. **新增 L1 组件 `http_router`**（原 §7.12 让业务组件向 `sync_server` 反向注册路由）。
+>    原因：把注册表放在 L4 会迫使 L3 业务组件向上依赖。现在业务组件向 L1 的 `http_router`
+>    注册，`sync_server` 只负责起 httpd 并把 catch-all 分发器挂上。统一响应封装、
+>    404/405/501 语义、鉴权钩子也一并集中在这里。
+> 2. **新增 L2 组件 `ui_assets`**（原 §12 "复用 `spiffs_create_partition_assets` 流程"）。
+>    `assets` 分区的打包调用放在该组件的 `CMakeLists.txt` 里，才能保证生成的
+>    `mmap_generate_assets.h` 在被编译前就绪。同时新增**实测约束**：`esp_mmap_assets`
+>    的打包脚本用 `os.listdir()` **只扫一层**，所以 `assets/ui/` 必须是**扁平目录**
+>    （天气图标命名为 `w_sunny.png` 这种前缀形式），且**字体不能放这里**（改用 `EMBED_FILES`）。
+> 3. **`UI_PAGE_IDLE_FACE` 由 `idle_face` 组件自己注册**，不在 `ui_pages` 的 `s_pages[]` 里
+>    （§10.1 原表说"由 idle_face 组件接管"，这样 `ui_pages` 不必依赖 `idle_face`）。
+> 4. **新增 L0 通知通道 `sys_notify()`**（原文档没有）。没有它，L3 想通知 UI/Web 就必须向上
+>    依赖 L4。`idle_face` 的**表情自动触发**也建在它上面（通知名 → 表情 → 时长，一张表）。
+> 5. **天气默认 provider = Open-Meteo（免 API Key）**，§17.2 #4 的选型未定；
+>    provider 可插拔（`weather_provider_t` 两个函数指针），加和风/OpenWeather 只需加一个文件
+>    加一行表项。**定位优先级第 2 档（IP 定位）已实现**，默认端点 `https://ipapi.co/json/`，
+>    可用 NVS 键 `geo_url` 覆盖。
+> 6. **WebSocket 用 SSE 代替**：推送端点是 `/api/v1/events`（Server-Sent Events），
+>    `/ws/events` 保留为 **501 占位**。原因：本地组件镜像中**没有** `esp_websocket_client`。
+>    §8.7 允许 SSE，且要求未实现返回 501——两者都满足。
+> 7. **`sdkconfig.defaults` 强制 `CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y`**：这不是偏好而是**必需**，
+>    否则 esp32s31 + `SPIRAM_XIP_FROM_PSRAM` 下链接失败
+>    （`sections.ld:1280 cannot move location counter backwards`）。原因与完整说明见
+>    `AGENT.md` §9.1。运行时日志级别不变（`LOG_DEFAULT_LEVEL` 仍为 INFO）。
+> 8. **`bsp` 门面符号前缀为 `th_bsp_`** 而非 §6 的 `bsp_display_*`：工程外 Korvo BSP 已占用
+>    这些符号。设计意图（业务层不直接调 BSP）不变。
+> 9. **设备端不支持中文输入**：屏幕键盘只有拉丁字母（无 IME）。中文待办 / AI 提问 / 城市名
+>    请通过电脑浏览器或 HTTP API。这是系统限制而非遗漏，已在相关页面文案中说明。
+> 10. **`sys_utils` 统一日志用 `esp_log_writev` + 运行时级别**，因此串口前缀固定为
+>     `TH:<tag>`，且 `sys_log_set_level()` 才能运行时生效。
+> 11. **分区表已重排**（§12 原表作废）：
+>     `nvs 0x9000/0x6000` · `phy_init 0xf000/0x1000` · `factory 0x10000/0x800000` ·
+>     `storage(data,littlefs) 0x810000/0x200000` · `assets(data,spiffs) 0xa10000/0x5f0000`。
+>     应用名由 `esp32_s31_korvo_factory_demo` 改为 **`todohelper`**。
+> 12. **中文字体方案**：FreeType + 内嵌 GB2312 一级子集（`components/ui_core/fonts/ui_cjk.ttf`，
+>     约 1.2 MB，`tools/gen_cjk_font.py` 生成），回退链为
+>     SD 字体 → 内嵌子集 → LVGL 内置 Source Han Sans SC 16px → Montserrat。§9.2/§12 中
+>     "字体放 SD 或资源分区"的取舍现在是"**内嵌进 app**"，因为字体无法走 mmap 素材管线。
+> 13. **FR6 的 11 个状态全部实现**（不止 P0 的 NORMAL/BLINK），且由**一张参数表**驱动；
+>     §11.3 建议的 `lv_canvas` 未采用，改用"仅描边的圆角对象 + `LV_BORDER_SIDE_TOP` 弧 +
+>     两条 `lv_line` 组成 X 眼 + 子对象瞳孔"，好处是零位图缓冲、可被 LVGL 动画平滑插值。
+> 14. **FR7 的 ASR/TTS 只做到"可配置 HTTP 端点"**：录音与回放是真实可用的，
+>     但 ASR/TTS 选型（§17.2 #6/#7）未定，故只定义了协议（见 `docs/API.md`）。
+>     三条降级路径（无麦克风→键盘/HTTP，无喇叭→仅上屏，无网络→提示）全部实现。
+> 15. **实现顺序**：P0 → P1 → P2 的代码均已完成；**但从未烧录到真机**，
+>     运行期行为零验证。首次上机清单见 `docs/HANDOVER.md` §5。
 
 > v0.4 变更（对齐 `AGENT.md` 实测基线）：
 > 1. 已阅读根目录 `AGENT.md`，§4 硬件基线由"全部待确认"改为**实测值回填**（仅剩天气 API、词库来源、屏幕驱动 IC 型号、MIC/扬声器型号待定）；
@@ -12,6 +65,7 @@
 
 > 文档路径：`docs/TODOHELPER_REQUIREMENTS.md`。本文件可作为其他 Agent 的入口文档。
 > **已阅读并核对根目录 `AGENT.md`（项目现有驱动与环境的权威描述）。**
+> **⚠️ 实现已完成但未经真机验证；接手前请先读 `docs/HANDOVER.md`。**
 > 本文档中涉及已有驱动、引脚、屏幕参数的描述来自 AGENT.md 的实测结论；若与代码实际不符，以**代码与 AGENT.md** 为准并回改本文档。
 
 ---

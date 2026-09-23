@@ -325,6 +325,57 @@ static idle_face_state_t effective_state(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Automatic expressions (requirement 11.2 trigger column)                   */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Maps an L0 notification name to an expression.
+ *
+ * This is deliberately the *whole* coupling between idle_face and the business
+ * layer: producers call `sys_notify("wifi_connected")` (L0) and never learn that
+ * a face exists, while adding a reaction here is one table row and needs no
+ * changes anywhere else. `ai_service` is the one exception that calls
+ * `idle_face_express()` directly, because it has a real state machine of its own.
+ */
+typedef struct {
+    const char *notification;
+    idle_face_state_t state;
+    uint32_t duration_ms;
+} idle_trigger_t;
+
+static const idle_trigger_t s_triggers[] = {
+    { "wifi_connected", IDLE_FACE_HAPPY,    2500 },
+    { "wifi_failed",    IDLE_FACE_ERROR,    3500 },
+    { "net_offline",    IDLE_FACE_SLEEPY,   4000 },
+    { "net_online",     IDLE_FACE_HAPPY,    1800 },
+    { "todo_done",      IDLE_FACE_HAPPY,    2000 },
+    { "sync_started",   IDLE_FACE_SYNCING,  9000 },
+    { "sync_done",      IDLE_FACE_HAPPY,    1500 },
+    { "widget_done",    IDLE_FACE_HAPPY,    1500 },
+};
+
+static void notify_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)id;
+
+    const sys_notify_t *note = (const sys_notify_t *)data;
+    if (note == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(s_triggers) / sizeof(s_triggers[0]); i++) {
+        if (strcmp(note->name, s_triggers[i].notification) != 0) {
+            continue;
+        }
+        SYS_LOGD(TAG, "trigger '%s' -> state %d", note->name, (int)s_triggers[i].state);
+        (void)idle_face_express(s_triggers[i].state, s_triggers[i].duration_ms);
+        return;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Timer                                                                     */
 /* ------------------------------------------------------------------------ */
 
@@ -590,13 +641,25 @@ esp_err_t idle_face_init(void)
     esp_err_t err = ui_page_register(&s_idle_page, 1);
     if (err == ESP_ERR_INVALID_STATE) {
         /* Already registered by a previous init: harmless. */
-        return ESP_OK;
+        err = ESP_OK;
     }
     if (err != ESP_OK) {
         SYS_LOGE(TAG, "page registration failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    SYS_LOGI(TAG, "ready (%d states)", IDLE_FACE_MAX);
+    /* Subscribe at boot, not at attach: the page is created lazily on the first
+     * idle timeout, but the target expression must already be live by then. */
+    static bool subscribed;
+    if (!subscribed) {
+        if (sys_notify_subscribe(notify_handler, NULL, NULL) == ESP_OK) {
+            subscribed = true;
+        } else {
+            SYS_LOGW(TAG, "expression triggers unavailable");
+        }
+    }
+
+    SYS_LOGI(TAG, "ready (%d states, %u triggers)", IDLE_FACE_MAX,
+             (unsigned)(sizeof(s_triggers) / sizeof(s_triggers[0])));
     return ESP_OK;
 }

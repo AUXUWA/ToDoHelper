@@ -516,6 +516,24 @@ static void notify_handler(void *arg, esp_event_base_t base, int32_t id, void *d
     (void)sync_server_broadcast_event(note->name, note->payload);
 }
 
+/**
+ * Connectivity is not a business change but every web client wants to know, so
+ * it is turned into an L0 notification here - which also feeds the idle face's
+ * trigger table without sync_server depending on it.
+ */
+static void connectivity_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)id;
+
+    const bool *online = (const bool *)data;
+    if (online == NULL) {
+        return;
+    }
+    (void)sys_notify(*online ? "net_online" : "net_offline", NULL);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Lifecycle                                                                 */
 /* ------------------------------------------------------------------------ */
@@ -581,6 +599,10 @@ esp_err_t sync_server_start(const sync_server_config_t *cfg)
             notify_subscribed = true;
         } else {
             SYS_LOGW(TAG, "notification relay unavailable");
+        }
+        if (sys_event_subscribe(SYS_EVENT, SYS_EVENT_CONNECTIVITY, connectivity_handler,
+                                NULL, NULL) != ESP_OK) {
+            SYS_LOGW(TAG, "connectivity relay unavailable");
         }
     }
 

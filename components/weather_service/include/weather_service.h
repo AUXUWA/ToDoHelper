@@ -91,6 +91,36 @@ esp_err_t weather_set_city(const char *city);
 /** @brief Currently configured city, "" when unset. */
 const char *weather_get_city(void);
 
+/* ------------------------------------------------------------------------ */
+/* Location (FR3 priority list)                                              */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * @brief Set the coordinates directly and adopt @p label as the display name.
+ *
+ * This is the shared entry point for IP geolocation and for callers that already
+ * know where they are. It overrides a manually chosen city, so the settings page
+ * warns before calling it.
+ */
+esp_err_t weather_set_location(double lat, double lon, const char *label);
+
+/**
+ * @brief Resolve the location from the public IP address (FR3 priority 2).
+ *
+ * Manual city selection stays priority 1 and is never overwritten silently: this
+ * only runs when the caller asks for it, or once at boot when no city is stored.
+ *
+ * Blocking (one HTTP request); the HTTP API and the refresh worker are the
+ * intended callers.
+ */
+esp_err_t weather_detect_location(void);
+
+/** @brief Geolocation endpoint used by weather_detect_location(). */
+const char *weather_get_geo_endpoint(void);
+
+/** @brief Override the geolocation endpoint (must answer city/latitude/longitude). */
+esp_err_t weather_set_geo_endpoint(const char *url);
+
 /** @brief Load the reading stored in cache/weather.json. */
 esp_err_t weather_load_cache(void);
 

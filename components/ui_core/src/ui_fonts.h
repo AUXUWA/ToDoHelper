@@ -19,11 +19,23 @@
 extern "C" {
 #endif
 
-/** Resolve all roles once. Idempotent; must run after th_bsp_init(). */
+/**
+ * @brief Resolve every font role once. Idempotent.
+ *
+ * Must run after th_bsp_init() (the FreeType path needs the LVGL adapter) and
+ * after storage_manager_init() (a font on storage overrides the embedded one).
+ */
 void ui_fonts_init(void);
 
-/** Font for @p role, or NULL when nothing is available (ui_theme falls back). */
+/** @brief Font for @p role, or NULL when nothing is available. */
 const lv_font_t *ui_fonts_get(ui_font_role_t role);
+
+/**
+ * @brief Re-resolve the fonts, dropping any FreeType handles.
+ *
+ * Used when a font file is added or replaced on storage while the device runs.
+ */
+void ui_fonts_reload(void);
 
 #ifdef __cplusplus
 }

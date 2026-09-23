@@ -580,6 +580,11 @@ esp_err_t todo_set_done(uint32_t id, bool done)
 
     post_todo_event(TODO_EVENT_DONE_CHANGED, id);
     after_change();
+
+    /* Ticking something off is worth an expression (FR6 HAPPY). */
+    if (done) {
+        (void)sys_notify("todo_done", NULL);
+    }
     return ESP_OK;
 }
 
@@ -810,6 +815,8 @@ esp_err_t todo_mark_all_synced(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    (void)sys_notify("sync_started", NULL);
+
     size_t changed = 0;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (size_t i = 0; i < s_count; i++) {
@@ -825,6 +832,7 @@ esp_err_t todo_mark_all_synced(void)
         publish_status();
         todo_save();
     }
+    (void)sys_notify("sync_done", NULL);
     SYS_LOGD(TAG, "%u item(s) marked in sync", (unsigned)changed);
     return ESP_OK;
 }

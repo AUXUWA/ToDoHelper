@@ -31,6 +31,8 @@ static const char *TAG = "ui_fonts";
 
 static const lv_font_t *s_fonts[UI_FONT_ROLE_MAX];
 static bool s_initialized;
+/** True when the active fonts came from FreeType, for logs and reload(). */
+static bool s_using_freetype;
 
 #if CONFIG_TODOHELPER_FONT_FREETYPE
 /** Pixel size for each role. Roboto-ish scale suited to a 800x480 panel. */
@@ -176,8 +178,11 @@ void ui_fonts_init(void)
     if (!ft_ok) {
         ft_ok = ft_load_from_memory();
     }
-    if (!ft_ok) {
+    if (ft_ok) {
+        s_using_freetype = true;
+    } else {
         memset(s_fonts, 0, sizeof(s_fonts));
+        SYS_LOGW(TAG, "FreeType font unavailable, falling back to the built-in CJK font");
     }
 #else
     SYS_LOGI(TAG, "FreeType disabled, using built-in fonts");
@@ -196,4 +201,28 @@ const lv_font_t *ui_fonts_get(ui_font_role_t role)
         role = UI_FONT_BODY;
     }
     return s_fonts[role];
+}
+
+void ui_fonts_reload(void)
+{
+    if (!s_initialized) {
+        return;
+    }
+
+#if CONFIG_TODOHELPER_FONT_FREETYPE
+    /* Release the FreeType handles so a replaced file can be re-opened. The
+     * adapter owns the underlying objects and drops them from its list here. */
+    for (int i = 0; i < UI_FONT_ROLE_MAX; i++) {
+        if (s_ft_handles[i] != NULL) {
+            (void)esp_lv_adapter_ft_font_deinit(s_ft_handles[i]);
+            s_ft_handles[i] = NULL;
+        }
+    }
+#endif
+
+    memset(s_fonts, 0, sizeof(s_fonts));
+    s_initialized = false;
+    ui_fonts_init();
+
+    SYS_LOGI(TAG, "fonts reloaded (%s)", s_using_freetype ? "FreeType" : "built-in");
 }

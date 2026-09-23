@@ -160,6 +160,41 @@ static esp_err_t city_post_handler(httpd_req_t *req)
     return http_reply_ok(req, data_json);
 }
 
+static esp_err_t locate_post_handler(httpd_req_t *req)
+{
+    esp_err_t err = weather_detect_location();
+    switch (err) {
+    case ESP_OK:
+        break;
+    case ESP_ERR_INVALID_STATE:
+        return http_reply_unavailable(req, "offline: IP geolocation needs a network");
+    case ESP_ERR_INVALID_RESPONSE:
+        return http_reply_unavailable(req, "geolocation provider returned an unusable response");
+    default:
+        return http_reply_unavailable(req, esp_err_to_name(err));
+    }
+
+    /* Detection only sets the coordinates; fetch the reading before answering so
+     * the caller sees the result of the whole operation. */
+    (void)weather_refresh();
+
+    weather_data_t data;
+    if (weather_get(&data) != ESP_OK) {
+        char partial[96];
+        snprintf(partial, sizeof(partial), "{\"city\":\"%s\",\"valid\":false}",
+                 weather_get_city());
+        return http_reply_ok(req, partial);
+    }
+
+    char *json = weather_to_json(&data);
+    if (json == NULL) {
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "weather");
+    }
+    err = http_reply_ok(req, json);
+    cJSON_free(json);
+    return err;
+}
+
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
     char *body = NULL;
@@ -176,6 +211,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     const cJSON *provider = cJSON_GetObjectItemCaseSensitive(root, "provider");
     const cJSON *key = cJSON_GetObjectItemCaseSensitive(root, "api_key");
     const cJSON *interval = cJSON_GetObjectItemCaseSensitive(root, "interval_s");
+    const cJSON *geo = cJSON_GetObjectItemCaseSensitive(root, "geo_url");
 
     esp_err_t err = ESP_OK;
     if (cJSON_IsString(provider)) {
@@ -191,14 +227,17 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     if (cJSON_IsNumber(interval)) {
         (void)weather_set_interval_s((uint32_t)interval->valuedouble);
     }
+    if (cJSON_IsString(geo)) {
+        (void)weather_set_geo_endpoint(geo->valuestring);
+    }
     cJSON_Delete(root);
 
     /* The API key is deliberately not echoed back. */
-    char data[128];
+    char data[320];
     snprintf(data, sizeof(data),
-             "{\"provider\":\"%s\",\"has_api_key\":%s,\"interval_s\":%u}",
+             "{\"provider\":\"%s\",\"has_api_key\":%s,\"interval_s\":%u,\"geo_url\":\"%s\"}",
              weather_get_provider(), weather_has_api_key() ? "true" : "false",
-             (unsigned)weather_get_interval_s());
+             (unsigned)weather_get_interval_s(), weather_get_geo_endpoint());
     return http_reply_ok(req, data);
 }
 
@@ -212,6 +251,7 @@ esp_err_t weather_service_register_http(void)
         { "/api/v1/weather", HTTP_GET, weather_get_handler },
         { "/api/v1/weather/refresh", HTTP_POST, refresh_post_handler },
         { "/api/v1/weather/city", HTTP_POST, city_post_handler },
+        { "/api/v1/weather/locate", HTTP_POST, locate_post_handler },
         { "/api/v1/weather/config", HTTP_POST, config_post_handler },
     };
 

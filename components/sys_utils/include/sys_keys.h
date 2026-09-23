@@ -42,6 +42,7 @@ extern "C" {
 #define SYS_KEY_WEATHER_KEY    "weather_key"
 #define SYS_KEY_WEATHER_PROV   "weather_prov"
 #define SYS_KEY_WEATHER_INT    "weather_int"
+#define SYS_KEY_GEO_URL        "geo_url"
 
 /* ---- Device / UI ---- */
 #define SYS_KEY_BRIGHTNESS     "brightness"

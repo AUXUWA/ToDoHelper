@@ -38,6 +38,20 @@ ESP_EVENT_DEFINE_BASE(WEATHER_EVENT);
 #define WEATHER_TASK_PRIO  4
 #define WEATHER_REFRESH_WAIT_MS 20000
 
+/**
+ * Default IP geolocation endpoint (FR3 priority 2).
+ *
+ * ipapi.co answers HTTPS without an API key and reports city/latitude/longitude.
+ * Overridable through the NVS key `geo_url`; the parser also accepts the
+ * `lat`/`lon` spelling and a nested `location` object, so switching providers is
+ * usually just a URL change.
+ */
+#define WEATHER_GEO_ENDPOINT_DEFAULT "https://ipapi.co/json/"
+
+/** Worker request opcodes. */
+#define WEATHER_REQ_REFRESH 0
+#define WEATHER_REQ_DETECT  1
+
 /* ------------------------------------------------------------------------ */
 /* State                                                                     */
 /* ------------------------------------------------------------------------ */
@@ -46,6 +60,7 @@ static bool s_initialized;
 static weather_data_t s_data;
 static char s_city[64];
 static char s_provider[24] = WEATHER_PROVIDER_DEFAULT;
+static char s_geo_url[192] = WEATHER_GEO_ENDPOINT_DEFAULT;
 static uint32_t s_interval_s = CONFIG_TODOHELPER_WEATHER_INTERVAL_S;
 
 static StaticSemaphore_t s_lock_buf;
@@ -490,6 +505,132 @@ esp_err_t weather_load_cache(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Location                                                                  */
+/* ------------------------------------------------------------------------ */
+
+const char *weather_get_geo_endpoint(void)
+{
+    return s_geo_url;
+}
+
+esp_err_t weather_set_geo_endpoint(const char *url)
+{
+    if (url == NULL || url[0] == '\0') {
+        strlcpy(s_geo_url, WEATHER_GEO_ENDPOINT_DEFAULT, sizeof(s_geo_url));
+        return sys_config_erase(SYS_KEY_GEO_URL);
+    }
+    if (strlen(url) >= sizeof(s_geo_url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    strlcpy(s_geo_url, url, sizeof(s_geo_url));
+    return sys_config_set_str(SYS_KEY_GEO_URL, s_geo_url);
+}
+
+esp_err_t weather_set_location(double lat, double lon, const char *label)
+{
+    if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_data.lat = lat;
+    s_data.lon = lon;
+    if (label != NULL && label[0] != '\0') {
+        strlcpy(s_city, label, sizeof(s_city));
+    }
+    xSemaphoreGive(s_lock);
+
+    if (label != NULL && label[0] != '\0') {
+        (void)sys_config_set_str(SYS_KEY_CITY, s_city);
+    }
+    char coord[24];
+    snprintf(coord, sizeof(coord), "%.4f", lat);
+    (void)sys_config_set_str(SYS_KEY_CITY_LAT, coord);
+    snprintf(coord, sizeof(coord), "%.4f", lon);
+    (void)sys_config_set_str(SYS_KEY_CITY_LON, coord);
+
+    SYS_LOGI(TAG, "location set to %.4f, %.4f ('%s')", lat, lon, s_city);
+    return ESP_OK;
+}
+
+/** Read a number under any of the spellings the supported providers use. */
+static bool json_number_any(const cJSON *root, const char *const *keys, size_t key_count,
+                            double *out)
+{
+    for (size_t i = 0; i < key_count; i++) {
+        const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, keys[i]);
+        if (cJSON_IsNumber(item)) {
+            *out = item->valuedouble;
+            return true;
+        }
+    }
+    return false;
+}
+
+esp_err_t weather_detect_location(void)
+{
+    sys_status_t st;
+    if (sys_status_get(&st) == ESP_OK && !st.online && !st.wifi_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char *body = NULL;
+    esp_err_t err = weather_http_get_json(s_geo_url, &body);
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "IP geolocation request failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    /* Some providers nest the coordinates under "location". */
+    const cJSON *scope = root;
+    const cJSON *nested = cJSON_GetObjectItemCaseSensitive(root, "location");
+    if (cJSON_IsObject(nested)) {
+        scope = nested;
+    }
+
+    static const char *const lat_keys[] = { "latitude", "lat" };
+    static const char *const lon_keys[] = { "longitude", "lon", "lng" };
+    double lat = 0;
+    double lon = 0;
+
+    if (!json_number_any(scope, lat_keys, 2, &lat) ||
+        !json_number_any(scope, lon_keys, 3, &lon)) {
+        /* A provider that reports a failure usually says so in "status"/"error". */
+        const cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
+        const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+        SYS_LOGW(TAG, "geolocation response unusable (%s / %s)",
+                 cJSON_IsString(status) ? status->valuestring : "?",
+                 cJSON_IsString(reason) ? reason->valuestring : "-");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    char label[64] = { 0 };
+    const cJSON *city = cJSON_GetObjectItemCaseSensitive(scope, "city");
+    const cJSON *region = cJSON_GetObjectItemCaseSensitive(scope, "region");
+    if (cJSON_IsString(city) && city->valuestring[0] != '\0') {
+        strlcpy(label, city->valuestring, sizeof(label));
+    } else if (cJSON_IsString(region)) {
+        strlcpy(label, region->valuestring, sizeof(label));
+    }
+    cJSON_Delete(root);
+
+    err = weather_set_location(lat, lon, label[0] != '\0' ? label : NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+    SYS_LOGI(TAG, "located by IP: %s (%.4f, %.4f)", label, lat, lon);
+    (void)sys_notify("weather_located", NULL);
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Refresh                                                                   */
 /* ------------------------------------------------------------------------ */
 
@@ -567,9 +708,18 @@ static esp_err_t weather_do_refresh(void)
 static void weather_task(void *arg)
 {
     (void)arg;
-    uint8_t token;
+    uint8_t opcode;
 
-    while (xQueueReceive(s_requests, &token, portMAX_DELAY) == pdTRUE) {
+    while (xQueueReceive(s_requests, &opcode, portMAX_DELAY) == pdTRUE) {
+        if (opcode == WEATHER_REQ_DETECT) {
+            /* Priority 2 of the FR3 location list: only used when nothing was
+             * chosen manually, or when the caller explicitly asked for it. */
+            const esp_err_t geo_err = weather_detect_location();
+            if (geo_err != ESP_OK) {
+                SYS_LOGD(TAG, "IP geolocation unavailable (%s)", esp_err_to_name(geo_err));
+            }
+        }
+
         const esp_err_t err = weather_do_refresh();
         if (err != ESP_OK) {
             SYS_LOGW(TAG, "refresh failed: %s", esp_err_to_name(err));
@@ -581,13 +731,26 @@ static void weather_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/** Queue an IP geolocation attempt followed by a refresh. */
+static esp_err_t weather_detect_async(void)
+{
+    if (!s_initialized || s_requests == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint8_t opcode = WEATHER_REQ_DETECT;
+    if (xQueueSend(s_requests, &opcode, 0) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;   /* a request is already queued */
+    }
+    return ESP_OK;
+}
+
 esp_err_t weather_refresh_async(void)
 {
     if (!s_initialized || s_requests == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint8_t token = 1;
-    if (xQueueSend(s_requests, &token, 0) != pdTRUE) {
+    const uint8_t opcode = WEATHER_REQ_REFRESH;
+    if (xQueueSend(s_requests, &opcode, 0) != pdTRUE) {
         /* A refresh is already queued: coalescing is the desired behaviour. */
         return ESP_OK;
     }
@@ -601,8 +764,8 @@ esp_err_t weather_refresh(void)
     }
 
     (void)xSemaphoreTake(s_done, 0);   /* drop a stale completion */
-    const uint8_t token = 0;
-    if (xQueueSend(s_requests, &token, 0) != pdTRUE) {
+    const uint8_t opcode = WEATHER_REQ_REFRESH;
+    if (xQueueSend(s_requests, &opcode, 0) != pdTRUE) {
         /* Someone else is refreshing: wait for that result instead of piling on. */
     }
 
@@ -724,6 +887,8 @@ esp_err_t weather_service_init(void)
     (void)sys_config_get_str_or(SYS_KEY_CITY, s_city, sizeof(s_city), "");
     (void)sys_config_get_str_or(SYS_KEY_WEATHER_PROV, s_provider, sizeof(s_provider),
                                WEATHER_PROVIDER_DEFAULT);
+    (void)sys_config_get_str_or(SYS_KEY_GEO_URL, s_geo_url, sizeof(s_geo_url),
+                               WEATHER_GEO_ENDPOINT_DEFAULT);
     s_interval_s = (uint32_t)sys_config_get_i32_or(SYS_KEY_WEATHER_INT,
                                                   CONFIG_TODOHELPER_WEATHER_INTERVAL_S);
 
@@ -756,13 +921,18 @@ esp_err_t weather_service_init(void)
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
     }
 
-    SYS_LOGI(TAG, "ready (provider '%s', city '%s', every %u s)",
+    SYS_LOGI(TAG, "ready (provider '%s', city '%s', every %u s, geo endpoint '%s')",
              weather_provider_current()->name, s_city[0] ? s_city : "<unset>",
-             (unsigned)s_interval_s);
+             (unsigned)s_interval_s, s_geo_url);
 
-    /* A city may already be stored; fetching at boot keeps the page current. */
     if (s_city[0] != '\0') {
+        /* A city is already configured: keep it and just refresh. */
         (void)weather_refresh_async();
+    } else {
+        /* FR3 location priority 2: with nothing configured, try the public IP so
+         * the page is useful on the very first boot without any setup. */
+        SYS_LOGI(TAG, "no city configured, trying IP geolocation");
+        (void)weather_detect_async();
     }
     return ESP_OK;
 }

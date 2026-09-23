@@ -224,6 +224,7 @@ static void reconnect_timer_cb(void *arg)
         set_state(WIFI_MGR_FAILED);
         (void)sys_event_post_to(WIFI_MGR_EVENT, WIFI_MGR_EVENT_FAILED,
                                 &s_last_reason, sizeof(s_last_reason));
+        (void)sys_notify("wifi_failed", NULL);
         return;
     }
 
@@ -271,6 +272,9 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     (void)sys_event_post_to(WIFI_MGR_EVENT, WIFI_MGR_EVENT_GOT_IP, NULL, 0);
     bool online = true;
     (void)sys_event_post_to(SYS_EVENT, SYS_EVENT_CONNECTIVITY, &online, sizeof(online));
+    /* L0 notification so the idle face can celebrate without wifi_manager
+     * knowing it exists (see idle_face's trigger table). */
+    (void)sys_notify("wifi_connected", NULL);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)

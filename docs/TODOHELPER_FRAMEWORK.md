@@ -36,6 +36,7 @@ components/
   storage_manager/     L1  存储根路径抽象（SD → LittleFS 回退）+ 文件与缓存 API
   bsp/                 L1  板级门面：显示启动、亮度、按键→事件、LED、音频
   ui_core/             L2  页面注册表 / 导航 / 状态栏 / 锁 / 主题 / 字体 / 提示
+  ui_assets/           L2  assets 分区打包（本组件拥有）+ 图标按基名解析
   wifi_manager/        L3  FR1
   todo_manager/        L3  FR2（含 HTTP API 注册）
   weather_service/     L3  FR3
@@ -59,7 +60,7 @@ tools/                 开发辅助脚本（如 gen_cjk_font.py）
 L5  ai_service, voice_service
 L4  sync_server, idle_face, ui_pages
 L3  wifi_manager, todo_manager, weather_service, calendar_service, word_service
-L2  ui_core
+L2  ui_assets, ui_core
 L1  http_router, storage_manager, bsp
 L0  sys_utils
 --------------------------------------------------> 依赖只能向下，绝不向上或横向
@@ -68,7 +69,9 @@ L0  sys_utils
 **规则**
 
 - L3 组件之间**不得**互相 `REQUIRES`：需要对方数据时，订阅对方事件或由 `main` 注入回调；
-- `ui_pages` / `idle_face` 不得被任何组件依赖（只有 `main` 依赖它们）；
+- `ui_core` / `ui_assets` / `idle_face` **不得被任何业务组件依赖**；
+- **`ui_pages` 是组合层**：它可以依赖任意非 UI 组件（`wifi_manager`、`sync_server`、
+  `ai_service` …），因为没人依赖它，不会成环；
 - **HTTP 路由反向注册**：业务组件向 L1 的 `http_router` 注册路由，
   `sync_server`（L4）只负责起服务并把 `http_router` 挂上去。
   这样 `todo_manager`（L3）不需要依赖 `sync_server`（L4），也没有组件被它依赖；
@@ -271,15 +274,26 @@ esp_err_t ui_nav_back(void);
 ```c
 typedef enum { UI_FONT_SMALL, UI_FONT_BODY, UI_FONT_TITLE, UI_FONT_HUGE, UI_FONT_ROLE_MAX } ui_font_role_t;
 const lv_font_t *ui_font(ui_font_role_t role);
+void ui_fonts_reload(void);   /* 运行中替换了 SD 上的字体时调用 */
 ```
 
 解析顺序（首个可用者胜出），保证**任何情况下都有中文字形**：
 
-1. **FreeType TTF**（`<storage>/todohelper/fonts/ui.ttf` 或 assets 分区内）→ 全 Unicode + 任意字号；
-2. **LVGL 内置 CJK**（`lv_font_source_han_sans_sc_16_cjk`）→ 开箱即用的中文；
-3. **Montserrat**（内置）→ 仅拉丁字形，最后兜底。
+1. **FreeType TTF（SD 卡）**：`<storage>/todohelper/fonts/ui.ttf`——换字体不用重新烧录；
+2. **FreeType TTF（内嵌）**：`components/ui_core/fonts/ui_cjk.ttf`，由
+   `tools/gen_cjk_font.py` 生成（Noto Sans SC 可变字体钉到 wght=400 + GB2312 一级
+   3755 常用字 + ASCII + 标点，约 **1.2 MB**），经 `EMBED_FILES` 内嵌；
+3. **LVGL 内置 CJK**：`lv_font_source_han_sans_sc_16_cjk`——FreeType 或字体文件不可用时的兜底；
+4. **Montserrat**（内置）：仅拉丁字形，最后兜底。
 
-新增字体只需往 `assets/ui/fonts/` 放文件，无需改代码。
+实测要点：
+
+- 字号按角色固定为 16/20/28/48 px，都由**同一个** TTF 渲染，因此中英文粗细一致；
+- `CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL=y` 把渲染池压到 4 KB 并去掉 LVGL
+  的 32 KB 绘制栈构建期检查；`..._MINIMAL_BUILD=y` 去掉用不到的字体驱动与压缩流支持；
+- 关掉 `CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK` 就没有中文兜底，**不要关**；
+- 字体**不能**走 `assets` 素材分区（`esp_mmap_assets` 只打包
+  `MMAP_FILE_SUPPORT_FORMAT` 里的后缀），所以用 `EMBED_FILES`。
 
 ### 5.6 `http_router`（L1）
 
@@ -376,6 +390,24 @@ esp_err_t sys_notify_subscribe(esp_event_handler_t handler, void *arg,
 用途：L3 服务想通知 UI/Web"数据变了"时，调 `sys_notify("todo_changed", NULL)`，
 **不需要**知道 `ui_core` 或 `sync_server` 的存在。载荷按值拷贝进事件队列，
 接收方永远不会拿到悬空指针（因此限制在 216 B 内；大块数据请接收方回查 API）。
+
+**已落地的通知及其消费者**：
+
+| 通知名 | 发送方 | 消费者 / 效果 |
+|---|---|---|
+| `todo_changed` | `todo_manager`（每次变更） | `sync_server` → SSE `todo_changed`；网页重新拉列表 |
+| `todo_done` | `todo_manager`（勾选为完成） | `idle_face` → HAPPY 2 s |
+| `sync_started` / `sync_done` | `todo_manager::todo_mark_all_synced()` | `idle_face` → SYNCING 9 s / HAPPY 1.5 s |
+| `wifi_connected` | `wifi_manager`（GOT_IP） | `idle_face` → HAPPY 2.5 s |
+| `wifi_failed` | `wifi_manager`（重试耗尽） | `idle_face` → ERROR 3.5 s |
+| `net_online` / `net_offline` | `sync_server`（订阅 `SYS_EVENT_CONNECTIVITY`） | SSE + `idle_face` → HAPPY / SLEEPY |
+| `weather_changed` / `weather_located` | `weather_service` | SSE（网页刷新） |
+| `word_reviewed` | `word_service` | SSE |
+
+**`idle_face` 的表情触发就是这张表的子集**（`idle_face.c` 的 `s_triggers[]`）：
+新增一种反应 = 在触发表加一行 + 让生产者 `sys_notify()`，**两处，无其它改动**。
+唯一例外是 `ai_service`：它有自己的状态机，直接调 `idle_face_express()`
+（LISTENING / THINKING / SPEAKING / ERROR），因为"说话中"这种状态需要持续时长而非一次性触发。
 
 ### 5.9 业务组件
 
@@ -529,23 +561,24 @@ static const app_module_t s_modules[] = {
 
 ## 10. 里程碑
 
-| 阶段 | 内容 | 完成判据 |
+| 阶段 | 内容 | 状态 |
 |---|---|---|
-| **A 框架** | 分区表/工程骨架 + 摘除咖啡机 + `sys_utils`/`storage_manager`/`bsp`/`ui_core` + 新 `app_main.c` | `idf.py build` 成功；设备起来有首页 + 状态栏 |
-| **B P0 业务** | wifi/todo/weather/calendar/word + sync_server(Todo API) + idle_face(NORMAL/BLINK) + 全部页面 | 需求 §15 前 5 条 + 构建成功 |
-| **C P1** | 设置页/鉴权/mDNS/缓存降级/SSE/SD 素材与字体/表情丰富 | 需求 §15 全部验收 |
-| **D P2** | ai_service + voice_service + 小眼睛联动 | FR7 语音提问→文字上屏 |
+| **A 框架** | 分区表/工程骨架 + 摘除咖啡机 + `sys_utils`/`http_router`/`storage_manager`/`bsp`/`ui_assets`/`ui_core` + 新 `app_main.c` | ✅ `idf.py build` 通过，**未上机** |
+| **B P0 业务** | wifi/todo/weather/calendar/word + sync_server + idle_face(NORMAL/BLINK) + 全部页面 | ✅ 代码完成，**未上机** |
+| **C P1** | 设置页/鉴权/mDNS/缓存降级/SSE/内嵌 CJK 字体/表情自动触发/IP 定位 | ✅ 代码完成，**未上机** |
+| **D P2** | ai_service + voice_service + 小眼睛联动 + AI 对话页 | ✅ 代码完成；ASR/TTS 仅定义协议，**未上机** |
 
-### 并行分工（B 阶段）
+> ⚠️ **全部四个阶段的共同前提是"编译通过"而非"真机验证"**。首次上机的逐项清单、
+> 最可能出问题的位置、以及开放决策见 `docs/HANDOVER.md`。
 
-`sys_utils`/`storage_manager`/`ui_core` 冻结后，B 阶段可 4 路并行：
+### 并行分工（B 阶段，历史记录）
+
+`sys_utils`/`http_router`/`storage_manager`/`ui_core` 冻结后，B 阶段可 5 路并行：
 
 | 路 | 负责 | 依赖 |
 |---|---|---|
 | B1 | `wifi_manager` | sys_utils |
-| B2 | `todo_manager` + `sync_server` | sys_utils, storage_manager |
+| B2 | `todo_manager` + `sync_server` | sys_utils, storage_manager, http_router |
 | B3 | `weather_service` + `calendar_service` | sys_utils, storage_manager, wifi 事件 |
 | B4 | `word_service` + `idle_face` | sys_utils, storage_manager, ui_core |
 | B5 | `ui_pages`（全部页面） | ui_core + 各 service 的**头文件**（不依赖其实现） |
-
-每路交付后由主线统一 `idf.py build` 验收（并行期间各自保证单组件可编译）。

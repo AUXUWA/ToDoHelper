@@ -42,12 +42,29 @@ CONFIG_FATFS_MAX_LFN=255
 CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=n
 CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
 
-# ToDoHelper: Chinese UI text. The built-in Source Han Sans SC CJK font is the last-resort
-# fallback behind the FreeType/SD font path (see docs/TODOHELPER_FRAMEWORK.md 5.5).
+# ToDoHelper: Chinese UI text.
+#
+# Primary path is FreeType rendering the CJK subset embedded by ui_core
+# (components/ui_core/fonts/ui_cjk.ttf, produced by tools/gen_cjk_font.py).
+# The built-in Source Han Sans SC 16 px font is kept as the safety net that
+# ui_fonts.c falls back to when FreeType or the TTF is unavailable, so Chinese
+# never degrades into empty boxes. The 14 px built-in is disabled because
+# FreeType covers every size and the built-in costs ~1 MB of rodata.
 CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
-CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_14_CJK=y
 CONFIG_LV_FONT_DEFAULT_SOURCE_HAN_SANS_SC_16_CJK=y
+# CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_14_CJK is not set
 # CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14 is not set
+
+# FreeType: scalable text at every role (16/20/28/48 px) from one subset font.
+# SMALL_RENDER_POOL keeps FreeType's render pool at 4 KB (instead of 16 KB) and
+# removes LVGL's conservative 32 KB FreeType draw-stack build-time check;
+# MINIMAL_BUILD drops the font drivers we never use (Type1/CID/PFR/BDF/PCF/FNT
+# and the gzip/lzw/bzip2 stream helpers) to save flash.
+CONFIG_LV_USE_FREETYPE=y
+CONFIG_ESP_LVGL_ADAPTER_ENABLE_FREETYPE=y
+CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL=y
+CONFIG_ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD=y
+CONFIG_TODOHELPER_FONT_FREETYPE=y
 
 # Display / UI
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_FS=y
