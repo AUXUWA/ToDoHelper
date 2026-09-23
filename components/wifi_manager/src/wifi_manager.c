@@ -41,6 +41,7 @@ ESP_EVENT_DEFINE_BASE(WIFI_MGR_EVENT);
 #define WIFI_SCAN_TASK_PRIO   5
 
 static void scan_worker(void *arg);
+static void push_status(void);
 
 static bool s_initialized;
 static esp_netif_t *s_netif;
@@ -64,6 +65,7 @@ static QueueHandle_t s_scan_cmd;           /* commands for the scan worker */
 static TaskHandle_t s_scan_task;
 static esp_timer_handle_t s_prescan_timer;
 static esp_timer_handle_t s_reconnect_timer;
+static esp_timer_handle_t s_health_timer;
 
 /** Work the scan worker performs. */
 typedef enum {
@@ -147,6 +149,37 @@ static void prescan_timer_cb(void *arg)
 {
     (void)arg;
     scan_request();
+}
+
+/**
+ * Print the link state periodically, independent of the screen.
+ *
+ * The device once stopped answering ping and HTTP after the screen went idle
+ * while logging nothing at all, which made "is the link down, or did the AP drop
+ * us, or is the app wedged?" unanswerable. This makes it answerable.
+ */
+static void health_timer_cb(void *arg)
+{
+    (void)arg;
+
+    wifi_ap_record_t ap = { 0 };
+    const esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err == ESP_OK) {
+        s_rssi = ap.rssi;
+    }
+
+    sys_status_t st;
+    const bool have_st = (sys_status_get(&st) == ESP_OK);
+
+    SYS_LOGI(TAG, "link: state=%s ap_info=%s rssi=%d ip=%s uptime=%llu s",
+             wifi_manager_state_name(s_state), esp_err_to_name(err),
+             (int)s_rssi, s_ip, (unsigned long long)(sys_time_ms() / 1000));
+
+    /* Keep sys_status fresh so the UI never shows a stale dBm (see the GOT_IP
+     * path: set_state() early-returns when the state is unchanged). */
+    if (have_st && st.wifi_connected) {
+        push_status();
+    }
 }
 
 static void scan_worker(void *arg)
@@ -548,23 +581,25 @@ esp_err_t wifi_manager_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
     /*
-     * No modem sleep.
+     * After esp_wifi_start(), not before.
      *
      * With the default power save the PHY is powered down and re-enabled around
      * radio activity, and that re-enable path (pm_wake_up -> esp_phy_enable ->
-     * phy_track_pll_init -> esp_timer_create) needs internal RAM. On this board
-     * internal RAM is the scarcest resource, and the allocation failed with
-     * ESP_ERR_NO_MEM, aborting the device:
+     * phy_track_pll_init -> esp_timer_create) needs internal RAM - which is the
+     * scarcest resource here, so that allocation failed with ESP_ERR_NO_MEM and
+     * aborted the device:
      *
      *   ESP_ERROR_CHECK failed: esp_err_t 0x101 (ESP_ERR_NO_MEM)
      *     at phy_track_pll_init (phy_common.c:126)
      *
-     * This is a mains-powered desktop device, so modem sleep buys nothing and
-     * costs both internal RAM churn and latency.
+     * Setting the policy before esp_wifi_start() is not reliable - start applies
+     * its own default - so it is done here. This is a mains-powered desktop
+     * device: modem sleep buys nothing and costs both internal-RAM churn and
+     * latency, and it risks the AP dropping us while the screen is idle.
      */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
     const esp_timer_create_args_t timer_args = {
         .callback = reconnect_timer_cb,
@@ -591,6 +626,24 @@ esp_err_t wifi_manager_init(void)
     esp_err_t http_err = wifi_manager_register_http();
     if (http_err != ESP_OK) {
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
+    }
+
+    /*
+     * Periodic link report.
+     *
+     * Added because the device stopped answering ping/HTTP after the screen went
+     * idle (~30 s in) while still logging nothing, so we could not tell whether
+     * the link was actually down or the AP had dropped us. This prints the truth
+     * every 30 s regardless of screen state.
+     */
+    const esp_timer_create_args_t health_args = {
+        .callback = health_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "wifi_health",
+    };
+    if (s_health_timer == NULL && esp_timer_create(&health_args, &s_health_timer) == ESP_OK) {
+        (void)esp_timer_start_periodic(s_health_timer, 30 * 1000 * 1000);
     }
 
 #if CONFIG_TODOHELPER_WIFI_AUTO_CONNECT

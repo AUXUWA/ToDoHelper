@@ -317,6 +317,36 @@ Project build complete.
     --port COM34 --seconds 30 --out build\boot.log
 ```
 
+### 8.2 烧录速度：用 `tools/flash.ps1`，别用 `idf.py flash`
+
+`idf.py flash` 在这个目标上比必要的**慢约 3.4 倍**。4.16 MB 镜像实测：
+
+| 方式 | 耗时 | 有效速率 |
+|---|---|---|
+| `idf.py flash`（460800 + `--no-stub`） | **147.9 s** | 224.6 kbit/s |
+| 921600 + `--no-stub` | 98.7 s | 337.4 kbit/s |
+| **921600 + stub loader（压缩）** | **35.8 s** | 930.9 kbit/s |
+
+两个原因：
+
+1. **`idf.py` 对 esp32s31 硬编码了 `--no-stub`** —— 走 ROM 下载协议，**不压缩**、
+   分块更小。去掉它就启用 stub loader，镜像被压缩（4.16 MB → 2.57 MB）。
+   这是主要收益：端到端 **148 s → 44 s**。
+2. **上传波特率默认 460800，而它在 IDF v6 里不是 Kconfig 选项**
+   （没有 `CONFIG_ESPTOOLPY_BAUD*` 符号可设），只能用 `-b` 或 `ESPBAUD` 环境变量。
+
+所以本工程提供 `tools/flash.ps1` 封装这条快路径（并顺手关掉占用串口的 monitor）：
+
+```powershell
+pwsh tools/flash.ps1              # 构建 + 快速烧录
+pwsh tools/flash.ps1 -NoBuild     # 只烧录
+pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
+```
+
+> **还能再快**：app 里 **1.2 MB 是内嵌的 CJK 字体**（占全镜像 30%），而这份字体
+> 已经在 SD 卡上（`/sdcard/todohelper/fonts/ui_cjk.ttf`）。不再内嵌它可把镜像压到
+> 约 2.9 MB。用 `idf.py size-components` 可随时复核体积构成。
+
 ---
 
 ## 9. 注意事项与坑
