@@ -35,7 +35,9 @@ extern const ui_page_t page_calendar;
 extern const ui_page_t page_word;
 extern const ui_page_t page_ai_chat;
 extern const ui_page_t page_settings;
-extern const ui_page_t page_idle_face;
+
+/* UI_PAGE_IDLE_FACE is registered by the idle_face component itself
+ * (idle_face_init() -> ui_page_register), so it is deliberately absent here. */
 
 /**
  * @brief Build a "coming soon" page body.

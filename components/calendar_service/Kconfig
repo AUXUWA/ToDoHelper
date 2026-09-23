@@ -1,0 +1,17 @@
+menu "ToDoHelper: calendar / time service"
+
+    config TODOHELPER_NTP_SERVER
+        string "Default NTP server"
+        default "ntp.aliyun.com"
+        help
+            Used when the NVS key `ntp_server` is absent. The device has no RTC,
+            so the clock is only valid after a successful SNTP sync.
+
+    config TODOHELPER_TZ_DEFAULT
+        string "Default POSIX timezone"
+        default "CST-8"
+        help
+            POSIX TZ string, e.g. "CST-8" for UTC+8 or "UTC0".
+            Overridable at runtime through the NVS key `tz`.
+
+endmenu

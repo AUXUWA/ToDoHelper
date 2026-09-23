@@ -13,7 +13,11 @@ idf_component_register(
         ui_pages
         wifi_manager
         todo_manager
+        calendar_service
+        weather_service
+        word_service
         sync_server
+        idle_face
 )
 
 if(NOT EXISTS "${TODOHELPER_ASSETS_DIR}")

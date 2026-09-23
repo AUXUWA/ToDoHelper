@@ -116,30 +116,3 @@ static esp_err_t settings_create(lv_obj_t *parent)
 const ui_page_t page_settings = {
     .id = UI_PAGE_SETTINGS, .name = "settings", .create = settings_create,
 };
-
-/* ---- FR6 Idle face ----------------------------------------------------- */
-
-static esp_err_t idle_face_create(lv_obj_t *parent)
-{
-    /* Replaced by the idle_face component in the FR6 milestone. */
-    lv_obj_t *box = lv_obj_create(parent);
-    if (box == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    lv_obj_remove_style_all(box);
-    lv_obj_set_size(box, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(box, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
-    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *label = lv_label_create(box);
-    lv_label_set_text(label, "( o o )");
-    lv_obj_set_style_text_font(label, ui_font(UI_FONT_HUGE), 0);
-    lv_obj_set_style_text_color(label, UI_COLOR_IDLE_FG, 0);
-    return ESP_OK;
-}
-const ui_page_t page_idle_face = {
-    .id = UI_PAGE_IDLE_FACE, .name = "idle_face", .create = idle_face_create,
-};

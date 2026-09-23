@@ -41,6 +41,7 @@ extern "C" {
 #define SYS_KEY_NTP_SERVER     "ntp_server"
 #define SYS_KEY_WEATHER_KEY    "weather_key"
 #define SYS_KEY_WEATHER_PROV   "weather_prov"
+#define SYS_KEY_WEATHER_INT    "weather_int"
 
 /* ---- Device / UI ---- */
 #define SYS_KEY_BRIGHTNESS     "brightness"

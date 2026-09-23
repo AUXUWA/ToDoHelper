@@ -493,6 +493,10 @@ static esp_err_t enter_idle(void)
     esp_err_t err = ui_page_switch(UI_PAGE_IDLE_FACE);
     if (err != ESP_OK) {
         SYS_LOGD(TAG, "idle page unavailable (%s), dimming only", esp_err_to_name(err));
+    } else if (s_statusbar != NULL) {
+        /* Requirement 11.1: the idle screen is full black, so the status bar
+         * (which lives outside the page container) has to go too. */
+        lv_obj_add_flag(s_statusbar, LV_OBJ_FLAG_HIDDEN);
     }
 
     int32_t dim = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 20);
@@ -515,6 +519,10 @@ static esp_err_t leave_idle(void)
         bright = 100;
     }
     (void)th_bsp_set_brightness((uint8_t)bright);
+
+    if (s_statusbar != NULL) {
+        lv_obj_remove_flag(s_statusbar, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (s_current == UI_PAGE_IDLE_FACE) {
         (void)ui_page_switch(s_page_before_idle);

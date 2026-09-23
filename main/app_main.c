@@ -25,6 +25,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "calendar_service.h"
+#include "idle_face.h"
 #include "storage_manager.h"
 #include "sync_server.h"
 #include "sys_utils.h"
@@ -33,7 +35,9 @@
 #include "ui_core.h"
 #include "ui_pages.h"
 #include "ui_theme.h"
+#include "weather_service.h"
 #include "wifi_manager.h"
+#include "word_service.h"
 
 static const char *TAG = "app";
 
@@ -50,11 +54,11 @@ typedef struct {
 static const app_module_t s_modules[] = {
     { .name = "wifi_manager",     .init = wifi_manager_init, .optional = true,  .after_ui = true },
     { .name = "todo_manager",     .init = todo_manager_init, .optional = true,  .after_ui = true },
-    { .name = "weather_service",  .init = NULL, .optional = true,  .after_ui = true },
-    { .name = "calendar_service", .init = NULL, .optional = true,  .after_ui = true },
-    { .name = "word_service",     .init = NULL, .optional = true,  .after_ui = true },
+    { .name = "weather_service",  .init = weather_service_init, .optional = true,  .after_ui = true },
+    { .name = "calendar_service", .init = calendar_service_init, .optional = true, .after_ui = true },
+    { .name = "word_service",     .init = word_service_init, .optional = true,  .after_ui = true },
     { .name = "sync_server",      .init = sync_server_init, .optional = true,  .after_ui = true },
-    { .name = "idle_face",        .init = NULL, .optional = true,  .after_ui = true },
+    { .name = "idle_face",        .init = idle_face_init, .optional = true,  .after_ui = true },
 };
 
 static esp_err_t run_modules(bool after_ui)

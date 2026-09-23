@@ -1,0 +1,16 @@
+menu "ToDoHelper: weather service"
+
+    config TODOHELPER_WEATHER_INTERVAL_S
+        int "Default refresh period (seconds)"
+        range 300 86400
+        default 900
+        help
+            Requirement FR3 asks for 15 minutes. Overridable at runtime through
+            the NVS key `weather_int`.
+
+    config TODOHELPER_WEATHER_HTTP_TIMEOUT_MS
+        int "HTTP timeout for weather requests (ms)"
+        range 3000 60000
+        default 12000
+
+endmenu

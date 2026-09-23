@@ -1,0 +1,23 @@
+menu "ToDoHelper: idle face"
+
+    config TODOHELPER_IDLE_EYE_WIDTH
+        int "Base eye width in pixels"
+        range 60 300
+        default 150
+
+    config TODOHELPER_IDLE_EYE_HEIGHT
+        int "Base eye height in pixels"
+        range 40 300
+        default 150
+
+    config TODOHELPER_IDLE_EYE_GAP
+        int "Horizontal gap between the eyes in pixels"
+        range 20 400
+        default 96
+
+    config TODOHELPER_IDLE_LINE_WIDTH
+        int "Eye outline thickness in pixels"
+        range 2 20
+        default 8
+
+endmenu

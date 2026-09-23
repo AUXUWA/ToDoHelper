@@ -28,7 +28,6 @@ static const ui_page_t *const s_pages[] = {
     &page_word,
     &page_ai_chat,
     &page_settings,
-    &page_idle_face,
 };
 
 esp_err_t ui_pages_init(void)
