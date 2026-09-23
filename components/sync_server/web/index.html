@@ -1196,7 +1196,7 @@ function ssePollStop() {
   if (sse.poll) { clearInterval(sse.poll); sse.poll = 0; }
 }
 
-/* 推送断开：降级到轮询，并按退避重连（设备端 SSE 上限 4 个客户端）。 */
+/* 推送断开：降级到轮询，并按退避重连（设备端 SSE 上限 3 个客户端）。 */
 function sseDown(reason) {
   sse.live = false;
   sse.fails += 1;
@@ -1268,7 +1268,7 @@ function sseViaFetch() {
     if (sse.controller !== controller) { return null; }
     if (response.status === 503) {
       sse.controller = null;
-      sseDown("设备推送客户端已满（最多 4 个）");
+      sseDown("设备推送客户端已满（最多 3 个，关掉其它已打开的页面即可）");
       return null;
     }
     if (response.status === 401) {
@@ -1369,7 +1369,7 @@ document.addEventListener("visibilitychange", function () {
   if (!sse.live) { sseStart(); }
 });
 
-/* 关标签页时主动释放设备上宝贵的 SSE 名额（设备最多 4 个客户端）。 */
+/* 关标签页时主动释放设备上宝贵的 SSE 名额（设备最多 3 个客户端）。 */
 window.addEventListener("pagehide", function () { sseStop(); ssePollStop(); });
 window.addEventListener("pageshow", function (event) {
   if (event.persisted) { loadAll(); loadDevice(); sseStart(); }

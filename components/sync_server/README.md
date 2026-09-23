@@ -31,7 +31,9 @@
    `init()` **幂等**，且把失败当作可恢复：`SYS_LOGW` 之后设备其余部分照常运行（需求 §15）。
 2. **httpd 配置偏保守**：`uri_match_fn = httpd_uri_match_wildcard`、`lru_purge_enable = true`、
    `max_uri_handlers = 4`（catch-all 只占一个）、`max_open_sockets = 5`、`stack_size = 6144`、
-   收发超时各 5 秒。SSE 会长期占用 socket，所以并发数很小。
+   收发超时各 5 秒。SSE 会长期占用 socket，所以并发数很小（见第 6 条）。
+   `lru_purge_enable` 在 socket 用满时会关掉**最久未用**的会话，但**异步会话（SSE）不会被回收**
+   （`esp_httpd_priv.h`: `for_async_req` 的 socket 不参与 LRU purge），所以 SSE 不会被新连接踢掉。
 3. **mDNS**：默认发布主机名 `todohelper`（`SYNC_SERVER_DEFAULT_HOSTNAME`）+ 服务 `_http._tcp`，
    于是浏览器可用 **`http://todohelper.local`**。`sys_server_url()` 在 mDNS 打开时返回
    `http://<hostname>.local`，否则退回 `http://<本机 IP>`（来自 `wifi_manager_get_ip()`）。
@@ -43,12 +45,20 @@
    都会被转成 SSE 事件（`sync_server_broadcast_event()`），这就是 `sync_server` 不需要依赖各业务组件的原因。
    没有 SSE 客户端时直接跳过格式化。
 6. **SSE 设计（需求 §8.7）**：`/api/v1/events` 是 GET，返回 `text/event-stream`。
-   - **每客户端一个 FreeRTOS 队列**（深度 8，元素是 `char *`），最多 **`SYNC_SSE_MAX_CLIENTS` = 4** 个，
-     第 5 个客户端收到 **503** `"too many event subscribers"`；
+   - **必须走异步 handler**：`events_get_handler()` 调 `httpd_req_async_handler_begin()` 把 socket
+     交给一个**每客户端一个的任务**（`sse_client_task`，3 KB 内部栈），然后**立即返回**。
+     原因：`esp_http_server` 的 URI handler 在**唯一的 httpd 任务里串行执行**，一个不返回的
+     handler 会把整台服务器拦死（实测：挂 1 个 `curl -N /api/v1/events` 后 `GET /` 与所有 API
+     全部超时，客户端断开立刻恢复）。任务结束时必须 `httpd_req_async_handler_complete()`，
+     否则会话槽永久泄漏、httpd 最终完全不再 accept（AGENT.md §9.0.1 最后一条）。
+   - **每客户端一个 FreeRTOS 队列**（深度 8，元素是 `char *`），最多 **`SYNC_SSE_MAX_CLIENTS` = 3** 个
+     （每个客户端 = 1 个 httpd 会话槽 + 1 个任务，服务器总共只有 5 个会话槽，所以至少给页面和
+     REST 调用留 2 个），第 4 个客户端收到 **503** `"too many event subscribers"`；
    - 连接建立先发 `retry: 3000`；
    - 广播时给每个队列 `strdup()` 一份 payload，`xQueueSend` **零等待**：队列满就 `free()` 并**丢弃该事件**，
      **绝不阻塞发布者**（慢客户端只丢自己的事件）；
    - 空闲 15 秒（`SYNC_SSE_KEEPALIVE_MS`）发一行 `: keepalive` 注释，防止 NAT/代理掐连接；
+     这也是**发现"客户端悄悄消失"的最坏延迟**（浏览器被关、WiFi 掉线时，只有发送失败才会察觉）；
    - 断连时 `sse_unregister()` 排空并删除队列，`sync_server_sse_clients()` 反映当前订阅数。
 7. **鉴权模型（需求 §8.8）**：默认 `auth_enabled = false`（局域网内免鉴权，方便电脑端直接改待办）。
    一旦通过 `sync_server_set_auth_token()` 设过 token（NVS 键 `auth_token`，**不硬编码、不写日志**），
@@ -125,11 +135,21 @@ curl.exe -N http://todohelper.local/api/v1/events            # 先收到 retry: 
 SSE 与鉴权：
 
 ```
-I (xxx) TH:sync: SSE client attached (1/4)
+I (xxx) TH:sync: SSE client attached (1/3)
 I (xxx) TH:sync: SSE client detached (0 left)
 I (xxx) TH:sync: HTTP authentication enabled        # 设置 token 后；token 本身不打印
 I (xxx) TH:sync: auth failed for /api/v1/device/reboot
 ```
 
-用 5 个并发 `curl -N /api/v1/events` 验证上限：第 5 个应立刻收到 503 `too many event subscribers`；
+**回归测试（这一条最重要，别省）**：用 3 个并发 `curl -N /api/v1/events` 挂着，然后
+
+```powershell
+curl.exe -s -o NUL -m 8 -w "%{http_code}" http://todohelper.local/           # 必须 200，不能超时
+curl.exe -s -o NUL -m 8 -w "%{http_code}" http://todohelper.local/api/v1/todos
+curl.exe -m 8 http://todohelper.local/api/v1/device/status                   # sse_clients 应为 3
+curl.exe -s -o NUL -m 8 -w "%{http_code}" http://todohelper.local/api/v1/events  # 第 4 个 → 503
+```
+
+再把 3 个客户端杀掉，约 15 秒后 `sse_clients` 应回到 0。**若挂上流以后普通请求超时，
+说明 handler 又变回同步实现（整个服务器被冻住了）**。
 用 `curl.exe -X POST http://todohelper.local/api/v1/todos ...`（不带 token）验证开启鉴权后写操作返回 401。

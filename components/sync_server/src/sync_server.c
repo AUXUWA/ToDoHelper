@@ -36,10 +36,25 @@ static const char *const s_always_auth[] = {
     "/api/v1/ai/history",
 };
 
-/** Concurrent SSE subscribers. */
-#define SYNC_SSE_MAX_CLIENTS 4
-/** Keepalive interval for idle SSE connections. */
+/**
+ * Concurrent SSE subscribers.
+ *
+ * Each subscriber costs one httpd session slot *and* one dedicated task, and the
+ * server only has `max_open_sockets` (5) sessions in total, so leave at least
+ * two slots for the page and the REST calls.
+ */
+#define SYNC_SSE_MAX_CLIENTS 3
+/**
+ * Keepalive interval for idle SSE connections.
+ *
+ * This is also the worst case in which a client that vanished without closing
+ * its socket (browser killed, WiFi dropped) is noticed: the streaming task only
+ * learns that the peer is gone when a send fails.
+ */
 #define SYNC_SSE_KEEPALIVE_MS 15000
+/** Stack for the per-subscriber streaming task (internal RAM: it talks to LWIP/WiFi). */
+#define SYNC_SSE_TASK_STACK 3072
+#define SYNC_SSE_TASK_PRIO 4
 
 /* The build system generates these for EMBED_FILES "web/index.html". */
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
@@ -417,6 +432,69 @@ esp_err_t sync_server_broadcast_event(const char *event_name, const char *json_p
     return ESP_OK;
 }
 
+/**
+ * A streaming subscriber.
+ *
+ * `req` is an *async* copy owned by this task. This is essential:
+ * esp_http_server runs every URI handler inline in its single server task, so a
+ * handler that streams until the client goes away freezes the whole server.
+ * Measured before this change, with an SD card and one SSE subscriber attached:
+ *
+ *     GET /                  -> timeout (no TCP connection at all)
+ *     GET /api/v1/words/stats -> timeout
+ *     (both answer 200 in ~0.15 s again once the subscriber disconnects)
+ *
+ * The accept loop stops too, which is exactly the "设备不可达 / 读取失败" banner
+ * the browser showed while it was happily holding its stream.
+ * httpd_req_async_handler_begin() hands the socket to this task so the handler
+ * can return immediately and the server keeps serving everyone else.
+ */
+typedef struct {
+    httpd_req_t *req;       /**< async handle, awaited by the task */
+    QueueHandle_t queue;    /**< per-client broadcast queue */
+} sse_client_t;
+
+static void sse_client_task(void *arg)
+{
+    sse_client_t *client = (sse_client_t *)arg;
+    httpd_req_t *req = client->req;
+
+    httpd_resp_set_type(req, "text/event-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    /* Tell the client to retry after 3 s and announce the channel. */
+    bool alive = (httpd_resp_send_chunk(req, "retry: 3000\n\n", HTTPD_RESP_USE_STRLEN) == ESP_OK);
+    if (alive) {
+        SYS_LOGI(TAG, "SSE client attached (%u/%d)", (unsigned)s_sse_clients,
+                 SYNC_SSE_MAX_CLIENTS);
+    }
+
+    while (alive) {
+        char *chunk = NULL;
+        if (xQueueReceive(client->queue, &chunk, pdMS_TO_TICKS(SYNC_SSE_KEEPALIVE_MS)) == pdTRUE) {
+            alive = (httpd_resp_send_chunk(req, chunk, HTTPD_RESP_USE_STRLEN) == ESP_OK);
+            free(chunk);
+        } else {
+            /* Idle keepalive comment keeps NAT/proxies from closing the socket -
+             * and tells us whether the peer is still there. */
+            alive = (httpd_resp_send_chunk(req, ": keepalive\n\n", HTTPD_RESP_USE_STRLEN) == ESP_OK);
+        }
+    }
+
+    sse_unregister(client->queue);
+    SYS_LOGI(TAG, "SSE client detached (%u left)", (unsigned)s_sse_clients);
+
+    /* Terminate the chunked body, then give the socket back to the server.
+     * Not completing the async request would leak the session slot and, as the
+     * header of httpd_req_async_handler_complete() warns, eventually stop the
+     * server from accepting connections at all. */
+    (void)httpd_resp_send_chunk(req, NULL, 0);
+    (void)httpd_req_async_handler_complete(req);
+    free(client);
+    vTaskDelete(NULL);
+}
+
 static esp_err_t events_get_handler(httpd_req_t *req)
 {
     QueueHandle_t queue = sse_register();
@@ -424,37 +502,33 @@ static esp_err_t events_get_handler(httpd_req_t *req)
         return http_reply_unavailable(req, "too many event subscribers");
     }
 
-    httpd_resp_set_type(req, "text/event-stream");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    /* Tell the client to retry after 3 s and announce the channel. */
-    if (httpd_resp_send_chunk(req, "retry: 3000\n\n", HTTPD_RESP_USE_STRLEN) != ESP_OK) {
+    sse_client_t *client = calloc(1, sizeof(*client));
+    if (client == NULL) {
         sse_unregister(queue);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "sse client");
+    }
+    client->queue = queue;
+
+    /* Up to here the request may still be answered directly; after this call
+     * only `client->req` may be used - `req` is gone once we return. */
+    if (httpd_req_async_handler_begin(req, &client->req) != ESP_OK) {
+        sse_unregister(queue);
+        free(client);
+        return http_reply_unavailable(req, "streaming unavailable");
+    }
+
+    if (xTaskCreate(sse_client_task, "sse", SYNC_SSE_TASK_STACK, client,
+                    SYNC_SSE_TASK_PRIO, NULL) != pdPASS) {
+        sse_unregister(queue);
+        (void)httpd_resp_set_status(client->req, "503 Service Unavailable");
+        (void)httpd_resp_send(client->req, "no memory for streaming task", HTTPD_RESP_USE_STRLEN);
+        (void)httpd_req_async_handler_complete(client->req);
+        free(client);
         return ESP_OK;
     }
 
-    SYS_LOGI(TAG, "SSE client attached (%u/%d)", (unsigned)s_sse_clients, SYNC_SSE_MAX_CLIENTS);
-
-    while (true) {
-        char *chunk = NULL;
-        if (xQueueReceive(queue, &chunk, pdMS_TO_TICKS(SYNC_SSE_KEEPALIVE_MS)) == pdTRUE) {
-            const esp_err_t err = httpd_resp_send_chunk(req, chunk, HTTPD_RESP_USE_STRLEN);
-            free(chunk);
-            if (err != ESP_OK) {
-                break;
-            }
-        } else {
-            /* Idle keepalive comment keeps NAT/proxies from closing the socket. */
-            if (httpd_resp_send_chunk(req, ": keepalive\n\n", HTTPD_RESP_USE_STRLEN) != ESP_OK) {
-                break;
-            }
-        }
-    }
-
-    sse_unregister(queue);
-    SYS_LOGI(TAG, "SSE client detached (%u left)", (unsigned)s_sse_clients);
+    /* Return immediately: the task owns the stream from here on, which is what
+     * keeps the rest of the API responsive while the client stays attached. */
     return ESP_OK;
 }
 

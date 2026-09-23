@@ -398,7 +398,7 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
    所以 `if (errno == EEXIST) return OK;` 会把已存在目录当成硬失败。
    → 失败后用 `stat()` 确认是否已是目录，并重试一次。
 
-### 9.0.1 三个已经把设备搞挂过的自伤 bug（别再犯）
+### 9.0.1 四个已经把设备搞挂过的自伤 bug（别再犯）
 
 - **PSRAM 任务栈绝对不能碰 flash。** 把 LVGL 任务栈放到 PSRAM
   （`stack_in_psram = true`）看起来能省 32 KB 内部 RAM，但**一点"连接 WiFi"就重启**：
@@ -423,6 +423,21 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
   曾经在 `WIFI_EVENT_SCAN_DONE` 里放了一个 `wifi_ap_record_t[24]` 局部数组（约 2.7 KB）
   并调用 `esp_wifi_scan_get_ap_records()` → 栈溢出重启。现在处理器只往队列里发一条命令，
   扫描记录的拷贝由 `wifi_manager` 的专用工作线程（4 KB 栈）完成。
+- **长连接的 URI handler 会冻住整个 Web 服务器（SSE / 流式接口都算）。**
+  `esp_http_server` 的 handler 是**在唯一的 httpd 任务里串行执行**的：v6.1 虽然是
+  `select()` 事件循环，但 `httpd_server() → httpd_sess_process() → uri->handler(req)`
+  一路都是内联调用，只有 `for_async_req` 的会话才会被跳过。所以一个"一直不返回"的
+  handler 会拦死**所有**请求，连 `accept()` 都不再执行 —— 表现为
+  **设备 ping 得通、串口正常，但任何 TCP 连接都建不上**（浏览器显示"设备不可达/读取失败"）。
+  真机实测（插卡）：挂上 1 个 `curl -N /api/v1/events` 之后，`GET /` 与全部 API 超时；
+  客户端一断开立刻恢复 200。
+  → 所有长期/流式 handler 都必须用 **`httpd_req_async_handler_begin()`** 把 socket 交给
+  自己的任务，handler 立即返回，结束时 `httpd_req_async_handler_complete()`
+  （**必须** complete：不 complete 会永久占用会话槽，`httpd` 最终完全不再 accept，
+  IDF 头文件里明确写了这一点）。参考实现：`components/sync_server/src/sync_server.c`
+  的 `events_get_handler()` + `sse_client_task()`（每客户端一个 3 KB 任务、一个队列）。
+  **同类隐患仍在**：`ai_service_http.c` 的 `/api/v1/ai/chat/stream`（以及阻塞版
+  `/api/v1/ai/chat`）在一次 AI 回复期间会把整台设备的 HTTP 全部堵住 —— 修法同上。
 
 ### 9.0.2 日志：`esp_log_writev()` 是无前缀、无换行的原样输出
 
@@ -741,6 +756,7 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 | `Failed to resolve component 'json'` | IDF v6.1 无内置 json；改成 `cjson` 并声明 `espressif/cjson` |
 | `ESP_ERR_NO_MEM` 但日志说 `free heap: 10 MB` | **内部 RAM 碎片化**，看"最大连续块"；见 §9.0 第 2 条 |
 | 插卡启动就 `ESP_ERROR_CHECK failed: ESP_ERR_NO_MEM`（`ets_timer_setfn` / `esp_timer_create`），拔卡正常 | 批量 JSON 解析把内部 RAM 抽干，**不是锁**；确认 `sys_json_use_psram()` 被调用；见 §9.0.5 |
+| 网页显示"设备不可达/读取失败"，但设备 `ping` 得通、串口也正常 | 有 SSE / 流式 handler 占住了 httpd 单任务（v6.1 的 handler 串行执行）；见 §9.0.1 最后一条 |
 | `TH:heap:` 的 `int-low` 掉到个位数 KB | 有瞬时峰值抽干过内部 RAM（旧版是 546 KB 词库的 cJSON 解析）；见 §9.0.5 |
 | 设备 ping/HTTP 时通时断，但设备自称 `link: connected rssi=-3x` | Windows 移动热点丢包，不是设备问题；先 `ping` 看丢包率，见 HANDOVER §3 需求 1 |
 | `wifi:alloc net80211 funcs fail` | 同上，`SPIRAM_MALLOC_ALWAYSINTERNAL` 太大 |

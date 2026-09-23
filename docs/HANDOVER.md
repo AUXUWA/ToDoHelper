@@ -194,7 +194,7 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 | 2b | 单词书 cet4→cet6 | ✅ **已端到端验证** | 卡上 `F:\todohelper\words\cet6.json` 与仓库 `assets/words/cet6.json`，**833 条**/120311 字节/sha256 一致。真机日志：`loaded 833 words from 'words/cet6.json'`、`ready (book 'cet6', 833 words, 10/day)`、HTTP `words/stats`→`book=cet6 total=833`。**注意：833 条是自编精选子集，不是官方约 2000 词表**。`WORD_DEFAULT_BOOK` 已改为 `cet6`；**已存在的设备必须 `POST /api/v1/words/config {"book":"cet6"}` 才会切**（NVS 存的是书名）。顺带修了 `progress_key()` 未按书名命名空间（裸 `w<id>` 会让 CET4 进度套到 CET6 前 32 词），现为 `<book>#w<id>` |
 | 3 | SD 卡资源 | ✅ | 六级词库已上卡；字体 `ui_cjk.ttf` 本就在卡上；**待机动画是程序化绘制，不需要任何图片** |
 | 4 | 设备端待办逻辑 | ✅ **按用户最终确认实现** | 用户中途澄清：设备端**保留"勾选完成 + 删除"**，只是不能新增（新增/编辑要中文输入，本板无 IME）。已加回 `row_toggle_cb`（失败回滚勾选状态，不让 UI 撒谎）与行尾 52×34「删除」按钮；**新增浮层与软键盘保持移除**；详情页只读；提示语「此页可勾选完成 / 删除 \| 新增请到电脑网页端」 |
-| 5 | 优化网页上位机 | ✅ 主体完成 | `components/sync_server/web/index.html` 重写为 1214 行/54KB，纯原生 JS + 内联 CSS、**零外部资源**。SSE 实时（无 token 用 `EventSource`；有 token 改用 `fetch`+`ReadableStream` 以便带 `X-Auth-Token`）、指数退避重连 + 断开降级 15s 轮询、`pagehide` 关流释放设备仅有的 5 个 socket、增删改查失败**回滚 UI 不假装成功**、筛选/搜索、设备状态面板、离线/401/501 分类错误横幅。**未做**：WiFi 配置面板（子 agent 被中断，只留下页头注释，无 DOM/无函数） |
+| 5 | 优化网页上位机 | ⚠️ 主体完成，**本轮修掉一个致命 bug（用户实测发现）** | `components/sync_server/web/index.html` 重写为 1214 行/54KB，纯原生 JS + 内联 CSS、**零外部资源**。SSE 实时（无 token 用 `EventSource`；有 token 改用 `fetch`+`ReadableStream` 以便带 `X-Auth-Token`）、指数退避重连 + 断开降级 15s 轮询、`pagehide` 关流、增删改查失败**回滚 UI 不假装成功**、筛选/搜索、设备状态面板、离线/401/501 分类错误横幅。**但设备端 `/api/v1/events` 是同步 handler：`esp_http_server` 的 handler 在唯一 httpd 任务里串行执行，所以只要有一个浏览器挂着 SSE，整台设备的 HTTP 全部超时**（用户截图里"推送：实时推送中"+"设备不可达/读取失败"就是这个）。已改为 `httpd_req_async_handler_begin()` + 每客户端一个流式任务（并发从 4 降到 3，给页面/REST 留槽），实测挂 3 条流时 `GET /` 仍 200/42ms、第 4 条流 503、推送仍实时。详见 AGENT.md §9.0.1 最后一条。**未做**：WiFi 配置面板（子 agent 被中断，只留下页头注释，无 DOM/无函数） |
 | 6 | 开机屏幕滚动启动日志 | ✅ 已实现，**待你目视确认** | `sys_log` 新增无锁 64×80 环形缓冲（seqlock 发布、PSRAM 分配+内部 RAM 兜底、serial 路径不变）；`page_splash.c` 用 `lv_timer` 刷新并 tail 最新行。`main/app_main.c` 改为固定 3s 延迟（用户要求）后切 HOME |
 | 7 | 时刻更新 harness 待办 | ✅ | 各轮均同步维护 |
 | 8 | 子 agent + 文档 + git | ✅ | 用了 8 个子 agent 分工；构建 0 错误 0 警告；文档已同步；全部提交见 §6 |
@@ -206,7 +206,8 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 1. **待机动画**：待机时是否**保持睁眼并按时眨眼/扫视**（这正是修 bug 的地方）、进出待机是否平滑。
 2. **开机日志**：3 秒内日志是否顺畅滚动、是否卡启动。
 3. **待办页**：勾选完成/删除按钮的观感与误触率（删除按钮 52×34，放在行尾）。
-4. **网页**：SSE 实时联动、离线/401 横幅、移动端布局。
+4. **网页**（本轮修了"挂上 SSE 就整站超时"之后**请重新验一遍**）：页面打开后应能读到待办与设备状态；
+   "推送：实时推送中"与能用的页面**同时**出现（修复前这两者是互斥的）；离线/401 横幅、移动端布局。
 5. 若要继续做 WiFi 面板：先在浏览器确认 `/api/v1/wifi/status` 能返回（设备端 7 条路由都已注册，实测 GET 返回 200）。
 
 ---
@@ -244,7 +245,11 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
    让 ≤4 KB 的分配优先吃内部 RAM，且**部分调用（如 `MALLOC_CAP_INTERNAL`）根本不允许回退 PSRAM**。
    批量数据（JSON、词库、缓存）必须显式要求 PSRAM —— 否则就会复现 §2 那类崩溃。
    判据是 `TH:heap:` 行的 `largest` 与 `int-low`，不是总空闲量。
-9. 更完整的坑位清单（内部 RAM 最紧处、PSRAM 栈不能碰 flash、日志格式陷阱、
+9. **HTTP handler 不能"长期不返回"**。`esp_http_server` 的 handler 在唯一 httpd 任务里**串行**执行，
+   一个 SSE/流式 handler 会把整台设备的 HTTP 堵死（ping 得通、TCP 建不上）。任何长连接都要
+   `httpd_req_async_handler_begin()` + 自己的任务。**这是本轮用户实测踩到的第二个坑**，
+   详见 `AGENT.md §9.0.1` 最后一条（`/api/v1/ai/chat/stream` 还有同类隐患没修）。
+10. 更完整的坑位清单（内部 RAM 最紧处、PSRAM 栈不能碰 flash、日志格式陷阱、
    `esp_log_writev` 原样输出、PHY 需 30KB 连续块……）全部在 **`AGENT.md §9.0 ~ §9.0.5`**。
 
 ---
@@ -272,18 +277,23 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 1. ~~验完 §2 的崩溃修复~~ —— **已完成**：插卡 3/3 冷启动 `abort=0`、`TH:app: ready` 3/3，
    词库 833 词 3/3 加载成功（证据见 §2）。
 2. 请用户做 §4 的四项目视确认，按反馈微调（动画/日志时长/按钮尺寸都是单个 `#define` 或一行）。
-3. 若要继续加功能：**网页 WiFi 配置面板**仍是最具性价比的一项 —— 设备端输 WiFi 密码体验很差
+   **网页那一项已因本轮第二个 bug 修好而需要重验**（§3 需求 5）。
+3. **修掉同类隐患 `/api/v1/ai/chat/stream`**（推荐，工作量小）：它和旧版 SSE 一样在 handler 里
+   长时间流式发送，会让整台设备的 HTTP 在一次 AI 回复期间不可用；阻塞版 `/api/v1/ai/chat`
+   同理。照 `sync_server.c` 的 `events_get_handler()` + 任务模式改即可（AGENT.md §9.0.1 最后一条）。
+4. 若要继续加功能：**网页 WiFi 配置面板**仍是最具性价比的一项 —— 设备端输 WiFi 密码体验很差
    （480px 屏、无 IME），而 `/api/v1/wifi/*` 7 条路由都已就绪。**本次已实测的报文语义**：
    `GET /api/v1/wifi/status` → connected/ssid/ip/rssi；`POST /api/v1/wifi/scan` 触发扫描并返回
    `{"scanning":true}`，**扫描结果要靠 `GET /api/v1/wifi/scan` 轮询**（它返回的是上一次结果，
    `POST` 之后立刻 `GET` 会得到空数组——本次踩过）。路由表在
    `components/wifi_manager/src/wifi_manager_http.c:259-284`。照 `index.html` 现有的请求漏斗与
    样式写，**不要**另起一套。
-4. 若用户反馈"插拔卡数据丢失"不可接受：把待办存储固定在片内存储，只把词库/字体放卡上
+5. 若用户反馈"插拔卡数据丢失"不可接受：把待办存储固定在片内存储，只把词库/字体放卡上
    （需要看 `storage_manager` 的根选择逻辑）。
-5. **加功能前先看内部 RAM 余量**：本次实测 boot complete 只剩 `internal 67 KB / largest 24 KB`
+6. **加功能前先看内部 RAM 余量**：本次实测 boot complete 只剩 `internal 67 KB / largest 24 KB`
    （`int-low 55 KB`），明显低于 `AGENT.md §8` 记录的上一版基线（118 KB / 74 KB）。
-   任何批量数据都必须显式 `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）。
+   任何批量数据都必须显式 `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）；SSE 这类
+   每客户端一个任务的设计也要算进内部 RAM（每客户端 3 KB）。
 
 ---
 
@@ -295,6 +305,7 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 | 启动流程与这次修复 | `main/app_main.c` |
 | **崩溃根因与修复** | `components/sys_utils/src/sys_json.c`（`sys_json_use_psram()`）、`components/word_service/src/word_service.c`（`parse_book()`） |
 | 内部 RAM 诊断（`largest` / `int-low`） | `components/sys_utils/src/sys_heap.c` |
+| SSE 实时推送（异步 handler 模式） | `components/sync_server/src/sync_server.c`（`events_get_handler()` + `sse_client_task()`）、`web/index.html` |
 | 待办页面（设备端） | `components/ui_pages/src/page_todo.c` |
 | 待机动画 | `components/idle_face/src/idle_face.c`（`tick_behaviour()` 必须被调用！） |
 | 开机日志缓冲 | `components/sys_utils/src/sys_log.c`、`include/sys_log.h` |
