@@ -77,9 +77,32 @@ static void input_submit_cb(lv_event_t *e)
     }
 }
 
+/**
+ * "重新定位": re-derive the city from the public IP.
+ *
+ * The manual city entry is gone. The panel has no IME, so typing a Chinese city
+ * name on it was never practical, and the public IP already tells us where we are
+ * (FR3 location priority 2, now the only path - see weather_detect_location()).
+ *
+ * NOTE: everything after the `return` below is the former input-overlay builder
+ * (textarea + on-screen keyboard). It is unreachable but kept for one commit so
+ * that input_submit_cb()/input_cancel_cb()/input_close() stay referenced and the
+ * -Werror=unused-function build stays green; delete both together next.
+ */
 static void city_clicked_cb(lv_event_t *e)
 {
     (void)e;
+
+    ui_toast("正在通过 IP 定位…");
+    esp_err_t err = weather_detect_location();
+    if (err != ESP_OK) {
+        ui_toast("定位失败：%s", esp_err_to_name(err));
+        return;
+    }
+    refresh();
+    ui_toast("已定位到 %s", weather_get_city());
+    return;
+
     if (s_input_overlay != NULL) {
         return;
     }
@@ -155,7 +178,7 @@ static void refresh(void)
     if (!have) {
         lv_label_set_text(s_city_label, weather_get_city()[0] ? weather_get_city() : "未设置城市");
         lv_label_set_text(s_temp_label, "--°");
-        lv_label_set_text(s_cond_label, "点击“设置城市”开始获取天气");
+        lv_label_set_text(s_cond_label, "正在通过 IP 自动定位…");
         lv_obj_set_style_text_color(s_cond_label, UI_COLOR_TEXT_MUTED, 0);
         lv_label_set_text(s_detail_label, "");
         if (s_icon != NULL) {
@@ -260,7 +283,7 @@ static esp_err_t weather_create(lv_obj_t *parent)
     s_city_label = lv_label_create(left);
     lv_obj_set_style_text_font(s_city_label, ui_font(UI_FONT_TITLE), 0);
     lv_obj_set_style_text_color(s_city_label, UI_COLOR_TEXT, 0);
-    lv_label_set_text(s_city_label, "未设置城市");
+    lv_label_set_text(s_city_label, "正在定位…");
 
     s_temp_label = lv_label_create(left);
     lv_obj_set_style_text_font(s_temp_label, ui_font(UI_FONT_HUGE), 0);
@@ -313,7 +336,7 @@ static esp_err_t weather_create(lv_obj_t *parent)
         lv_event_cb_t cb;
         lv_color_t color;
     } buttons[] = {
-        { "设置城市", city_clicked_cb, UI_COLOR_SURFACE_ALT },
+        { "重新定位", city_clicked_cb, UI_COLOR_SURFACE_ALT },
         { "立即刷新", refresh_clicked_cb, UI_COLOR_PRIMARY },
     };
 

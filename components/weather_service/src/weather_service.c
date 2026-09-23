@@ -885,6 +885,21 @@ esp_err_t weather_service_init(void)
     }
 
     (void)sys_config_get_str_or(SYS_KEY_CITY, s_city, sizeof(s_city), "");
+    /*
+     * Read the coordinates back too.
+     *
+     * weather_set_location() has always persisted them (SYS_KEY_CITY_LAT/LON) but
+     * nothing ever loaded them, so after a reboot the city name survived while the
+     * position did not: have_coords was false, the refresh fell back to geocoding
+     * by name (weather still came out right) and /api/v1/weather reported lat/lon 0.
+     */
+    char coord[24];
+    if (sys_config_get_str(SYS_KEY_CITY_LAT, coord, sizeof(coord)) == ESP_OK) {
+        s_data.lat = strtod(coord, NULL);
+    }
+    if (sys_config_get_str(SYS_KEY_CITY_LON, coord, sizeof(coord)) == ESP_OK) {
+        s_data.lon = strtod(coord, NULL);
+    }
     (void)sys_config_get_str_or(SYS_KEY_WEATHER_PROV, s_provider, sizeof(s_provider),
                                WEATHER_PROVIDER_DEFAULT);
     (void)sys_config_get_str_or(SYS_KEY_GEO_URL, s_geo_url, sizeof(s_geo_url),
