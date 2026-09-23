@@ -35,6 +35,9 @@ static lv_obj_t *s_icon_fallback;
 static lv_obj_t *s_input_overlay;
 static lv_obj_t *s_input_area;
 
+/** Defined below; the "重新定位" button refreshes the card once IP location lands. */
+static void refresh(void);
+
 /* ------------------------------------------------------------------------ */
 /* City input                                                                */
 /* ------------------------------------------------------------------------ */

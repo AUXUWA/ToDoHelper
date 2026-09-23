@@ -199,11 +199,7 @@ static void input_open(void)
     lv_obj_center(cancel_label);
     lv_obj_add_event_cb(cancel, input_cancel_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *keyboard = lv_keyboard_create(s_input_overlay);
-    lv_obj_set_width(keyboard, LV_PCT(100));
-    lv_obj_set_height(keyboard, 220);
-    lv_keyboard_set_textarea(keyboard, s_input_area);
-    lv_obj_set_style_text_font(keyboard, ui_font(UI_FONT_SMALL), 0);
+    (void)ui_keyboard_create(s_input_overlay, s_input_area);
 }
 
 /* ------------------------------------------------------------------------ */

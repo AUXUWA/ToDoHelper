@@ -32,6 +32,52 @@ static void tile_clicked_cb(lv_event_t *e)
     (void)ui_nav_push(target);
 }
 
+lv_obj_t *ui_keyboard_create(lv_obj_t *parent, lv_obj_t *textarea)
+{
+    lv_obj_t *keyboard = lv_keyboard_create(parent);
+    if (keyboard == NULL) {
+        return NULL;
+    }
+
+    lv_obj_set_width(keyboard, LV_PCT(100));
+    /* Six rows have to fit; 200 px squeezed them to ~33 px per row, which is below
+     * a comfortable touch target. */
+    lv_obj_set_height(keyboard, 240);
+    if (textarea != NULL) {
+        lv_keyboard_set_textarea(keyboard, textarea);
+    }
+
+    /* Symbols (LV_SYMBOL_BACKSPACE / OK / the layout switch) are NOT in the embedded
+     * CJK subset - they come from the fallback chain set up in ui_core/fonts. */
+    lv_obj_set_style_text_font(keyboard, ui_font(UI_FONT_SMALL), 0);
+
+    /* Dark theme, matching the rest of the UI. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(keyboard, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(keyboard, 0, 0);
+    lv_obj_set_style_pad_all(keyboard, 4, 0);
+    lv_obj_set_style_pad_gap(keyboard, 4, 0);
+
+    /* Keys. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_SURFACE_ALT, LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(keyboard, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(keyboard, UI_COLOR_TEXT, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(keyboard, 0, LV_PART_ITEMS);
+    lv_obj_set_style_radius(keyboard, 6, LV_PART_ITEMS);
+    /* Pressed feedback in the accent colour. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_PRIMARY, LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(keyboard, lv_color_white(), LV_PART_ITEMS | LV_STATE_PRESSED);
+    /* Checked keys are the sticky ones (shift / layout switch). */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_PRIMARY, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(keyboard, lv_color_white(), LV_PART_ITEMS | LV_STATE_CHECKED);
+    /* The text area being typed into. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_BG, LV_PART_ITEMS | LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(keyboard, UI_COLOR_TEXT, LV_PART_ITEMS | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(keyboard, 0, LV_PART_ITEMS | LV_STATE_FOCUSED);
+
+    return keyboard;
+}
+
 lv_obj_t *page_back_button_create(lv_obj_t *parent)
 {
     lv_obj_t *btn = lv_button_create(parent);

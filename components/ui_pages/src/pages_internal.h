@@ -70,6 +70,19 @@ lv_obj_t *page_back_button_create(lv_obj_t *parent);
 /** @brief Shared page header: title on the left, optional back button. */
 lv_obj_t *page_header_create(lv_obj_t *parent, const char *title);
 
+/**
+ * @brief Create an on-screen keyboard with the project's shared styling.
+ *
+ * Every keyboard must be created through this so they all look identical. LVGL's
+ * default keyboard is light grey and clashed badly with the dark theme, and the
+ * panel is only 480 px tall so the row height matters.
+ *
+ * @param parent   Usually the input overlay.
+ * @param textarea Target text area; may be NULL and assigned later.
+ * @return The keyboard, or NULL on allocation failure.
+ */
+lv_obj_t *ui_keyboard_create(lv_obj_t *parent, lv_obj_t *textarea);
+
 #ifdef __cplusplus
 }
 #endif
