@@ -12,6 +12,8 @@
 #include <sys/time.h>
 
 #include "esp_netif_sntp.h"
+#include "esp_heap_caps.h"
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 
 static const char *TAG = "calendar";
@@ -89,6 +91,32 @@ static esp_err_t sntp_start(void)
 {
     if (s_sntp_started) {
         return ESP_OK;
+    }
+
+    /*
+     * Warm up esp_libc's timekeeping lock before the network stack needs it.
+     *
+     * lwIP's SNTP client calls settimeofday() **from its tcpip_thread** as soon as
+     * the first reply arrives, and esp_libc creates the lock for its timekeeping
+     * lazily on that first call. That lazy creation returned NULL on the device
+     * and IDF aborts when it does (esp_libc/src/locks.c:77):
+     *
+     *   sntp_recv -> sntp_set_system_time -> settimeofday
+     *     -> esp_libc_timekeeping_set_realtime_us -> lock_acquire_generic
+     *     -> lock_init_generic -> xQueueCreateMutex() == NULL -> abort()
+     *
+     * Doing it here, on a normal task with the scheduler settled and plenty of
+     * stack, means the first call from the network stack finds the lock already
+     * created and performs no allocation. The value written is the clock's
+     * current value, so this is a semantic no-op.
+     */
+    struct timeval now;
+    if (gettimeofday(&now, NULL) == 0) {
+        (void)settimeofday(&now, NULL);
+    }
+    if (!heap_caps_check_integrity_all(false)) {
+        SYS_LOGE(TAG, "heap integrity check FAILED before starting SNTP - "
+                      "expect the libc lock creation to fail");
     }
 
     const esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(s_ntp);

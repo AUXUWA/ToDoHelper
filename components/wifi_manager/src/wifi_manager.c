@@ -394,7 +394,26 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     s_reconnect_left = CONFIG_TODOHELPER_WIFI_RECONNECT_ATTEMPTS;
 
     set_state(WIFI_MGR_CONNECTED);
+    /*
+     * push_status() explicitly, because set_state() early-returns when the state
+     * is unchanged - and WIFI_EVENT_STA_CONNECTED already moved us to CONNECTED
+     * (link up, before DHCP). Without this the IP and RSSI gathered just above
+     * never reach sys_status, and the UI shows the values from association time
+     * forever: the status bar read "WiFi 0 dBm" and the API reported 0.0.0.0
+     * while s_rssi was -35 and s_ip was 192.168.137.110.
+     */
+    push_status();
+
     SYS_LOGI(TAG, "got ip %s (ssid '%s', %d dBm)", s_ip, s_ssid, (int)s_rssi);
+
+    /* Read back what actually landed in sys_status - the first thing to check if
+     * the UI shows stale network state again. */
+    sys_status_t st_check;
+    if (sys_status_get(&st_check) == ESP_OK) {
+        SYS_LOGD(TAG, "status: connected=%d rssi=%d ssid='%s' ip='%s'",
+                 (int)st_check.wifi_connected, (int)st_check.wifi_rssi,
+                 st_check.wifi_ssid, st_check.wifi_ip);
+    }
 
     (void)sys_event_post_to(WIFI_MGR_EVENT, WIFI_MGR_EVENT_GOT_IP, NULL, 0);
     bool online = true;

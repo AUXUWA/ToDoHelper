@@ -76,16 +76,22 @@ void sys_log_write(int level, const char *tag, const char *fmt, ...)
     snprintf(tagged, sizeof(tagged), "TH:%s", tag ? tag : "?");
 
     /*
-     * Format first, then hand the finished text to esp_log_write().
+     * Format first, then emit through the standard ESP_LOGx macros.
      *
-     * esp_log_writev() was used originally for its va_list convenience, but it
-     * emits the message *verbatim*: no "I (1234) TH:tag:" prefix and, crucially,
-     * no trailing newline. The console is line buffered, so every application
-     * message stayed in the buffer and then merged into the next line - the boot
-     * log came out as one enormous unreadable line, and anything logged after the
-     * last IDF message (the boot-time Wi-Fi scan, the idle timeout) looked like it
-     * never happened. esp_log_write() is the same entry point the ESP_LOGx macros
-     * use, so this produces the standard, parseable format.
+     * Two wrong turns led here, both visible in the device log:
+     *
+     * 1. esp_log_writev() emits the message verbatim - no trailing newline - so
+     *    the line-buffered console held every application message back and merged
+     *    it into the next line.
+     * 2. esp_log_write() adds the newline but still none of the
+     *    "I (1234) TH:tag: " decoration, because that prefix is built into the
+     *    format string by the ESP_LOGx macros themselves, not by the log backend.
+     *    The result read like a continuation of the previous line.
+     *
+     * Using the macros gives exactly the same shape as IDF's own output, so the
+     * log is uniform and greppable. The runtime level is still filtered by
+     * sys_log_write's own check, and sys_log_set_level() mirrors it into
+     * esp_log_level_set() so IDF's filter agrees.
      */
     char line[SYS_LOG_LINE_BUF];
     va_list ap;
@@ -93,5 +99,19 @@ void sys_log_write(int level, const char *tag, const char *fmt, ...)
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
 
-    esp_log_write((esp_log_level_t)(level + 1), tagged, "%s\n", line);
+    switch (level) {
+    case SYS_LOG_ERROR:
+        ESP_LOGE(tagged, "%s", line);
+        break;
+    case SYS_LOG_WARN:
+        ESP_LOGW(tagged, "%s", line);
+        break;
+    case SYS_LOG_DEBUG:
+        ESP_LOGD(tagged, "%s", line);
+        break;
+    case SYS_LOG_INFO:
+    default:
+        ESP_LOGI(tagged, "%s", line);
+        break;
+    }
 }
