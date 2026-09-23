@@ -569,6 +569,75 @@ FreeType 子集 --fallback--> Montserrat(同尺寸) --fallback--> 内置 CJK 16p
 
 ---
 
+### 9.7 剩余待办（下一轮从这里开始）
+
+以下三项都已定位到确切位置，但**上下文余量不足时不要动**——它们都需要精确的长文本
+匹配或通读文件，草率改容易留下编译不过的状态。
+
+**① 把 1.2 MB 字库移出 app（目标项"用好 SD 卡"的主要落点）**
+
+现状：`ui_core` 用 `EMBED_FILES` 把 `fonts/ui_cjk.ttf`（1224120 字节）编进 app，
+`idf.py size-components` 显示 `libui_core.a` 的 `.rodata` 正好就是它，**占全镜像 30%**
+（4.16 MB）。而这份字体**一直在 SD 卡上**（`/sdcard/todohelper/fonts/ui_cjk.ttf`），
+`ui_fonts.c` 也是"卡上文件优先"。所以每次烧录都在重写 1.2 MB 已经存在的东西。
+
+步骤：
+1. `components/ui_core/CMakeLists.txt`：删掉 `UI_CORE_EMBED_FILES` 那段与
+   `EMBED_FILES ${UI_CORE_EMBED_FILES}`（该文件只有 19 行，整文件重写最省事）。
+2. `components/ui_core/src/ui_fonts.c`：
+   - 删掉 `extern const uint8_t ui_cjk_ttf_start/end[]`（`_binary_ui_cjk_ttf_start`）
+   - `ft_ensure_file()` 里删掉"文件不存在就把内嵌字体写出去"那一整段
+     （`ui_cjk_ttf_end - ui_cjk_ttf_start`、`storage_mkdir_p`、`storage_write_file`
+     与随后的日志），改成：文件不存在就 `SYS_LOGW` 提示路径并返回 NULL。
+3. **注意**：两步必须同一次改完，否则 `_binary_ui_cjk_ttf_start` 未定义会**链接失败**。
+4. 预期收益：app 4.16 MB → 约 2.9 MB（压缩后约 1.9 MB），烧录从 43 s 再降到约 30 s。
+5. 代价：没插 SD 卡时回退到内置 `LV_FONT_SOURCE_HAN_SANS_SC_16_CJK`（约 2500 字，
+   生僻字会方框）。日志会给明确告警。若要兼顾，可改为把 TTF 放进 5.9 MB 的 `assets`
+   分区（那里只用了 8.9 KB），但需先验证适配器的 FreeType 能否用 lv_fs 路径
+   （`A:ui_cjk.ttf`）——`EMBED_FILES` + 内存模式在 LVGL v9 **一定不行**（见 §9.0 第 3 条）。
+
+**② 删掉天气页那段不可达的输入浮层代码**
+
+`page_weather.c`：`city_clicked_cb()` 现在在 `return` 之前就完成了"重新定位"，
+其后的旧输入浮层构建代码（textarea + `lv_keyboard_create` + 确定/取消）**不可达但保留着**，
+目的是让 `input_submit_cb()` / `input_cancel_cb()` / `input_close()` 保持被引用，
+避免 `-Werror=unused-function`。
+
+步骤：把这三组一起删——① 静态变量 `s_input_overlay` / `s_input_area`；
+② `input_close()` / `input_cancel_cb()` / `input_submit_cb()`；
+③ `city_clicked_cb()` 里 `return;` 之后的全部内容。**必须一次删完**，否则中间态编译不过。
+（该文件里还残留一处 `lv_keyboard_create`，就是这段死代码——全工程键盘统一后唯一
+没走 `ui_keyboard_create()` 的地方。）
+
+**③ 新增 L0 的 `SYS_EVENT_TIME_SYNCED`（让 SNTP 同步后能自动重新定位）**
+
+现状：时间同步只在 `CALENDAR_EVENT_TIME_SYNCED`（`calendar_service` 的事件基址）上发。
+`weather_service` 同属 L3，订阅它属于**横向依赖，架构不允许**。所以需要一个 L0 事件：
+1. `components/sys_utils/include/sys_utils.h`：`sys_event_id_t` 里加
+   `SYS_EVENT_TIME_SYNCED`（payload `int64_t` Unix 秒）。
+2. `components/calendar_service/src/calendar_service.c` 的 `sntp_sync_cb()` 里，
+   在现有 `sys_event_post_to(CALENDAR_EVENT, ...)` 旁边补一次
+   `sys_events_post(SYS_EVENT_TIME_SYNCED, &ts, sizeof(ts))`。
+3. `components/weather_service/src/weather_service.c`：订阅它，handler 里在城市未设置时
+   入队 `WEATHER_REQ_DETECT`。
+4. 有了它，`weather_task` 里那段"最多等 75 秒时钟"的循环可以缩短甚至去掉。
+
+**其余已知但优先级低的问题**
+
+- **IP 定位在本机网络不可达**：时钟已同步时 `POST /api/v1/weather/locate` 仍失败
+  （现返回 502，语义已正确）。已确证是设备（Windows 热点后）出网到 `ipapi.co` 不通
+  ——DNS 限制或免费额度限流。既然已有固定默认城市"南昌"，影响很小。
+  换服务商**无需改代码**：写 NVS 键 `geo_url` 即可（解析器兼容
+  `latitude/lat`、`longitude/lon/lng` 与嵌套 `location`）。
+- **`update_ts` 可能为 0**：`/api/v1/weather` 里 `update_ts` 表示最近一次抓取时间，
+  城市刚改过、尚未重新抓取时会是 0（`server_ts` 正常）。
+- **待机眼睛动画**（用户提了三次，**只做眼睛、不要嘴巴、零位图**）：
+  `components/idle_face` 目前是 11 状态一张参数表 + 一个 33 ms 插值器。
+  目标是补上：表情**之间的**平滑过渡（现在只有单表情内插值）、呼吸/眨眼随机化、
+  进入/退出待机的过场动画。需要通读 `idle_face.c` 再动。
+- **单词书 cet4 → cet6**：内置词库在 `word_service`，格式见 `docs/API.md`；
+  卡上已有一份 `words/cet4.json`（4704 字节）可作模板。
+
 ## 10. 排错速查
 
 | 症状 | 处理 |
