@@ -1,0 +1,7 @@
+version: "0.1.0"
+description: ToDoHelper LAN HTTP server, device API and browser UI
+
+dependencies:
+  idf: ">=6.1.0"
+  espressif/mdns: "^1.13.0"
+  espressif/cjson: "^1.7.19"

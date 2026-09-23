@@ -1,0 +1,25 @@
+menu "ToDoHelper: WiFi manager"
+
+    config TODOHELPER_WIFI_AUTO_CONNECT
+        bool "Reconnect to the saved network on boot"
+        default y
+        help
+            Reads wifi_ssid / wifi_pass / wifi_auto from NVS during
+            wifi_manager_init() and connects automatically.
+
+    config TODOHELPER_WIFI_RECONNECT_ATTEMPTS
+        int "Automatic reconnect attempts after an unexpected disconnect"
+        range 0 20
+        default 5
+
+    config TODOHELPER_WIFI_RECONNECT_DELAY_MS
+        int "Delay between automatic reconnect attempts (ms)"
+        range 500 60000
+        default 3000
+
+    config TODOHELPER_WIFI_SCAN_MAX_APS
+        int "Maximum access points cached from one scan"
+        range 4 64
+        default 24
+
+endmenu

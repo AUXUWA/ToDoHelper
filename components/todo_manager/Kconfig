@@ -1,0 +1,18 @@
+menu "ToDoHelper: todo manager"
+
+    config TODOHELPER_TODO_CACHE_FILE
+        string "Cache file name under <app_dir>/cache"
+        default "todos.json"
+        help
+            Written atomically on every change so the list survives power loss
+            and can be shown while offline (requirements FR2 and 9.2).
+
+    config TODOHELPER_TODO_BACKUP_KEEP
+        int "Number of daily backup files to keep in backup/"
+        range 0 30
+        default 7
+        help
+            0 disables backups. Backups never contain WiFi passwords, API keys
+            or the auth token (requirement 8.8).
+
+endmenu

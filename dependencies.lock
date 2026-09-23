@@ -25,6 +25,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 4.2.1
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -296,6 +306,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.6.58~1
+  espressif/mdns:
+    component_hash: b679eafd0acae2066e2645bd91d073e33ca5be515e2545cd3c4e55a3e3bce3cb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.13.1
   espressif/usb:
     component_hash: 6c2cff118141dbbca181d0d27d71801fdddfc78f7ac03ae43f6e5a8cbd89cb99
     dependencies:
@@ -313,30 +333,6 @@ dependencies:
     - esp32h4
     - linux
     version: 1.5.0
-  espressif/usb_host_hid:
-    component_hash: 74b9c84cd2921a5e987f504c1713ca7819f7e8be80565e5253e9e9c7e07ab881
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
-    - name: espressif/usb
-      registry_url: https://components.espressif.com
-      require: public
-      rules:
-      - if: idf_version >=6.0
-      - if: target not in ["linux"]
-      version: ^1.0.0
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    - esp32h4
-    - esp32s31
-    - linux
-    version: 1.2.1
   espressif/usb_host_uvc:
     component_hash: ecb2604b71cb5a65d64e5f441be54793b1838096043ad8cf1fa0d3012de18a9a
     dependencies:
@@ -375,6 +371,16 @@ dependencies:
     source:
       type: idf
     version: 6.1.0
+  joltwallet/littlefs:
+    component_hash: 3af20a3d75c49db9dc2286fd50862c34055c9f578419ad1f2bf7ed3ed01391fe
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.22.3
   lvgl/lvgl:
     component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
     dependencies: []
@@ -385,6 +391,7 @@ dependencies:
 direct_dependencies:
 - esp32_s31_korvo
 - espressif/button
+- espressif/cjson
 - espressif/cmake_utilities
 - espressif/esp_cam_sensor
 - espressif/esp_codec_dev
@@ -395,8 +402,9 @@ direct_dependencies:
 - espressif/esp_sccb_intf
 - espressif/esp_video
 - espressif/led_strip
-- espressif/usb_host_hid
+- espressif/mdns
 - idf
-manifest_hash: ed8c073971e2d8830bc01d78d36eb68e8c8f3a9d386f074949ef6ee0800fec6d
+- joltwallet/littlefs
+manifest_hash: b2c4a1a50e24b322350b0e851eab4518708db636abf302f199a9761ee8071c74
 target: esp32s31
 version: 3.0.0

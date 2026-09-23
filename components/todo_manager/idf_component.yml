@@ -1,0 +1,8 @@
+version: "0.1.0"
+description: ToDoHelper todo list with local persistence and PC sync
+
+dependencies:
+  idf: ">=6.1.0"
+  # ESP-IDF v6.1 no longer ships a built-in `json` component; cJSON comes from
+  # the component registry now.
+  espressif/cjson: "^1.7.19"

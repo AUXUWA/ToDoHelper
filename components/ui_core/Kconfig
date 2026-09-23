@@ -1,0 +1,29 @@
+menu "ToDoHelper: UI core"
+
+    config TODOHELPER_FONT_FREETYPE
+        bool "Render UI text with a scalable CJK TrueType font"
+        depends on ESP_LVGL_ADAPTER_ENABLE_FREETYPE
+        default n
+        help
+            Uses the FreeType font manager from esp_lvgl_adapter so every text
+            role can have its own size while still covering Chinese glyphs.
+
+            Requires CONFIG_ESP_LVGL_ADAPTER_ENABLE_FREETYPE, which in turn
+            requires CONFIG_LV_USE_FREETYPE.
+
+            The font is looked up in this order:
+              1. <storage>/todohelper/<TODOHELPER_FONT_PATH>
+              2. the subset embedded in the firmware (components/ui_core/fonts)
+              3. LVGL's built-in Source Han Sans SC CJK font
+              4. LVGL's built-in Montserrat font (Latin only)
+            so the UI keeps working even when every optional piece is missing.
+
+    config TODOHELPER_FONT_PATH
+        string "TrueType font on storage, relative to the app data directory"
+        depends on TODOHELPER_FONT_FREETYPE
+        default "fonts/ui.ttf"
+        help
+            Dropping a .ttf at <storage>/todohelper/fonts/ui.ttf overrides the
+            firmware font without reflashing.
+
+endmenu

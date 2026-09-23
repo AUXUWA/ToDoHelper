@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ToDoHelper · 待办同步</title>
+<style>
+  :root {
+    --bg: #0b0f14; --surface: #161c24; --surface-alt: #1f2733;
+    --primary: #3da9fc; --success: #2ecc71; --warning: #f1c40f;
+    --danger: #e74c3c; --text: #f2f5f8; --muted: #9aa7b4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 16px 24px; background: var(--surface);
+    border-bottom: 1px solid var(--surface-alt);
+  }
+  h1 { font-size: 20px; margin: 0; }
+  .grow { flex: 1; }
+  .pill {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    background: var(--surface-alt); color: var(--muted);
+  }
+  .pill.ok { color: var(--success); }
+  .pill.warn { color: var(--warning); }
+  .pill.err { color: var(--danger); }
+  main { padding: 24px; max-width: 900px; margin: 0 auto; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+  input[type=text] {
+    flex: 1; min-width: 200px; padding: 12px 14px; border-radius: 10px;
+    border: 1px solid var(--surface-alt); background: var(--surface);
+    color: var(--text); font-size: 15px;
+  }
+  input[type=text]:focus { outline: 1px solid var(--primary); }
+  button {
+    min-height: 44px; padding: 0 18px; border: 0; border-radius: 10px;
+    background: var(--primary); color: #06121c; font-size: 15px;
+    font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: var(--surface-alt); color: var(--text); }
+  button:disabled { opacity: .5; cursor: default; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li {
+    display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+    background: var(--surface); border-radius: 12px; margin-bottom: 8px;
+  }
+  li.done .title { text-decoration: line-through; color: var(--muted); }
+  li .title { flex: 1; word-break: break-word; }
+  li .meta { font-size: 12px; color: var(--muted); }
+  input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--success); }
+  .empty { color: var(--muted); padding: 32px; text-align: center; }
+  #toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background: var(--surface-alt); padding: 12px 20px; border-radius: 12px;
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  .hint { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ToDoHelper</h1>
+  <span class="pill" id="device">设备信息加载中…</span>
+  <span class="grow"></span>
+  <span class="pill" id="link">连接中…</span>
+</header>
+
+<main>
+  <p class="hint">
+    在电脑上新增/勾选待办后，设备端会自动刷新；设备端勾选后这里也会通过事件推送更新。
+  </p>
+
+  <form id="add-form">
+    <input type="text" id="title" placeholder="新增待办，例如：买牛奶" maxlength="127" required>
+    <button type="submit">添加</button>
+    <button type="button" class="ghost" id="sync">标记已同步</button>
+    <button type="button" class="ghost" id="reload">刷新</button>
+  </form>
+
+  <ul id="list"></ul>
+  <div class="empty" id="empty" hidden>还没有待办，先添加一条吧。</div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+let authToken = localStorage.getItem("todohelper_token") || "";
+
+function toast(message) {
+  const el = $("toast");
+  el.textContent = message;
+  el.classList.add("show");
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+async function api(path, options = {}) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+  if (authToken) headers["X-Auth-Token"] = authToken;
+
+  const response = await fetch(path, Object.assign({}, options, { headers }));
+  let body = null;
+  try { body = await response.json(); } catch (e) { /* 501/204 may have no body */ }
+
+  if (response.status === 401) {
+    throw new Error("未授权：请在设置里填写 token（本页会保存在浏览器本地）");
+  }
+  // 501 means "path exists but the feature is not built yet" (requirement 8.1):
+  // surface it clearly instead of pretending it worked.
+  if (response.status === 501) {
+    const hint = body && body.data && body.data.hint ? body.data.hint : "该接口尚未实现";
+    throw new Error("501 " + hint);
+  }
+  if (!response.ok || (body && body.code !== 0)) {
+    throw new Error((body && body.msg) || ("HTTP " + response.status));
+  }
+  return body ? body.data : null;
+}
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function render(items) {
+  const list = $("list");
+  list.innerHTML = "";
+  $("empty").hidden = items.length > 0;
+
+  for (const item of items) {
+    const li = document.createElement("li");
+    if (item.done) li.classList.add("done");
+
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!item.done;
+    box.addEventListener("change", async () => {
+      try {
+        await api(`/api/v1/todos/${item.id}/done`, {
+          method: "PATCH",
+          body: JSON.stringify({ done: box.checked }),
+        });
+        toast(box.checked ? "已标记完成" : "已取消完成");
+      } catch (e) {
+        box.checked = !box.checked;
+        toast("失败：" + e.message);
+      }
+    });
+
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = item.title;
+
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const syncText = { ok: "已同步", pending: "待同步", failed: "同步失败", none: "" }[item.sync_state] || "";
+    meta.textContent = [item.updated_at ? fmtTime(item.updated_at) : "", syncText]
+      .filter(Boolean).join(" · ");
+
+    const del = document.createElement("button");
+    del.className = "ghost";
+    del.textContent = "删除";
+    del.addEventListener("click", async () => {
+      try {
+        await api(`/api/v1/todos/${item.id}`, { method: "DELETE" });
+        toast("已删除");
+      } catch (e) {
+        toast("失败：" + e.message);
+      }
+    });
+
+    li.append(box, title, meta, del);
+    list.append(li);
+  }
+}
+
+async function load() {
+  try {
+    const data = await api("/api/v1/todos");
+    render(data.items || []);
+    setLink(true);
+  } catch (e) {
+    toast("加载失败：" + e.message);
+    setLink(false);
+  }
+}
+
+async function loadDevice() {
+  try {
+    const info = await api("/api/v1/device/info");
+    $("device").textContent =
+      `${info.model} · ${info.version} · ${info.ip || "无 IP"} · ${info.sd_available ? "SD 卡" : "内置存储"}`;
+  } catch (e) {
+    $("device").textContent = "设备信息不可用";
+  }
+}
+
+function setLink(ok) {
+  const el = $("link");
+  el.textContent = ok ? "已连接" : "连接中断";
+  el.className = "pill " + (ok ? "ok" : "err");
+}
+
+$("add-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("title");
+  const value = input.value.trim();
+  if (!value) return;
+  try {
+    await api("/api/v1/todos", { method: "POST", body: JSON.stringify({ title: value }) });
+    input.value = "";
+    toast("已添加");
+  } catch (e) {
+    toast("失败：" + e.message);
+  }
+});
+
+$("reload").addEventListener("click", load);
+$("sync").addEventListener("click", async () => {
+  try {
+    await api("/api/v1/sync", { method: "POST" });
+    toast("已标记为同步");
+  } catch (e) {
+    toast("失败：" + e.message);
+  }
+});
+
+// Server-sent events keep the page live; polls are the fallback when SSE is
+// unavailable (requirement 8.7: the web page must degrade to polling).
+function connectEvents() {
+  try {
+    const source = new EventSource("/api/v1/events");
+    source.addEventListener("todo_changed", () => load());
+    source.addEventListener("open", () => setLink(true));
+    source.addEventListener("error", () => {
+      setLink(false);
+      source.close();
+      setTimeout(connectEvents, 5000);
+    });
+  } catch (e) {
+    setInterval(load, 5000);
+  }
+}
+
+load();
+loadDevice();
+connectEvents();
+setInterval(loadDevice, 30000);
+</script>
+</body>
+</html>

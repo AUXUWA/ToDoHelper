@@ -1,0 +1,6 @@
+version: "0.1.0"
+description: ToDoHelper storage abstraction (SD card with internal LittleFS fallback)
+
+dependencies:
+  idf: ">=6.1.0"
+  joltwallet/littlefs: "^1.21.0"
