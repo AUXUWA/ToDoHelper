@@ -279,9 +279,37 @@ static esp_err_t wifi_create_password_view(lv_obj_t *parent)
 
     lv_obj_t *keyboard = lv_keyboard_create(s_view[WIFI_VIEW_PASSWORD]);
     lv_obj_set_width(keyboard, LV_PCT(100));
-    lv_obj_set_height(keyboard, 200);
+    /* Six rows have to fit; 200 px squeezed them to ~33 px per row, which is below
+     * a comfortable touch target. */
+    lv_obj_set_height(keyboard, 240);
     lv_keyboard_set_textarea(keyboard, s_pass_area);
     lv_obj_set_style_text_font(keyboard, ui_font(UI_FONT_SMALL), 0);
+
+    /* LVGL's default keyboard is light grey and clashes with the dark theme.
+     * Symbols (LV_SYMBOL_BACKSPACE/OK/...) come from the font fallback chain set up
+     * in ui_fonts.c - they are not in the embedded CJK subset. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(keyboard, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(keyboard, 0, 0);
+    lv_obj_set_style_pad_all(keyboard, 4, 0);
+    lv_obj_set_style_pad_gap(keyboard, 4, 0);
+
+    /* Keys. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_SURFACE_ALT, LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(keyboard, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(keyboard, UI_COLOR_TEXT, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(keyboard, 0, LV_PART_ITEMS);
+    lv_obj_set_style_radius(keyboard, 6, LV_PART_ITEMS);
+    /* Pressed feedback in the accent colour, matching the rest of the UI. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_PRIMARY, LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(keyboard, lv_color_white(), LV_PART_ITEMS | LV_STATE_PRESSED);
+    /* Checked keys are the sticky ones (shift / layout switch). */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_PRIMARY, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(keyboard, lv_color_white(), LV_PART_ITEMS | LV_STATE_CHECKED);
+    /* The text area the password is typed into. */
+    lv_obj_set_style_bg_color(keyboard, UI_COLOR_BG, LV_PART_ITEMS | LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(keyboard, UI_COLOR_TEXT, LV_PART_ITEMS | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(keyboard, 0, LV_PART_ITEMS | LV_STATE_FOCUSED);
 
     return ESP_OK;
 }

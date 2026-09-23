@@ -185,6 +185,57 @@ static bool ft_load_from_file(void)
     return true;
 }
 
+/**
+ * Per-role fallback for codepoints the embedded subset does not contain.
+ *
+ * The subset covers GB2312 level 1 plus ASCII, so it has no LVGL symbol glyphs
+ * (LV_SYMBOL_* live in U+F000..) and no rare hanzi. Without a fallback those
+ * render as boxes - which is exactly what the on-screen keyboard did, because its
+ * shift/backspace/ok keys are drawn with LV_SYMBOL_*.
+ *
+ * LVGL resolves `lv_font_t.fallback` recursively, so each role falls back to the
+ * Montserrat size closest to it (symbols and punctuation), and that in turn falls
+ * back to the built-in CJK font for hanzi outside the subset.
+ */
+static const lv_font_t *role_symbol_fallback(ui_font_role_t role)
+{
+    switch (role) {
+#if CONFIG_LV_FONT_MONTSERRAT_18
+    case UI_FONT_SMALL:
+    case UI_FONT_BODY:
+        return &lv_font_montserrat_18;
+#endif
+#if CONFIG_LV_FONT_MONTSERRAT_24
+    case UI_FONT_TITLE:
+        return &lv_font_montserrat_24;
+#endif
+#if CONFIG_LV_FONT_MONTSERRAT_46
+    case UI_FONT_HUGE:
+        return &lv_font_montserrat_46;
+#endif
+    default:
+        break;
+    }
+#if CONFIG_LV_FONT_MONTSERRAT_18
+    return &lv_font_montserrat_18;
+#else
+    return NULL;
+#endif
+}
+
+static void install_fallbacks(void)
+{
+    for (int i = 0; i < UI_FONT_ROLE_MAX; i++) {
+        if (s_fonts[i] == NULL) {
+            continue;
+        }
+        /* The FreeType fonts are heap objects owned by the adapter; LVGL has no
+         * lv_font_set_fallback() in 9.5, only this public field. */
+        lv_font_t *font = (lv_font_t *)s_fonts[i];
+        font->fallback = role_symbol_fallback((ui_font_role_t)i);
+    }
+}
+
 #endif /* CONFIG_TODOHELPER_FONT_FREETYPE */
 
 /* ------------------------------------------------------------------------- */
@@ -214,6 +265,12 @@ void ui_fonts_init(void)
     }
 #else
     SYS_LOGI(TAG, "FreeType disabled, using built-in fonts");
+#endif
+
+#if CONFIG_TODOHELPER_FONT_FREETYPE
+    if (s_using_freetype) {
+        install_fallbacks();
+    }
 #endif
 
     for (int i = 0; i < UI_FONT_ROLE_MAX; i++) {

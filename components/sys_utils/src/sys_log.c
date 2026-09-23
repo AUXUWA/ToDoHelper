@@ -19,6 +19,15 @@
 /** Max length of the "TH:<tag>" prefix built by sys_log_write(). */
 #define SYS_LOG_TAG_BUF 48
 
+/**
+ * Max length of one formatted log line.
+ *
+ * Long lines are truncated rather than dropped; on the stack this costs 256 bytes
+ * per caller, which is why it is not larger. It is on the stack deliberately: a
+ * shared buffer would need a lock, and logging must never block or allocate.
+ */
+#define SYS_LOG_LINE_BUF 256
+
 static sys_log_level_t s_level = (sys_log_level_t)CONFIG_TODOHELPER_LOG_LEVEL;
 
 void sys_log_set_level(sys_log_level_t level)
@@ -66,8 +75,23 @@ void sys_log_write(int level, const char *tag, const char *fmt, ...)
     char tagged[SYS_LOG_TAG_BUF];
     snprintf(tagged, sizeof(tagged), "TH:%s", tag ? tag : "?");
 
+    /*
+     * Format first, then hand the finished text to esp_log_write().
+     *
+     * esp_log_writev() was used originally for its va_list convenience, but it
+     * emits the message *verbatim*: no "I (1234) TH:tag:" prefix and, crucially,
+     * no trailing newline. The console is line buffered, so every application
+     * message stayed in the buffer and then merged into the next line - the boot
+     * log came out as one enormous unreadable line, and anything logged after the
+     * last IDF message (the boot-time Wi-Fi scan, the idle timeout) looked like it
+     * never happened. esp_log_write() is the same entry point the ESP_LOGx macros
+     * use, so this produces the standard, parseable format.
+     */
+    char line[SYS_LOG_LINE_BUF];
     va_list ap;
     va_start(ap, fmt);
-    esp_log_writev((esp_log_level_t)(level + 1), tagged, fmt, ap);
+    vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
+
+    esp_log_write((esp_log_level_t)(level + 1), tagged, "%s\n", line);
 }

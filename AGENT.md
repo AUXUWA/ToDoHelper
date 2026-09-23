@@ -358,15 +358,57 @@ Project build complete.
    所以 `if (errno == EEXIST) return OK;` 会把已存在目录当成硬失败。
    → 失败后用 `stat()` 确认是否已是目录，并重试一次。
 
-### 9.0.1 两个已经把设备搞挂过的自伤 bug（别再犯）
+### 9.0.1 三个已经把设备搞挂过的自伤 bug（别再犯）
 
+- **PSRAM 任务栈绝对不能碰 flash。** 把 LVGL 任务栈放到 PSRAM
+  （`stack_in_psram = true`）看起来能省 32 KB 内部 RAM，但**一点"连接 WiFi"就重启**：
+  UI 任务会写 NVS（连接按钮存凭据、设置页存亮度/时区/待机时间），而 flash 写会关闭
+  cache，PSRAM 随即不可访问，IDF 直接断言：
+  ```
+  assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+                (esp_task_stack_is_sane_cache_disabled())
+    nvs_set_str <- sys_config_set_str <- wifi_manager_save_config <- connect_with
+  ```
+  → **只要任务可能做 flash 操作（NVS/OTA/SPI flash），栈就必须在内部 RAM**。同理
+  `wifi_manager` 的扫描工作线程也用内部栈（Wi-Fi 驱动可能访问 NVS）。判据：崩溃时
+  `SP` 落在 `0x50xxxxxx`（PSRAM 段）就是这个坑。
 - **任何 LVGL 调用都必须要么在 LVGL 任务里、要么持锁。** `ui_lock()/ui_unlock()` 包着
   适配器的**递归**互斥锁，所以从 LVGL 任务内部再取一次是安全的。曾经 `app_main` 直接调
   `ui_statusbar_refresh()` 没持锁，在渲染任务遍历对象链表时改标签 → main 任务死循环、
-  IDLE0 被饿死、每 5 秒刷一次 task watchdog。现在 `ui_statusbar_refresh()` **自己**加锁，
-  调用方不必关心。
-- **跨任务通知用 `sys_notify()` / 事件，不要跨任务直接摸 LVGL 对象。** 需要从非 LVGL
-  任务操作 UI 时用 `ui_run_async()`。
+  IDLE0 被饿死、每 5 秒刷一次 task watchdog。现在 `ui_statusbar_refresh()` **自己**加锁。
+  另外**别用 `esp_lv_adapter_lock(0)` 做"试着拿一下"**：拿不到时它会打 `ESP_LOGE`
+  （"Failed to acquire LVGL lock"），把日志刷满。周期性工作请用 `lv_timer`（本来就在
+  LVGL 任务里，根本不需要加锁）。
+- **不要在 WiFi 事件处理器里干活。** 它跑在共享的 `sys_evt` 任务上，栈只有约 2.8 KB。
+  曾经在 `WIFI_EVENT_SCAN_DONE` 里放了一个 `wifi_ap_record_t[24]` 局部数组（约 2.7 KB）
+  并调用 `esp_wifi_scan_get_ap_records()` → 栈溢出重启。现在处理器只往队列里发一条命令，
+  扫描记录的拷贝由 `wifi_manager` 的专用工作线程（4 KB 栈）完成。
+
+### 9.0.2 日志：`esp_log_writev()` 是无前缀、无换行的原样输出
+
+`sys_log_write()` 原先用 `esp_log_writev()`（图 va_list 方便），但它是**原样输出**：
+既没有 `I (1234) TH:tag:` 前缀，也**没有结尾换行**。串口是行缓冲的，于是：
+
+- 所有应用日志互相粘连成一行，完全没法看；
+- **最后一条 IDF 日志之后的应用日志会卡在缓冲区里不出来**——表现为"扫描完成"、
+  "待机超时"这类消息**看起来根本没发生**，害我误判了两个功能是坏的。
+
+改用 `esp_log_write(level, tag, "%s\n", line)`（先 `vsnprintf` 格式化，再用
+`ESP_LOGx` 宏同一条格式化路径）。修好后启动日志从"1 行"变成 **782 行**，
+`scan done: 18 AP(s)` 立刻就看到了。**排障时如果怀疑"某段代码没执行"，先确认日志格式。**
+
+### 9.0.3 字体缺字：用 fallback 链，不要逐个控件打补丁
+
+内嵌的 CJK 子集只有 GB2312 一级 + ASCII，**没有 LVGL 的符号字形**
+（`LV_SYMBOL_*` 在 U+F000 区），所以屏幕键盘的退格/确定/切键盘键全变成空方框。
+正确做法是在 `ui_fonts.c` 里给每个角色的 FreeType 字体挂 fallback
+（`lv_font_t.fallback` 字段，LVGL 9.5 **没有** `lv_font_set_fallback()` 函数）：
+
+```
+FreeType 子集 --fallback--> Montserrat(同尺寸) --fallback--> 内置 CJK 16px
+```
+
+这样符号、少见的汉字都能显示，且**全局生效**，不用在键盘上写特例。
 
 ### 9.1 三条**不可删**的 `sdkconfig.defaults` 配置
 

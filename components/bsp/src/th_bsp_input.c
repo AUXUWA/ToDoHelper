@@ -16,8 +16,8 @@ static const char *TAG = "bsp_input";
 /** Idle timeout used when the NVS key is absent (FR6: 30 s). */
 #define TH_BSP_IDLE_TIMEOUT_DEFAULT_S 30
 
-/** How often the idle state is re-evaluated. */
-#define TH_BSP_IDLE_POLL_US (500 * 1000)
+/** How often the idle state is re-evaluated (an lv_timer period). */
+#define TH_BSP_IDLE_POLL_MS 500
 
 static button_handle_t s_buttons[BSP_BUTTON_NUM];
 static int s_button_count;
@@ -25,7 +25,8 @@ static int s_button_count;
 static volatile uint32_t s_last_activity_ms;
 static bool s_idle;
 static uint32_t s_idle_timeout_ms = TH_BSP_IDLE_TIMEOUT_DEFAULT_S * 1000;
-static esp_timer_handle_t s_idle_timer;
+/** Runs inside the LVGL task, see idle_timer_cb(). */
+static lv_timer_t *s_idle_timer;
 
 /* ------------------------------------------------------------------------- */
 /* Buttons                                                                   */
@@ -134,9 +135,30 @@ void th_bsp_poll_idle(void)
     }
 }
 
-static void idle_timer_cb(void *arg)
+static void idle_timer_cb(lv_timer_t *timer)
 {
-    (void)arg;
+    (void)timer;
+
+    /*
+     * Treat any input as user activity.
+     *
+     * The only reliable way to see *every* input path (touch, keys, encoder) is to
+     * ask LVGL how long the display has gone without input - hooking each path by
+     * hand missed the touchscreen entirely, which produced two reported bugs:
+     * the device fell asleep while the screen was being used, and a touch could
+     * not wake it again (only the hardware buttons could, because
+     * button_event_cb() was the sole caller of th_bsp_report_activity()).
+     *
+     * This callback is an lv_timer, so it runs from lv_timer_handler() inside the
+     * LVGL task with the adapter lock already held: reading LVGL state needs no
+     * lock of its own. An esp_timer was tried first and had to try-lock, which
+     * made the adapter log "Failed to acquire LVGL lock" as an *error* every time
+     * the render task happened to be busy.
+     */
+    if (s_idle_timeout_ms > 0 && lv_display_get_inactive_time(NULL) < s_idle_timeout_ms) {
+        th_bsp_report_activity();
+    }
+
     th_bsp_poll_idle();
 }
 
@@ -157,22 +179,17 @@ esp_err_t th_bsp_idle_init(void)
         return ESP_OK;
     }
 
-    const esp_timer_create_args_t args = {
-        .callback = idle_timer_cb,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "th_idle",
-    };
-
-    esp_err_t err = esp_timer_create(&args, &s_idle_timer);
+    /* Created under the adapter lock because lv_timer_create() touches LVGL's
+     * timer list, and this runs on main_task rather than the LVGL task. */
+    esp_err_t err = esp_lv_adapter_lock(-1);
     if (err != ESP_OK) {
         return err;
     }
-    err = esp_timer_start_periodic(s_idle_timer, TH_BSP_IDLE_POLL_US);
-    if (err != ESP_OK) {
-        esp_timer_delete(s_idle_timer);
-        s_idle_timer = NULL;
-        return err;
+    s_idle_timer = lv_timer_create(idle_timer_cb, TH_BSP_IDLE_POLL_MS, NULL);
+    esp_lv_adapter_unlock();
+
+    if (s_idle_timer == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
     SYS_LOGI(TAG, "idle timeout %u s", (unsigned)(s_idle_timeout_ms / 1000));
@@ -184,8 +201,10 @@ esp_err_t th_bsp_idle_stop(void)
     if (s_idle_timer == NULL) {
         return ESP_OK;
     }
-    esp_timer_stop(s_idle_timer);
-    esp_timer_delete(s_idle_timer);
+    if (esp_lv_adapter_lock(-1) == ESP_OK) {
+        lv_timer_delete(s_idle_timer);
+        esp_lv_adapter_unlock();
+    }
     s_idle_timer = NULL;
     s_idle = false;
     return ESP_OK;

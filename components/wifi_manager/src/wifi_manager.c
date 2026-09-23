@@ -13,7 +13,10 @@
 #include "esp_timer.h"
 #include "esp_wifi_default.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "lwip/ip_addr.h"
 
 #include "th_bsp.h"
@@ -34,11 +37,39 @@ ESP_EVENT_DEFINE_BASE(WIFI_MGR_EVENT);
 
 #define WIFI_SCAN_CACHE_MAX  CONFIG_TODOHELPER_WIFI_SCAN_MAX_APS
 #define WIFI_BLOCKING_SCAN_TIMEOUT_MS 15000
+#define WIFI_SCAN_TASK_STACK  (4 * 1024)
+#define WIFI_SCAN_TASK_PRIO   5
+
+static void scan_worker(void *arg);
 
 static bool s_initialized;
 static esp_netif_t *s_netif;
-static SemaphoreHandle_t s_scan_done;      /* signalled by the SCAN_DONE handler */
+/**
+ * Scan plumbing.
+ *
+ * All of this exists because the WiFi event handler runs on the shared `sys_evt`
+ * task, whose stack is only ~2.8 KB. Copying scan results there (see
+ * scan_collect()) used ~2.7 KB of local array on top of the WiFi logging path and
+ * overflowed the stack:
+ *
+ *     Guru Meditation Error: Core 0 panic'ed (Stack protection fault).
+ *     Detected in task "sys_evt"
+ *     ... esp_wifi_scan_get_ap_num <- wifi_event_handler (wifi_manager.c:288)
+ *
+ * So the handler now only signals, and a dedicated worker with a real stack does
+ * the copying.
+ */
+static SemaphoreHandle_t s_scan_done;      /* scan worker -> whoever waited */
+static QueueHandle_t s_scan_cmd;           /* commands for the scan worker */
+static TaskHandle_t s_scan_task;
+static esp_timer_handle_t s_prescan_timer;
 static esp_timer_handle_t s_reconnect_timer;
+
+/** Work the scan worker performs. */
+typedef enum {
+    SCAN_CMD_START,     /**< ask the radio to scan */
+    SCAN_CMD_COLLECT,   /**< a scan finished, copy the results into the cache */
+} scan_cmd_t;
 
 static wifi_mgr_state_t s_state = WIFI_MGR_DISCONNECTED;
 static char s_ssid[WIFI_MANAGER_SSID_MAX + 1];
@@ -50,6 +81,102 @@ static bool s_allow_reconnect;
 
 static wifi_ap_info_t s_scan_cache[WIFI_SCAN_CACHE_MAX];
 static size_t s_scan_count;
+
+/* ------------------------------------------------------------------------- */
+/* Scan worker                                                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Pull the completed scan's results into the cache.
+ *
+ * Runs on the scan worker's own stack. The local `records` array is
+ * WIFI_SCAN_CACHE_MAX * sizeof(wifi_ap_record_t) - about 2.7 KB with the default
+ * of 24 - which is precisely why it must not live in the WiFi event handler.
+ */
+static void scan_collect(void)
+{
+    uint16_t num = 0;
+    if (esp_wifi_scan_get_ap_num(&num) != ESP_OK) {
+        num = 0;
+    }
+    if (num > WIFI_SCAN_CACHE_MAX) {
+        num = WIFI_SCAN_CACHE_MAX;
+    }
+
+    wifi_ap_record_t records[WIFI_SCAN_CACHE_MAX];
+    uint16_t got = num;
+    if (got > 0 && esp_wifi_scan_get_ap_records(&got, records) == ESP_OK) {
+        if (got > WIFI_SCAN_CACHE_MAX) {
+            got = WIFI_SCAN_CACHE_MAX;
+        }
+        for (uint16_t i = 0; i < got; i++) {
+            memset(&s_scan_cache[i], 0, sizeof(s_scan_cache[i]));
+            strlcpy(s_scan_cache[i].ssid, (const char *)records[i].ssid,
+                    sizeof(s_scan_cache[i].ssid));
+            s_scan_cache[i].rssi = records[i].rssi;
+            s_scan_cache[i].authmode = records[i].authmode;
+            s_scan_cache[i].channel = records[i].primary;
+            memcpy(s_scan_cache[i].bssid, records[i].bssid, 6);
+        }
+        s_scan_count = got;
+    } else {
+        s_scan_count = 0;
+    }
+
+    SYS_LOGI(TAG, "scan done: %u AP(s)", (unsigned)s_scan_count);
+}
+
+/**
+ * Ask the scan worker to start a scan.
+ *
+ * All scanning goes through the worker so that no WiFi API is ever driven from
+ * the WiFi event handler (~2.8 KB stack) or from an HTTP handler task. In
+ * particular, starting a scan straight after esp_wifi_start() returned ESP_OK but
+ * never produced SCAN_DONE - the radio was not up yet - which is why the
+ * boot-time pre-scan goes through a short timer instead.
+ */
+static void scan_request(void)
+{
+    const scan_cmd_t cmd = SCAN_CMD_START;
+    if (s_scan_cmd != NULL) {
+        (void)xQueueSend(s_scan_cmd, &cmd, 0);
+    }
+}
+
+static void prescan_timer_cb(void *arg)
+{
+    (void)arg;
+    scan_request();
+}
+
+static void scan_worker(void *arg)
+{
+    (void)arg;
+
+    scan_cmd_t cmd;
+    for (;;) {
+        if (xQueueReceive(s_scan_cmd, &cmd, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        if (cmd == SCAN_CMD_START) {
+            const esp_err_t err = esp_wifi_scan_start(NULL, false);
+            if (err != ESP_OK) {
+                SYS_LOGW(TAG, "scan start failed: %s", esp_err_to_name(err));
+            } else {
+                SYS_LOGD(TAG, "scan requested");
+            }
+            continue;
+        }
+
+        scan_collect();
+        /* Released last so a waiter that wakes up sees a filled cache. */
+        if (s_scan_done != NULL) {
+            xSemaphoreGive(s_scan_done);
+        }
+        (void)sys_event_post_to(WIFI_MGR_EVENT, WIFI_MGR_EVENT_SCAN_DONE, NULL, 0);
+    }
+}
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                   */
@@ -284,36 +411,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
     switch (id) {
     case WIFI_EVENT_SCAN_DONE: {
-        uint16_t num = 0;
-        if (esp_wifi_scan_get_ap_num(&num) != ESP_OK) {
-            num = 0;
+        /* Signal the worker and return immediately.  This handler runs on the
+         * shared ~2.8 KB `sys_evt` stack, so it must not copy scan records or
+         * call anything that walks the WiFi logging path - doing that used to
+         * overflow the stack and reset the device. */
+        const scan_cmd_t cmd = SCAN_CMD_COLLECT;
+        if (s_scan_cmd != NULL) {
+            (void)xQueueSend(s_scan_cmd, &cmd, 0);
         }
-        if (num > WIFI_SCAN_CACHE_MAX) {
-            num = WIFI_SCAN_CACHE_MAX;
-        }
-
-        wifi_ap_record_t records[WIFI_SCAN_CACHE_MAX];
-        uint16_t got = num;
-        if (got > 0 && esp_wifi_scan_get_ap_records(&got, records) == ESP_OK) {
-            s_scan_count = got;
-            for (uint16_t i = 0; i < got; i++) {
-                memset(&s_scan_cache[i], 0, sizeof(s_scan_cache[i]));
-                strlcpy(s_scan_cache[i].ssid, (const char *)records[i].ssid,
-                        sizeof(s_scan_cache[i].ssid));
-                s_scan_cache[i].rssi = records[i].rssi;
-                s_scan_cache[i].authmode = records[i].authmode;
-                s_scan_cache[i].channel = records[i].primary;
-                memcpy(s_scan_cache[i].bssid, records[i].bssid, 6);
-            }
-        } else {
-            s_scan_count = 0;
-        }
-
-        SYS_LOGI(TAG, "scan done: %u AP(s)", (unsigned)s_scan_count);
-        if (s_scan_done != NULL) {
-            xSemaphoreGive(s_scan_done);
-        }
-        (void)sys_event_post_to(WIFI_MGR_EVENT, WIFI_MGR_EVENT_SCAN_DONE, NULL, 0);
         break;
     }
 
@@ -383,6 +488,25 @@ esp_err_t wifi_manager_init(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    if (s_scan_cmd == NULL) {
+        s_scan_cmd = xQueueCreate(4, sizeof(scan_cmd_t));
+        if (s_scan_cmd == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_scan_task == NULL) {
+        /* Internal RAM on purpose: a task whose stack lives in PSRAM must never
+         * perform a flash operation (the cache is disabled then, see th_bsp.c),
+         * and the Wi-Fi driver may touch NVS during a scan. It is only 4 KB. */
+        const BaseType_t ok = xTaskCreate(scan_worker, "th_wifi_scan",
+                                         WIFI_SCAN_TASK_STACK, NULL,
+                                         WIFI_SCAN_TASK_PRIO, &s_scan_task);
+        if (ok != pdPASS) {
+            SYS_LOGE(TAG, "cannot create the scan worker");
+            return ESP_ERR_NO_MEM;
+        }
+        SYS_LOGD(TAG, "scan worker started (%d B stack)", WIFI_SCAN_TASK_STACK);
+    }
 
     s_netif = esp_netif_create_default_wifi_sta();
     if (s_netif == NULL) {
@@ -438,6 +562,28 @@ esp_err_t wifi_manager_init(void)
     esp_err_t auto_err = wifi_manager_auto_connect();
     if (auto_err == ESP_ERR_NOT_FOUND) {
         SYS_LOGI(TAG, "no saved network yet");
+        /* Nothing to connect to, and the user's first action will be to pick a
+         * network - so populate the list before they open the page.
+         *
+         * Deferred by a timer on purpose: starting a scan immediately after
+         * esp_wifi_start() returns ESP_OK but never delivers SCAN_DONE because
+         * the radio is still coming up, which left the list permanently empty.
+         */
+        if (s_prescan_timer == NULL) {
+            const esp_timer_create_args_t prescan_args = {
+                .callback = prescan_timer_cb,
+                .arg = NULL,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "wifi_prescan",
+            };
+            if (esp_timer_create(&prescan_args, &s_prescan_timer) == ESP_OK) {
+                esp_timer_start_once(s_prescan_timer, 2000 * 1000);
+                SYS_LOGI(TAG, "pre-scanning for available networks in 2 s");
+            } else {
+                SYS_LOGW(TAG, "cannot schedule the pre-scan");
+                s_prescan_timer = NULL;
+            }
+        }
     } else if (auto_err != ESP_OK) {
         SYS_LOGW(TAG, "auto connect not started: %s", esp_err_to_name(auto_err));
     }
@@ -455,7 +601,10 @@ esp_err_t wifi_manager_start_scan(void)
         /* Drop a stale completion so the next wait cannot return early. */
         (void)xSemaphoreTake(s_scan_done, 0);
     }
-    return esp_wifi_scan_start(NULL, false);
+    /* Handed to the worker: see scan_request() for why the radio is not driven
+     * from the caller's task. */
+    scan_request();
+    return ESP_OK;
 }
 
 esp_err_t wifi_manager_scan(wifi_ap_info_t *aps, size_t max, size_t *count)
@@ -474,8 +623,16 @@ esp_err_t wifi_manager_scan(wifi_ap_info_t *aps, size_t max, size_t *count)
         return err;
     }
 
-    /* esp_wifi_scan_start(block=true) already waited for SCAN_DONE; the handler
-     * filled the cache on the way. */
+    /* esp_wifi_scan_start(block=true) returns once SCAN_DONE has been handled, but
+     * the handler only *signals* the worker - the cache is filled asynchronously,
+     * so wait for the worker before reading it. */
+    if (s_scan_done != NULL) {
+        if (xSemaphoreTake(s_scan_done, pdMS_TO_TICKS(WIFI_BLOCKING_SCAN_TIMEOUT_MS)) != pdTRUE) {
+            SYS_LOGW(TAG, "timed out waiting for the scan worker");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
     return wifi_manager_get_scan_result(aps, max, count);
 }
 

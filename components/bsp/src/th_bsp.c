@@ -197,23 +197,32 @@ esp_err_t th_bsp_init(void)
     cfg.enable_touch = true;
 
     /*
-     * Take over the LVGL adapter configuration before the BSP initialises it.
+     * Take over the LVGL adapter configuration before the BSP initialises it, so
+     * the render task gets the 32 KB stack FreeType needs (AGENT.md 9.0).
      *
-     * bsp_display_start_with_config() only calls esp_lv_adapter_init() when the
-     * adapter is not already up, so initialising it here is the supported way to
-     * choose the render task's stack placement. The BSP's own default puts it in
-     * internal RAM; moving it to PSRAM keeps internal RAM for DMA.
+     * stack_in_psram is deliberately **false**. It was tried and it aborts the
+     * device: the UI task writes NVS (WiFi credentials from the connect button,
+     * brightness/timezone/idle from the settings page), and a flash write disables
+     * the cache - which makes a PSRAM stack unreachable:
+     *
+     *   assert failed: spi_flash_disable_interrupts_caches_and_other_cpu
+     *                 (esp_task_stack_is_sane_cache_disabled())
+     *     nvs_set_str <- sys_config_set_str <- wifi_manager_save_config
+     *     <- connect_with            SP in 0x5062_xxxx (PSRAM)
+     *
+     * The 32 KB therefore comes out of internal RAM, which is why the budget in
+     * AGENT.md 8 matters.
      */
     if (!esp_lv_adapter_is_initialized()) {
         esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
         adapter_cfg.task_stack_size = TH_BSP_DISPLAY_TASK_STACK;
-        adapter_cfg.stack_in_psram = true;
+        adapter_cfg.stack_in_psram = false;
         esp_err_t aerr = esp_lv_adapter_init(&adapter_cfg);
         if (aerr != ESP_OK) {
             SYS_LOGE(TAG, "LVGL adapter init failed: %s", esp_err_to_name(aerr));
             return aerr;
         }
-        SYS_LOGI(TAG, "LVGL adapter pre-initialised (task stack %u KB in PSRAM)",
+        SYS_LOGI(TAG, "LVGL adapter pre-initialised (task stack %u KB, internal)",
                  (unsigned)(TH_BSP_DISPLAY_TASK_STACK / 1024));
     }
 
