@@ -713,26 +713,33 @@ static void weather_task(void *arg)
     while (xQueueReceive(s_requests, &opcode, portMAX_DELAY) == pdTRUE) {
         if (opcode == WEATHER_REQ_DETECT) {
             /*
-             * Do not start a TLS request before the clock is valid.
+             * Wait for a valid clock, don't just skip.
              *
-             * Certificate validation checks notBefore/notAfter, so while the system
-             * clock is still at 0 (SNTP has not synced yet) mbedtls always fails:
+             * TLS certificate validation checks notBefore/notAfter, so a request
+             * made before SNTP syncs always fails:
              *
              *   E esp-x509-crt-bundle: Failed to verify certificate
              *   E esp-tls-mbedtls: mbedtls_ssl_handshake returned -0x3000
-             *   W TH:weather: IP geolocation request failed: ESP_ERR_HTTP_CONNECT
              *
-             * (-0x3000 is MBEDTLS_ERR_X509_CERT_VERIFY_FAILED.) That is why the
-             * boot-time IP geolocation always failed and why
-             * POST /api/v1/weather/locate answered 503.
+             * (-0x3000 is MBEDTLS_ERR_X509_CERT_VERIFY_FAILED.) The boot-time
+             * detect fires at ~3 s while SNTP typically lands at ~36 s, so waiting
+             * here is what makes automatic IP location actually work. Bounded to
+             * 75 s so it can never hang the worker; the periodic refresh and the
+             * page's "重新定位" button cover the rest.
              *
-             * Skipping here removes the guaranteed-failure request and the
-             * misleading error spam. The page's "重新定位" button and the periodic
-             * refresh still retry; an automatic short retry timer is the next step.
+             * This runs on the weather worker task, not in a caller, so the wait
+             * delays nothing that the user is blocking on.
              */
-            if (!sys_time_synced()) {
-                SYS_LOGW(TAG, "clock not synced yet - skipping IP geolocation "
-                              "(TLS certificate validation would fail)");
+            bool clock_ready = sys_time_synced();
+            for (int attempt = 0; attempt < 15 && !clock_ready; attempt++) {
+                if (attempt == 0) {
+                    SYS_LOGI(TAG, "waiting for the clock before IP geolocation");
+                }
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                clock_ready = sys_time_synced();
+            }
+            if (!clock_ready) {
+                SYS_LOGW(TAG, "clock still not synced after 75 s - skipping IP geolocation");
             } else {
                 /* Priority 2 of the FR3 location list: only used when nothing was
                  * chosen manually, or when the caller explicitly asked for it. */
