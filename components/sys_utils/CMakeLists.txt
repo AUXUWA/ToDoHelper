@@ -8,6 +8,7 @@ idf_component_register(
         "src/sys_status.c"
         "src/sys_notify.c"
         "src/sys_heap.c"
+        "src/sys_json.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_event nvs_flash esp_timer log esp_common heap esp_hw_support
+    REQUIRES esp_event nvs_flash esp_timer log esp_common heap esp_hw_support cjson
 )

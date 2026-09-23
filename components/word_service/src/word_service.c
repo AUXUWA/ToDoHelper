@@ -156,6 +156,18 @@ static esp_err_t parse_book(const char *json)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /*
+     * Diagnostics for the scarcest resource on this board. A full word book is
+     * ~7000 cJSON nodes, and *while the tree is alive* it holds all of them; if
+     * those come out of internal RAM the concurrently connecting WiFi driver
+     * cannot allocate and the boot aborts (AGENT.md 9.0.5). With the cJSON hooks
+     * from sys_json_use_psram() in place this number stays at its pre-parse
+     * value, which is exactly what makes the SD-card boot work.
+     */
+    SYS_LOGI(TAG, "book tree alive: internal %u KB free (largest %u KB)",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(sys_heap_largest_internal() / 1024));
+
     const cJSON *words = cJSON_GetObjectItemCaseSensitive(root, "words");
     if (!cJSON_IsArray(words)) {
         cJSON_Delete(root);
@@ -173,12 +185,16 @@ static esp_err_t parse_book(const char *json)
         count = WORD_MAX_ITEMS;
     }
 
-    /* Word text is bulky: prefer PSRAM so internal RAM stays free for WiFi/HTTP. */
-    word_item_t *items = heap_caps_malloc(count * sizeof(word_item_t), MALLOC_CAP_SPIRAM);
-    if (items == NULL) {
-        items = malloc(count * sizeof(word_item_t));
-    }
-    word_progress_t *progress = calloc(count, sizeof(word_progress_t));
+    /*
+     * Word text is bulky: prefer PSRAM so internal RAM stays free for WiFi/HTTP.
+     * Both arrays are part of the same "bulk device data" rule as the cJSON hooks
+     * installed by sys_json_use_psram(): 833 words are ~546 KB of items and
+     * ~20 KB of progress, which must never land in the ~310 KB internal pool.
+     */
+    word_item_t *items = heap_caps_malloc_prefer(count * sizeof(word_item_t), 2,
+                                                 MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    word_progress_t *progress = heap_caps_calloc_prefer(count, sizeof(word_progress_t), 2,
+                                                        MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     if (items == NULL || progress == NULL) {
         free(items);
         free(progress);
@@ -457,7 +473,7 @@ esp_err_t word_load_from_sd(const char *path)
     s_queue_len = 0;
 
     const size_t count = s_count;
-    SYS_LOGI(TAG, "loaded %u words from '%s'", (unsigned)count, relative);
+    SYS_LOGI(TAG, "loaded %u words from '%s' (%u B)", (unsigned)count, relative, (unsigned)len);
     (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_LOADED, &count, sizeof(count));
 
     /* Restore progress last: it indexes into the freshly loaded words. */

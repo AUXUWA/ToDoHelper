@@ -18,7 +18,6 @@
 #include "sys_utils.h"
 
 #include "esp_heap_caps.h"
-#include "esp_system.h"
 
 size_t sys_heap_largest_internal(void)
 {
@@ -32,10 +31,18 @@ void sys_heap_log(const char *stage)
     const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     const size_t internal_largest = sys_heap_largest_internal();
     const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    const size_t min_free = esp_get_minimum_free_heap_size();
+    /* Low-water mark of *internal* RAM.
+     *
+     * This column used to print esp_get_minimum_free_heap_size(), which is
+     * dominated by the 12 MB PSRAM pool and therefore never moved - it could not
+     * show that anything had drained the ~310 KB internal pool. The number that
+     * predicts a crash is exactly that: how close some transient burst came to
+     * emptying internal RAM. A dip into the single-digit KB here is the signature
+     * of the SD-card boot abort (AGENT.md 9.0.5). */
+    const size_t internal_low = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
 
-    SYS_LOGI("heap", "after %-14s internal %6u KB (largest %6u KB)  psram %5u KB  min %6u KB",
+    SYS_LOGI("heap", "after %-14s internal %6u KB (largest %6u KB)  psram %5u KB  int-low %6u KB",
              stage != NULL ? stage : "?",
              (unsigned)(internal_free / 1024), (unsigned)(internal_largest / 1024),
-             (unsigned)(psram_free / 1024), (unsigned)(min_free / 1024));
+             (unsigned)(psram_free / 1024), (unsigned)(internal_low / 1024));
 }

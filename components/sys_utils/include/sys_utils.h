@@ -199,12 +199,32 @@ esp_err_t sys_config_get_str_or(const char *key, char *out, size_t len, const ch
  * esp_wifi_init(); the total can look healthy while fragmentation still breaks a
  * large allocation.
  *
+ * `int-low` is the *internal* low-water mark since boot. It is the column that
+ * catches a transient burst (a bulk JSON parse used to be the one) emptying the
+ * internal pool and taking an unrelated subsystem down with `ESP_ERR_NO_MEM`;
+ * see AGENT.md 9.0.5.
+ *
  * @param stage Short stage label, e.g. "bsp", "ui_core", "wifi".
  */
 void sys_heap_log(const char *stage);
 
 /** @brief Largest free block of internal DMA-capable RAM, in bytes. */
 size_t sys_heap_largest_internal(void);
+
+/**
+ * @brief Make cJSON allocate from PSRAM instead of internal RAM.
+ *
+ * Call once, early in `app_main`, before anything parses JSON.
+ *
+ * This is **not** an optimisation, it is the fix for the SD-card boot abort:
+ * cJSON allocates one ~56-byte node per JSON element, and every allocation of
+ * <= `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (4096) goes to internal RAM first.
+ * Parsing the 546 KB CET-6 word book therefore empties the ~107 KB internal
+ * pool, after which the concurrently connecting WiFi driver can no longer get
+ * the ~100 bytes it needs for `esp_timer_create()` and aborts behind
+ * `ESP_ERROR_CHECK`. See AGENT.md 9.0.5 and `sys_json.c`.
+ */
+void sys_json_use_psram(void);
 
 #ifdef __cplusplus
 }

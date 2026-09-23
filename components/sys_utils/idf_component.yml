@@ -1,0 +1,8 @@
+version: "0.1.0"
+description: ToDoHelper L0 utilities (logging, shared event loop, time, config, notifications, heap diagnostics)
+
+dependencies:
+  idf: ">=6.1.0"
+  # Needed by sys_json.c: installs cJSON allocation hooks so bulk JSON parsing
+  # stays out of internal RAM (AGENT.md 9.0.5).
+  espressif/cjson: "^1.7.19"

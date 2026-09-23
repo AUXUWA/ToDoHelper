@@ -147,6 +147,12 @@ void app_main(void)
     /* First, so every later line is filtered by our level/quiet-tag policy. */
     sys_log_init();
 
+    /* Before anything parses JSON: cJSON's per-element allocations must come
+     * from PSRAM, not from the ~310 KB internal pool. Parsing the 546 KB CET-6
+     * word book from internal RAM empties that pool and makes the concurrently
+     * connecting WiFi driver abort with ESP_ERR_NO_MEM (AGENT.md 9.0.5). */
+    sys_json_use_psram();
+
     SYS_LOGI(TAG, "ToDoHelper starting");
 
     ESP_ERROR_CHECK(sys_config_init(NULL));
@@ -180,53 +186,12 @@ void app_main(void)
      * Show the splash before the slow, optional services come up and keep it up for
      * a fixed 3 s so the boot log is readable (user request).
      *
-     * The hand-off deliberately happens BEFORE run_modules(true). An earlier revision
-     * moved it *after*, which spread the splash's log-refresh lv_timer across the
-     * whole module-init window; that revision ran into a reproducible startup
-     * abort() (newlib lazy lock race, see AGENT.md 9.0.5), so the original ordering
-     * is restored and the readability is bought with a plain delay instead.
+     * The hand-off deliberately happens BEFORE run_modules(true), so the splash's
+     * log-refresh lv_timer is not alive while the modules initialise. That
+     * ordering was once suspected of causing the startup abort(); it did not.
+     * The real cause was internal RAM exhaustion inside a module's JSON parse,
+     * fixed by sys_json_use_psram() above - see AGENT.md 9.0.5.
      */
-
-    /*
-     * Linearise the crypto peripheral locks BEFORE anything concurrent can touch them.
-     *
-     * IDF's esp_security keeps these as zero-initialised static `_lock_t`s and relies
-     * on newlib's lazy lock init, which is "check then initialise" with no guard:
-     * when two contexts (here the WiFi WPA2 supplicant and the tick hook) call
-     * _lock_acquire() on the same lock for the first time, the second one hits
-     * `assert(lock->owner == LOCK_FREE)` in lock_init_generic() and the device
-     * aborts, reboots and loops. Acquiring and releasing each lock here - while
-     * app_main is the only context running - initialises them once and for all.
-     *
-     * See AGENT.md 9.0.5: the panic was resolved to esp_crypto_lock.c and this is
-     * the fix for it. The empty stubs IDF provides for unsupported peripherals make
-     * every one of these calls safe (and linkable) on any target, which is why they
-     * are declared here instead of pulling esp_security into main's REQUIRES.
-     */
-    extern void esp_crypto_sha_aes_lock_acquire(void);
-    extern void esp_crypto_sha_aes_lock_release(void);
-    extern void esp_crypto_hmac_lock_acquire(void);
-    extern void esp_crypto_hmac_lock_release(void);
-    /* NOTE: esp_crypto_dma_lock_{acquire,release} is *declared* in esp_crypto_lock.h
-     * but has no implementation on this target - calling it fails to link. Only use
-     * pairs that the linker has confirmed (see git log for the failure). */
-    extern void esp_crypto_mpi_lock_acquire(void);
-    extern void esp_crypto_mpi_lock_release(void);
-    extern void esp_crypto_ecc_lock_acquire(void);
-    extern void esp_crypto_ecc_lock_release(void);
-    extern void esp_crypto_ecdsa_lock_acquire(void);
-    extern void esp_crypto_ecdsa_lock_release(void);
-
-    esp_crypto_sha_aes_lock_acquire();
-    esp_crypto_sha_aes_lock_release();
-    esp_crypto_hmac_lock_acquire();
-    esp_crypto_hmac_lock_release();
-    esp_crypto_mpi_lock_acquire();
-    esp_crypto_mpi_lock_release();
-    esp_crypto_ecc_lock_acquire();
-    esp_crypto_ecc_lock_release();
-    esp_crypto_ecdsa_lock_acquire();
-    esp_crypto_ecdsa_lock_release();
 
     ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH));
 

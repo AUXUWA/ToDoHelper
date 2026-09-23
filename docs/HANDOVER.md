@@ -11,9 +11,13 @@
 
 ## 0. 一句话现状
 
-**8 项需求全部实现并提交，构建 0 错误 0 警告，但有一个阻塞性崩溃没修完：插 SD 卡时设备会
-崩溃重启循环。** 根因已定位到 IDF 内部具体文件行，并已加了一个修复，**该修复的验证当时仍在
-进行中**（见 §2，接手第一件事就是把它验完）。
+**8 项需求全部实现并提交；构建 0 错误 0 警告；上一个阻塞问题「插 SD 卡即崩溃重启循环」
+已定位根因、修复并在真机上 3/3 冷启动验证通过。目前没有已知阻塞问题。**
+
+> **关键更正**：交接时判断根因是「crypto 锁惰性初始化竞态」，**那是错的**（两处归因都是
+> panic 栈的误读）。真实根因是**批量 JSON 解析把内部 RAM 抽干**，使同一时刻正在连网的
+> WiFi 驱动 `ESP_ERROR_CHECK` 失败并 abort —— 只有插卡时才会去解析卡上的 546 KB 词库。
+> 详见 §2；`AGENT.md §9.0.5` 已改写为实测结论并保留了两处误读作为教训。
 
 ---
 
@@ -61,7 +65,9 @@
 - **L0 `SYS_EVENT_TIME_SYNCED` 事件**：已在 `AGENT.md §9.7` 降级为**可选** —— `weather_task`
   现在会等时钟最多 75 秒，已覆盖原场景。
 
+---
 
+## 1. 环境与命令（原文档漏了标题）
 
 - 目标芯片 `esp32s31`（ESP32-S31-Korvo，800×480 RGB 屏 + GT1151 触摸 + ES8389 + SDMMC 4-bit）
 - ESP-IDF **v6.1**，路径 `D:\ESP-IDF\v6.1\esp-idf`；工程 `D:\project\ESP-IDFv6.1\ToDoHelper`
@@ -101,90 +107,81 @@ python tools\monitor_capture.py --port COM34 --seconds 16 --no-reset --out build
 
 ---
 
-## 2. 🔴 阻塞问题：插卡启动崩溃（**接手第一件事**）
+## 2. ✅ 已修复：插 SD 卡启动崩溃重启循环（根因与当初的判断不同）
 
-### 现象（100% 可复现）
+### 当初的现象（100% 可复现）
 
 | 条件 | 结果 |
 |---|---|
 | **拔掉 SD 卡** | 启动干净：0 故障、9 模块 ready、`storage=/littlefs` |
 | **插上 SD 卡** | **3/3 崩溃**，从未到达 `TH:app: ready`；16 秒内崩 3 次 = 重启循环 |
 
-崩点固定：`module 'calendar_service' ready`（约 3.13 s）之后、`word_service` 打出任何日志之前。
+崩点固定：`module 'calendar_service' ready` 之后、`word_service` 打出任何日志之前。
 `reset reason: panic (4)`。
 
-### 根因（已用 addr2line 定位到具体文件行）
+### 真实根因：JSON 解析掏空内部 RAM → WiFi 驱动的 `ESP_ERROR_CHECK` 失败
+
+**答案一直写在 panic 文本里，只是被两处误读盖住了**：
 
 ```
-2f0029b0  lock_acquire_generic  @ esp_libc/src/locks.c:158
-2f00c91a  __assert_func         @ esp_libc/src/assert.c:34
-2f02d15c  ??                    @ esp_security/src/esp_crypto_lock.c:39   ← 关键
+I (5910) TH:app: module 'calendar_service' ready
+I (5915) TH:heap: after calendar_service internal 107 KB (largest 61 KB) psram 11183 KB
+ESP_ERROR_CHECK failed: esp_err_t 0x101 (ESP_ERR_NO_MEM) at 0x50127178
+file: ".../esp_timer/src/ets_timer_legacy.c" line 58
+func: ets_timer_setfn
+expression: esp_timer_create(&create_args, (esp_timer_handle_t*) & (ptimer->timer_arg))
+abort() was called at PC 0x2f00f08f on core 0
 ```
 
-`esp_security/src/esp_crypto_lock.c` 把硬件加密引擎的锁写成**零初始化的静态 `_lock_t`**
-（如第 39 行 `static _lock_t s_crypto_sha_aes_lock;`），靠 newlib 的**惰性初始化**：第 61-65 行
-`esp_crypto_hmac_lock_acquire()` 直接 `_lock_acquire()`。而 newlib 的 `lock_acquire_generic()`
-在发现锁"未初始化"时会调 `lock_init_generic()`，里面有 `assert(lock->owner == LOCK_FREE)` ——
-**两个上下文同时首次 acquire 同一把锁，后到者必然断言失败 → abort**。
+1. **`locks.c:77` 不是断言**。本机 IDF v6.1 的 `esp_libc/src/locks.c:77` 恰恰是
+   `lock_init_generic()` 里的 `abort(); /* No more semaphores available or OOM */`；
+   而那段惰性初始化全程由 `lock_init_spinlock` 保护，**不存在"两个上下文同时首次 acquire"
+   的竞态**。所以"crypto 锁竞态"这个结论不成立 —— 两条"线索"其实都指向**内存不够**。
+   （`esp_crypto_lock.c:39` 那个地址是数据段里静态锁变量的地址，根本不是返回地址。）
+2. **`RA = 0x2f00f098` 也不是"上下文来自 tick 钩子"**。`nm --numeric-sort` 显示该地址就是
+   `esp_vApplicationTickHook` 的**函数入口**，它紧跟在 `esp_system_abort` 之后；而
+   `esp_system_abort` 的 `sw ra,12(sp)` 保存的正是 `2f00f096: jal panic_abort` 的下一条指令。
+   **纯函数相邻的巧合。**
+3. `abort() was called at PC 0x...` 打印的是 `return_address - 3`（`esp_libc/src/abort.c:27`），
+   所以真实调用者是 `0x2f00f092`，即 `_esp_error_check_failed` 的末尾
+   （反汇编 `2f00f08e: jal 2f00c898 <abort>`）→ **就是 `ESP_ERROR_CHECK` 失败**。
 
-这解释了全部观察：时序依赖（故间歇）、**只有插卡才崩**（插卡使启动时序偏移约 100 ms 撞进竞态
-窗口）、崩点固定在 `calendar_service` 之后（那正是 WiFi 接上做 WPA2 握手、开始用 SHA/AES/HMAC
-的时刻）、寄存器现场含 `esp_vApplicationTickHook`（另一上下文来自 tick/中断侧）、栈上出现 WiFi
-SSID（崩溃上下文刚碰过 WiFi 配置）。
+**因果链**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 使 **≤4096 B** 的分配优先落在内部 RAM；
+cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝），833 词的 cet6 词库约 7000 个节点，
+于是 `cJSON_Parse()` 把 ~107 KB 的内部空闲抽到接近 0。此刻 WiFi 正在连网，其
+`ets_timer_setfn()` → `esp_timer_create()` 要的是 `MALLOC_CAP_INTERNAL`
+（**不允许回退 PSRAM**）的 ~100 B，拿不到即 `ESP_ERR_NO_MEM`，外面包着 `ESP_ERROR_CHECK`
+→ abort → 重启循环。拔卡时解析的是内置 32 词的小词库，内部 RAM 不会被抽干 ——
+**这就是"只有插卡才崩"**；而"间歇/时序相关"只是因为崩溃取决于那次 WiFi 内部分配是否正好
+落进解析窗口，本机 3/3 必崩只是这个 ~5.9 s 窗口每次都重合。
 
-**已排除**：与 `main/app_main.c` 里"切 HOME 在 `run_modules(true)` 之前还是之后"无关 ——
-恢复原时序后连续 3 次冷启动仍然 3/3 崩溃。
+### 修复（已实现，已上机验证）
 
-### 已尝试的修复：**实测无效（代码保留，但没解决问题）**
+- **`components/sys_utils/src/sys_json.c`（新增）**：`sys_json_use_psram()` 用
+  `cJSON_InitHooks()` 把 cJSON 的分配改成"**先 PSRAM、失败再回退默认堆**"；
+  `main/app_main.c` 在最早期（`sys_log_init()` 之后、任何模块之前）调用一次。
+- `word_service`：`items[]` / `progress[]` 改为显式
+  `heap_caps_malloc_prefer / calloc_prefer(..., MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT)`；
+  并在 `cJSON_Parse()` 返回后打印 `book tree alive: internal N KB free`（判据行）。
+- **删除**了 `app_main.c` 里那段"启动期预初始化 crypto 锁"的代码：它出自被推翻的归因，
+  实测从未起作用，留着只会误导后来人。
+- `sys_heap_log()` 末列由 `esp_get_minimum_free_heap_size()`（被 12 MB PSRAM 主导、
+  永远不动）改为 **`int-low`：内部 RAM 的历史最低水位** —— 这一类 bug 的判据就是它。
 
-> **结论（重要，别被下文误导）**：在 `main/app_main.c` 里预先 acquire+release 一遍 crypto 锁之后，
-> 构建通过、烧录通过，但**连续 3 次冷启动仍然 `abort=1/1/2`、`app_ready=0` —— 没有修好**。
-> 设备依旧是"插卡即崩溃重启循环"。这个改动保留了（无害），但**不等于问题已解决**。
->
-> **另一处必须更正的归因**：我最初把栈里的 `2f02d15c` 归到 `esp_crypto_lock.c:39`，这**可能是方法错误**
-> —— 那个地址正好落在静态锁变量 `s_crypto_sha_aes_lock` 的地址上，也就是说它很可能是**栈里的一个
-> 数据值（正在被 acquire 的锁的指针），而不是返回地址**。因此"crypto 锁竞态"这个结论**需要重新论证**，
-> 不要当作定论。真正可信的只有两条帧：`lock_acquire_generic`(locks.c:158) 与 `__assert_func`(assert.c:34)，
-> 即**某个 newlib `_lock_t` 的惰性初始化断言失败**；至于是哪把锁、哪两个上下文在竞争，仍待查。
+### 验证证据（真机，插卡 = 7.4 GB SDHC，`root=/sdcard`）
 
-### 下一步排查建议（按性价比）
+| 项 | 修复前 | 修复后 |
+|---|---|---|
+| 冷启动 ×3 | `abort=3/3`、`TH:app: ready 0/3` | **`abort=0/3`、`TH:app: ready 3/3`** |
+| 词库 | 解析途中 abort，从未加载成功 | `loaded 833 words from 'words/cet6.json' (120311 B)` 3/3 |
+| 解析中（JSON 树存活）内部 RAM | 被抽到接近 0 | **86 KB 空闲 / 最大连续块 40 KB** |
+| 启动结束 | — | 9 模块全 ready、`storage=/sdcard`、`int-low 55 KB` |
+| 端到端 | — | `words/stats` → `book=cet6 total=833`；`wifi/status` → connected；`POST+GET wifi/scan` → 22 个 AP 且设备存活 |
 
-1. **先确认是不是真正的栈帧再做归因**：重新抓一次 panic，用
-   `riscv32-esp-elf-objdump -d build\todohelper.elf` 确认候选地址落在**代码段且是返回地址**，
-   而不是数据段。区分"代码地址"和"数据地址"是解析 panic 栈时最容易犯的错。
-2. **拿到完整回溯**：打开 `CONFIG_ESP_SYSTEM_PANIC_PRINT_ALL_REGS=y` 与
-   `CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y`（`sdkconfig.defaults`），重新抓取。
-3. **二分定位触发者**：插卡时崩溃、拔卡正常，且与 `word_service`（读卡上 833 词）时间上重合。
-   可把 `word_service` 的初始化临时注释掉，看崩溃是否消失 —— 这是最直接的因果验证。
-4. **换一条更稳的路**：既然 `lock_init_generic` 断言的是"锁状态不是 FREE"，而这是 newlib 的
-   惰性初始化机制，可考虑让 IDF 在启动时一次性初始化 newlib 锁（`CONFIG_NEWLIB_...` 相关），
-   或在单任务上下文里先把 stdio/malloc/time 各调一次。
-5. 查 IDF v6.1 是否已有此问题的已知 issue / 补丁，考虑升级管理组件。
-
-**临时办法（给用户）**：拔掉 SD 卡即可正常启动（词库退回内置 32 词、字体退回片内字库）。
-
----
-
-#### 以下是当时的原始分析（保留供参考，注意上面已更正）
-
-`main/app_main.c`：在 `ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH))` 之前，**由单任务上下文
-把 crypto 锁 acquire+release 一遍**（最初含 dma，后因该芯片无实现而删除），从而一次性
-完成初始化，之后不再有惰性初始化竞态。
-
-**注意一个真实的踩坑**：`esp_crypto_lock.h` 声明了全部这些函数，但**并非全部都有实现** ——
-`esp_crypto_dma_lock_{acquire,release}` 在本芯片上**没有实现**，调用会**链接失败**
-（`undefined reference`）。不能因为"头文件里有声明"就假定可链接。
-
-### 接手请你做
-
-1. 跑完验证：构建 → 烧录 → **连续 3 次冷启动**，确认 `abort=0` 且出现 `TH:app: ready`。
-   （当时正在跑的命令：`idf.py build` → esptool 烧录 → 3× `monitor_capture --seconds 16`，
-   逐个统计 `abort\(\) was called` 与 `TH:app: ready` 的出现次数。）
-2. 若**仍然崩溃**：说明 init 时机还不够早，或还有别的锁参与。下一步建议
-   （a）把这段调用再往前挪到 `app_main` 最开头、`th_bsp_init()` 之前；
-   （b）查 IDF v6.1 是否已有此问题的 Kconfig/补丁，考虑升级管理组件；
-   （c）让 WiFi 连接完成前不要有任何其他加密使用方。
-3. 若**修好了**：把 §2 标题里的"阻塞"去掉，并把结论写回 `AGENT.md §9.0.5`。
+> 回归复现命令：`python tools\monitor_capture.py --port COM34 --seconds 18 --out build\boot.log`，
+> 然后统计 `abort\(\) was called` 与 `TH:app: ready` 的出现次数。
+> **注意**：PC 侧偶发 `http 000` / ping 丢包是 Windows 热点的老问题（实测丢包 33%），
+> 不是设备问题 —— 判断设备死活请看串口的 `TH:wifi: link:` 行。
 
 ---
 
@@ -225,20 +222,30 @@ SSID（崩溃上下文刚碰过 WiFi 配置）。
    破坏。让它们只改文件，构建/烧录由你统一做。
 3. **解析 panic 栈时的 addr2line 陷阱**：不要用 `-pfiaC` 然后"两行一取" —— 遇到内联函数时
    每个地址会输出多行，配对会**静默错位**（我第一次就是这么读错的）。正确做法：**逐个地址
-   单独调用** `addr2line -f -C -e build\todohelper.elf 0x...`。
+   单独调用** `addr2line -f -C -e build\todohelper.elf 0x...`，**再用 `nm --numeric-sort`
+   核对它落在哪个函数区间**（本次两处误读都是"函数相邻"造成的：`esp_system_abort` 的
+   `jal panic_abort` 让 RA 恰好等于下一个函数 `esp_vApplicationTickHook` 的入口地址）。
+   并且**先把整段 panic 文本读完**：`ESP_ERROR_CHECK failed: esp_err_t 0x...` 这种行是最直接的
+   答案，比栈解析可靠得多（§2 的根因就写在里面，却被忽略了整整一轮）。
 4. **`-Werror` 很严**：`format-truncation`（缓冲区要留够，例如 `char key[48]` 存 `"<book>#w<id>"`）、
    `unused-function`、隐式声明都会让构建失败。**但注意 `unused-function` 只是警告**（构建仍过），
    所以它会掩盖"函数根本没被调用"这类真 bug —— 看到这类警告**要查语义，不要直接删**。
+   （新增：`discarded-qualifiers` 也会让构建失败 —— `cJSON_InitHooks(&hooks)` 不能传 `const` 指针。）
 5. **设备从 PC 不可达 ≠ 代码错**。先 `ping` + 看设备自报的 `link:` 日志；Windows 热点会间歇性丢包
-   （ARP 缓存/网卡省电）。`arp -d` 需要提权。
+   （ARP 缓存/网卡省电；本次实测 ping 丢包 33%，同一时刻设备 `link: connected rssi=-33`）。
+   `arp -d` 需要提权。
 6. **换存储介质会"丢数据"观感**：存储根在 `/littlefs` 与 `/sdcard` 之间切换时，待办数据文件也
    跟着换位置（无卡时建的待办插卡后看不见）。这是设计使然，但用户会当成 bug。
 7. **字体**：LVGL v9 的 FreeType **不能**用内存字体，必须从文件路径加载（现在是
    `/sdcard/todohelper/fonts/ui_cjk.ttf`）；无卡时回退片内字库（约 2500 字，生僻字会方框）。
    字库已从 app 里移出（镜像 4.16MB→2.94MB，烧录 43.6s→31.6s）；要恢复内嵌需**同时**改
    `ui_core/CMakeLists.txt` 与 `ui_fonts.c` 两半，否则链接失败。
-8. 更完整的坑位清单（内部 RAM 最紧处、PSRAM 栈不能碰 flash、日志格式陷阱、
-   `esp_log_writev` 原样输出、PHY 需 30KB 连续块……）全部在 **`AGENT.md §9.0 ~ §9.0.5**。
+8. **`ESP_ERR_NO_MEM` 不一定是"没有内存"，而是"没有*内部*内存"**。`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`
+   让 ≤4 KB 的分配优先吃内部 RAM，且**部分调用（如 `MALLOC_CAP_INTERNAL`）根本不允许回退 PSRAM**。
+   批量数据（JSON、词库、缓存）必须显式要求 PSRAM —— 否则就会复现 §2 那类崩溃。
+   判据是 `TH:heap:` 行的 `largest` 与 `int-low`，不是总空闲量。
+9. 更完整的坑位清单（内部 RAM 最紧处、PSRAM 栈不能碰 flash、日志格式陷阱、
+   `esp_log_writev` 原样输出、PHY 需 30KB 连续块……）全部在 **`AGENT.md §9.0 ~ §9.0.5`**。
 
 ---
 
@@ -246,7 +253,8 @@ SSID（崩溃上下文刚碰过 WiFi 配置）。
 
 | commit | 内容 |
 |---|---|
-| `e365448` | `AGENT.md 9.0.5`：把启动崩溃定位到 crypto 锁惰性初始化竞态 |
+| `0936a27` | 交接文档重写 + 现阶段目标与需求 + 崩溃修复尝试的诚实结论 |
+| `e365448` | `AGENT.md 9.0.5`：把启动崩溃定位到 crypto 锁惰性初始化竞态（**该归因后被推翻**） |
 | `2dfa7b7` | 开机日志改为固定 3 秒延迟 + 恢复原启动时序 + 崩溃实测数据 |
 | `e126c31` | 设备端待办：保留勾选完成 + 删除，仅新增留给网页 |
 | `561a591` | 第二轮收尾：待机动画、cet6 词库、设备端只读、网页上位机、开机滚动日志 |
@@ -260,14 +268,21 @@ SSID（崩溃上下文刚碰过 WiFi 配置）。
 
 ## 7. 建议的接手顺序
 
-1. **验完 §2 的崩溃修复**（这是唯一阻塞项，且已有明确假设与可复现判据）。
+1. ~~验完 §2 的崩溃修复~~ —— **已完成**：插卡 3/3 冷启动 `abort=0`、`TH:app: ready` 3/3，
+   词库 833 词 3/3 加载成功（证据见 §2）。
 2. 请用户做 §4 的四项目视确认，按反馈微调（动画/日志时长/按钮尺寸都是单个 `#define` 或一行）。
-3. 若要继续加功能：**网页 WiFi 配置面板**是性价比最高的一项 —— 设备端输 WiFi 密码体验很差
-   （480px 屏、无 IME），而 `/api/v1/wifi/*` 7 条路由都已就绪。先读
-   `components/wifi_manager/src/wifi_manager_http.c`（266-272 行是路由表）确认真实报文格式，
-   再照 `index.html` 现有的请求漏斗与样式写，**不要**另起一套。
+3. 若要继续加功能：**网页 WiFi 配置面板**仍是最具性价比的一项 —— 设备端输 WiFi 密码体验很差
+   （480px 屏、无 IME），而 `/api/v1/wifi/*` 7 条路由都已就绪。**本次已实测的报文语义**：
+   `GET /api/v1/wifi/status` → connected/ssid/ip/rssi；`POST /api/v1/wifi/scan` 触发扫描并返回
+   `{"scanning":true}`，**扫描结果要靠 `GET /api/v1/wifi/scan` 轮询**（它返回的是上一次结果，
+   `POST` 之后立刻 `GET` 会得到空数组——本次踩过）。路由表在
+   `components/wifi_manager/src/wifi_manager_http.c:259-284`。照 `index.html` 现有的请求漏斗与
+   样式写，**不要**另起一套。
 4. 若用户反馈"插拔卡数据丢失"不可接受：把待办存储固定在片内存储，只把词库/字体放卡上
    （需要看 `storage_manager` 的根选择逻辑）。
+5. **加功能前先看内部 RAM 余量**：本次实测 boot complete 只剩 `internal 67 KB / largest 24 KB`
+   （`int-low 55 KB`），明显低于 `AGENT.md §8` 记录的上一版基线（118 KB / 74 KB）。
+   任何批量数据都必须显式 `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）。
 
 ---
 
@@ -277,6 +292,8 @@ SSID（崩溃上下文刚碰过 WiFi 配置）。
 |---|---|
 | 环境/命令/全部实测坑 | `AGENT.md`（**§9.0 起必读**，§9.0.5 = 崩溃，§9.7 = 剩余待办） |
 | 启动流程与这次修复 | `main/app_main.c` |
+| **崩溃根因与修复** | `components/sys_utils/src/sys_json.c`（`sys_json_use_psram()`）、`components/word_service/src/word_service.c`（`parse_book()`） |
+| 内部 RAM 诊断（`largest` / `int-low`） | `components/sys_utils/src/sys_heap.c` |
 | 待办页面（设备端） | `components/ui_pages/src/page_todo.c` |
 | 待机动画 | `components/idle_face/src/idle_face.c`（`tick_behaviour()` 必须被调用！） |
 | 开机日志缓冲 | `components/sys_utils/src/sys_log.c`、`include/sys_log.h` |
