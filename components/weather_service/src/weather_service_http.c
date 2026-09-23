@@ -167,11 +167,19 @@ static esp_err_t locate_post_handler(httpd_req_t *req)
     case ESP_OK:
         break;
     case ESP_ERR_INVALID_STATE:
+        /* Genuinely cannot serve it: no network, or the clock is not synced yet so
+         * the TLS handshake to the provider would fail certificate validation. */
         return http_reply_unavailable(req, "offline: IP geolocation needs a network");
     case ESP_ERR_INVALID_RESPONSE:
-        return http_reply_unavailable(req, "geolocation provider returned an unusable response");
+        /* 502, not 503. This service is healthy - the geolocation *provider* gave
+         * an unusable answer. 503 "service unavailable" was misleading: the caller
+         * would conclude ToDoHelper is down when in fact the upstream failed, and
+         * the device very likely still has a perfectly good city (there is a
+         * built-in default), so nothing the caller depends on has changed. */
+        return http_reply_err(req, 502, "geolocation provider returned an unusable response");
     default:
-        return http_reply_unavailable(req, esp_err_to_name(err));
+        /* Upstream unreachable, timed out, DNS failure, ... same reasoning. */
+        return http_reply_err(req, 502, "geolocation provider unreachable");
     }
 
     /* Detection only sets the coordinates; fetch the reading before answering so
