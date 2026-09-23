@@ -254,8 +254,8 @@ static esp_err_t calendar_create(lv_obj_t *parent)
     lv_obj_set_style_bg_color(s_grid, UI_COLOR_SURFACE, 0);
     lv_obj_set_style_bg_opa(s_grid, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_grid, UI_CARD_RADIUS, 0);
-    lv_obj_set_style_pad_all(s_grid, 8, 0);
-    lv_obj_set_style_pad_row(s_grid, 4, 0);
+    lv_obj_set_style_pad_all(s_grid, 6, 0);
+    lv_obj_set_style_pad_row(s_grid, 2, 0);
     lv_obj_set_style_pad_column(s_grid, 4, 0);
     lv_obj_remove_flag(s_grid, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -277,7 +277,14 @@ static esp_err_t calendar_create(lv_obj_t *parent)
 
     for (int i = 0; i < CAL_MAX_DAYS; i++) {
         lv_obj_t *cell = lv_label_create(s_grid);
-        lv_obj_set_style_text_font(cell, ui_font(UI_FONT_BODY), 0);
+        /* UI_FONT_SMALL, not UI_FONT_BODY.
+         *
+         * The grid shares its height over seven rows (weekday header + six date
+         * rows), which on a 480 px panel is roughly 22 px per row. A 20 px font
+         * needs ~26 px of line height, so the digits overflowed their cells and
+         * adjacent date rows visibly collided (reported from the device). 16 px
+         * fits with room to spare. */
+        lv_obj_set_style_text_font(cell, ui_font(UI_FONT_SMALL), 0);
         lv_obj_set_style_text_color(cell, UI_COLOR_TEXT, 0);
         lv_obj_set_style_radius(cell, LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_color(cell, UI_COLOR_PRIMARY, 0);
