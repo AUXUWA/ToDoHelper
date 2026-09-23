@@ -1,6 +1,9 @@
 # word_service
 
-**L3 业务组件（FR5）** — 单词卡：词库加载 + 三档评分 + 间隔复习。内置一份起始词库，替换成真实 CET4/CET6 词库即可。
+**L3 业务组件（FR5）** — 单词卡：词库加载 + 三档评分 + 间隔复习。
+默认书 `WORD_DEFAULT_BOOK = "cet6"`，卡上 `words/cet6.json` 是 **833 条**自编精选
+（BrE 音标 + 简体释义 + 例句，约 546 KB）；固件另带一份 32 词的起始词库作兜底，
+替换成自己的词库**不需要重新烧录**（见下）。
 
 - 头文件：`include/word_service.h`（私有 `src/word_default_book.h` 只导出内置词库字符串）
 - 依赖：`sys_utils`、`storage_manager`、`http_router`、`cjson`
@@ -42,9 +45,25 @@ NVS 键 `word_book` 可改）。`parse_book()` 接受的字段：
 - 每个条目必须是对象；**`spelling` 必填且非空**，缺失的条目会被**静默跳过**；
   `phonetic`、`meaning`、`example` 可选（上限分别为 64 / 256 / 256 字节，见 `WORD_*_MAX`）。
 - `id` 可选：给了数字就用它，否则用数组下标 `index + 1`。
-  **id 是进度的主键**（进度按 `w<id>` 存），所以替换词库文件时务必保留 id 语义，否则旧进度会对错词。
+  **id 是进度的主键**（进度键为 `"<book>#w<id>"`，1.0.0 起带书名词缀），所以替换词库文件时
+  务必保留 id 语义，否则旧进度会对错词。
 - 超过 `WORD_MAX_ITEMS`（2000）会截断并告警，防止坏文件吃光内存。
 - 完整格式同时记录在 `docs/API.md`。
+
+### 内存：词库是这台设备上最大的"批量数据"
+
+板子只有约 310 KB 内部 RAM、却有 12.4 MB PSRAM，而 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`
+让**≤4 KB 的分配默认落在内部 RAM**。解析一份真实词库（CET-6 = 546 KB / 833 词 / 约 7000 个
+cJSON 节点）会把内部 RAM 抽干，并连带把当时正在连网的 WiFi 驱动打进 `ESP_ERR_NO_MEM` → abort。
+**这就是"插 SD 卡启动崩溃"的真因**（`AGENT.md §9.0.5`）。因此：
+
+- `items[]` 与 `progress[]` 都用 `heap_caps_malloc_prefer/calloc_prefer(..., MALLOC_CAP_SPIRAM,
+  MALLOC_CAP_DEFAULT)` 显式要 PSRAM（833 词约 546 KB + 20 KB）；
+- cJSON 的分配由 L0 的 `sys_json_use_psram()` 全局改成 PSRAM 优先（`app_main()` 最早调用）；
+- `parse_book()` 在 `cJSON_Parse()` 返回后打印一行判据：
+  `book tree alive: internal N KB free (largest M KB)` —— **JSON 树存活时的内部 RAM 余量**。
+  1.0.0 实测 833 词时仍有 86 KB 空闲 / 40 KB 最大连续块（修复前该窗口被抽到接近 0）；
+- `word_load_from_sd()` 的成功日志带字节数：`loaded 833 words from 'words/cet6.json' (120311 B)`。
 
 ## 内置起始词库与导出
 
@@ -68,7 +87,7 @@ NVS 键 `word_book` 可改）。`parse_book()` 接受的字段：
 ```json
 {
   "items": {
-    "w1": { "level": 2, "n": 3, "last": 2, "next": 1730086400, "at": 1730000000 }
+    "cet6#w1": { "level": 2, "n": 3, "last": 2, "next": 1730086400, "at": 1730000000 }
   },
   "version": 1,
   "book": "cet4",

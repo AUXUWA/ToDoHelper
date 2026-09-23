@@ -6,8 +6,11 @@
 
 > **本仓库已从 Korvo 产测固件（factory_demo）重构为 ToDoHelper 桌面助手。**
 > 需求见 `docs/TODOHELPER_REQUIREMENTS.md`，框架设计见 `docs/TODOHELPER_FRAMEWORK.md`，
-> 组件接口与 HTTP API 见 `docs/API.md`，**交接说明见 `docs/HANDOVER.md`**。
+> 组件接口与 HTTP API 见 `docs/API.md`，**交接说明见 `docs/HANDOVER.md`**，
+> 变更历史见 `CHANGELOG.md`。
 > 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
+>
+> **当前版本 `1.0.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
 
 ---
 
@@ -42,6 +45,8 @@
 ```text
 components/
   sys_utils/          L0  日志/共享事件循环/时间/sys_status/sys_notify/NVS 配置/错误码
+                          /堆诊断（`sys_heap_log()` 含内部 RAM 最低水位 `int-low`）
+                          /cJSON PSRAM 钩子（`sys_json_use_psram()`，见 §9.0.5）
   http_router/        L1  HTTP 路由表 + 统一响应 {code,msg,data} + 404/405/501 + 鉴权钩子
   storage_manager/    L1  SD(SDMMC 4bit) → 片内 LittleFS 回退、原子写、缓存 API
   bsp/                L1  th_bsp_ 门面（显示/软件调光/按键/待机看门狗/LED/SD/音频）
@@ -172,7 +177,7 @@ ToDoHelper/
 ├─ sdkconfig.defaults          # 真正的默认配置来源（**含两条不可删的必需项**，见 §9）
 ├─ sdkconfig                   # 生成物，不要手改
 ├─ dependencies.lock           # 组件管理器锁文件（target: esp32s31）
-├─ main/app_main.c             # 模块编排表（12 个模块）
+├─ main/app_main.c             # 模块编排表（9 个模块，全部 after_ui）
 ├─ components/                 # 见 §2
 ├─ assets/ui/                  # 扁平 PNG（w_*.png）；**不能有子目录**
 ├─ tools/gen_cjk_font.py       # CJK 子集字体生成脚本
@@ -278,7 +283,7 @@ Project build complete.
 
 | 项 | 值 |
 |---|---|
-| app bin | `build/todohelper.bin`，`0x2da0a0` 字节（约 2.85 MB；字库已移出到 SD/`storage`，见 §9.7） |
+| app bin | `build/todohelper.bin`，`0x2da5f0` 字节（约 2.85 MB，含 `1.0.0` 版本号；字库已移出到 SD/`storage`，见 §9.7） |
 | app 分区余量 | `0x800000` 分区，剩 **64%** |
 | bootloader | `build/bootloader/bootloader.bin`，`0x5a80`，余 6% |
 | 编译警告 | 0（`-Werror` 全开） |
@@ -317,7 +322,25 @@ Project build complete.
 烧录地址（`idf.py flash` 自动处理）：
 `0x2000` bootloader、`0x8000` 分区表、`0x10000` app、`0x810000` storage(littlefs)、`0xa10000` assets。
 
-### 8.1 抓串口日志（`idf.py monitor` 无法脚本化）
+### 8.1 版本号与发布（`version.txt`）
+
+固件版本来自工程根目录的 **`version.txt`**。ESP-IDF 的取值优先级是
+`PROJECT_VER` 变量 → **`version.txt`** → `git describe`（本工程没设 `PROJECT_VER`，
+`sdkconfig` 里 `CONFIG_APP_PROJECT_VER_FROM_CONFIG` 也未开，所以 `version.txt` 是唯一来源）。
+**不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
+改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
+
+- **当前版本：`1.0.0`**
+- 版本进 `esp_app_desc_t`，于是**三处可见**：
+  设备「设置」页顶部「固件 1.0.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
+  以及 `build/todohelper.bin` 的 app descriptor（离线核对：
+  `riscv32-esp-elf-objdump -s -j .flash.appdesc build/todohelper.elf`）。
+- 规则（三段式）：**MAJOR** = 一轮需求全部完成、或有破坏性变更（存储格式 / HTTP API /
+  NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调参、文档。
+- 发布动作：改 `version.txt` → `idf.py build`（它在 `CMAKE_CONFIGURE_DEPENDS` 里，会自动触发
+  reconfigure）→ 烧录并确认 `device/info` → 写 `CHANGELOG.md` → `git tag -a vX.Y.Z -m "..."`。
+
+### 8.2 抓串口日志（`idf.py monitor` 无法脚本化）
 
 `idf.py monitor` 会独占终端、不能重定向，自动化验证请用工程自带脚本：
 
@@ -327,9 +350,10 @@ Project build complete.
     --port COM34 --seconds 30 --out build\boot.log
 ```
 
-### 8.2 烧录速度：用 `tools/flash.ps1`，别用 `idf.py flash`
+### 8.3 烧录速度：用 `tools/flash.ps1`，别用 `idf.py flash`
 
-`idf.py flash` 在这个目标上比必要的**慢约 3.4 倍**。4.16 MB 镜像实测：
+`idf.py flash` 在这个目标上比必要的**慢约 3.4 倍**。下表的耗时是当年 4.16 MB 镜像
+（字库还在 app 里）实测的；**当前 2.85 MB 镜像用 `tools/flash.ps1` 实测约 32 s**。
 
 | 方式 | 耗时 | 有效速率 |
 |---|---|---|
@@ -722,9 +746,10 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 > `s_state = IDLE_FACE_SLEEPY;` / `begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 0.0f);` /
 > `s_current = *params_for(IDLE_FACE_SLEEPY);`
 
-**待上机确认**：交叉淡入与呼吸/扫视的主观观感（全部是单个 `#define` 可调）；以及
-`idle_face_standby_exit()` 的 700 ms 睁眼几乎看不见 —— `ui_core` 在 `on_hide()` 之后
-**立刻**给页面容器加 `LV_OBJ_FLAG_HIDDEN`，要看到完整唤醒得在 `ui_core` 侧延后约 200~300 ms 再隐藏。
+**已由用户目视确认正常（2026-09-23）**：交叉淡入与呼吸/扫视的主观观感。
+**仅剩一个已知小瑕疵**：`idle_face_standby_exit()` 的 700 ms 睁眼几乎看不见 —— `ui_core`
+在 `on_hide()` 之后**立刻**给页面容器加 `LV_OBJ_FLAG_HIDDEN`；要看到完整唤醒得在 `ui_core`
+侧延后约 200~300 ms 再隐藏（用户认为可接受，故未改）。
 
 **② 单词书 cet4 → cet6** —— ✅ **已完成**。`WORD_DEFAULT_BOOK` 已改为 `"cet6"`
 （`word_service.h`）。卡上是 `words/cet6.json`：**833 条自编精选**（BrE 音标 + 简体释义 +

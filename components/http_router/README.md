@@ -30,6 +30,14 @@ todo_manager (L3) --> http_router (L1) <-- sync_server (L4)
 
 1. **只有一个 handler**。`http_router_attach()` 在 server 上注册 `/*` + `HTTP_ANY`；分发逻辑全在 `router_dispatch()` 里。
    重复 attach 遇到 `ESP_ERR_HTTPD_HANDLER_EXISTS` 返回 `ESP_OK`，所以 `sync_server` 重启不需要额外判断。
+
+   > ⚠️ **handler 里不能"长期不返回"**：`esp_http_server` 的 URI handler 在**唯一** httpd 任务里
+   > **串行**执行，所以一个 SSE / 流式 handler 会把整台服务器冻住 —— 实测表现是 `ping` 得通、
+   > 串口正常，但**任何 TCP 连接都建不上**（浏览器"设备不可达"，`GET /` 也超时）。
+   > 长连接必须用 `httpd_req_async_handler_begin()` 把 socket 交给自己的任务，handler 立即返回，
+   > 结束时 `httpd_req_async_handler_complete()`（不 complete 会永久泄漏会话槽，最终不再 accept）。
+   > 参考实现：`components/sync_server/src/sync_server.c` 的 `events_get_handler()` + `sse_client_task()`；
+   > 完整背景见 `AGENT.md §9.0.1` 第 4 条。
 2. **路由表是定长静态数组**：`HTTP_ROUTER_MAX_ROUTES`（48）项，路径长度上限 `ROUTER_PATH_MAX`（64）。
    同一 `path + method` 重复注册 = **替换** handler（`init()` 幂等）；表满返回 `ESP_ERR_NO_MEM` 并 `ESP_LOGE`。
 3. **通配符只有一个 `*`**，语义是"前缀 + 任意字符串 + 后缀"：

@@ -874,8 +874,19 @@ curl.exe http://todohelper.local/api/v1/words/stats
 
 服务端参数（`sync_server_start()` 内）：`uri_match_fn = httpd_uri_match_wildcard`、`lru_purge_enable=true`、
 `max_uri_handlers=4`、`max_open_sockets=5`、`stack_size=6144`、`recv/send_wait_timeout=5 s`；
-SSE 上限 **4** 个并发客户端（`SYNC_SSE_MAX_CLIENTS`），每客户端独立队列深度 8，
-keepalive **15000 ms**（发 `": keepalive\n\n"`），开场发 `retry: 3000`。
+SSE 上限 **3** 个并发客户端（`SYNC_SSE_MAX_CLIENTS`；每个订阅者占 1 个 httpd 会话槽 + 1 个
+3 KB 任务，必须给页面与 REST 留槽），每客户端独立队列深度 8，keepalive **15000 ms**
+（发 `": keepalive\n\n"`），开场发 `retry: 3000`，超限返回 **503** `"too many event subscribers"`。
+
+> **写新的流式/长连接端点时必须注意**：`esp_http_server` 的 URI handler 在**唯一** httpd 任务里
+> **串行**执行，一个"不返回"的 handler 会冻住整台服务器（`ping` 通但任何 TCP 都建不上）。
+> 长连接必须 `httpd_req_async_handler_begin()` 把 socket 交给自己的任务，结束时
+> `httpd_req_async_handler_complete()`。参考实现：`sync_server.c` 的
+> `events_get_handler()` + `sse_client_task()`。背景与实测见 `AGENT.md §9.0.1` 第 4 条。
+> （已知同类隐患：`/api/v1/ai/chat/stream` 与阻塞版 `/api/v1/ai/chat`，用户决定本轮不动。）
+
+`lru_purge_enable=true` 时，socket 用满会关掉最久未用的会话，但**异步（SSE）会话不会被回收**
+（`esp_httpd_priv.h`：`for_async_req` 的 socket 不参与 LRU purge）。
 
 #### 事件
 
@@ -895,7 +906,7 @@ keepalive **15000 ms**（发 `": keepalive\n\n"`），开场发 `retry: 3000`。
 
 ```
 I (xxx) TH:sync: mDNS published as todohelper.local
-I (xxx) TH:sync: listening on port 80, 29 route(s), auth=off, url=http://todohelper.local
+I (xxx) TH:sync: listening on port 80, 45 route(s), auth=off, url=http://todohelper.local
 ```
 
 ```powershell
@@ -1094,17 +1105,26 @@ I (xxx) TH:app: ready (storage=/sdcard)
 
 下表是**实际注册**的全部路由（来源：`components/*/src/*.c` 中的
 `http_router_register()` / `http_router_register_not_implemented()` 路由表）。
-当前注册 **29** 条（`sync_server` 8 + `todo_manager` 7 + `weather_service` 4 + `calendar_service` 5 + `word_service` 5）。
+当前注册 **45** 条：`sync_server` 8 + `todo_manager` 7 + `weather_service` 5 +
+`calendar_service` 5 + `word_service` 5 + `wifi_manager` 7 + `ai_service` 6 + `voice_service` 2，
+与 `GET /api/v1/device/status` 的 `routes` 字段一致（1.0.0 真机实测 45）。
+
+> **1.0.0 更正**：旧版这张表把 `/api/v1/wifi/*` 记为"组件里没有任何 `http_router_register()`
+> 调用 → 404"、把 `ai_service` 记为"不在 `app_main` 模块表里 → 运行时 404"。**两条都是错的**，
+> 来源是子 agent 未经核实的自述。真机实测：`GET /api/v1/wifi/status` → 200（connected/ssid/ip/rssi）、
+> `POST /api/v1/wifi/scan` → 200 `{"scanning":true}`、随后 `GET /api/v1/wifi/scan` → 22 个 AP；
+> `ai_service_init()` 就在 `main/app_main.c` 的模块表里（开机日志 `module 'ai_service' ready`）。
+> 教训见 `docs/HANDOVER.md §5` 第 1 条：**验收必须自己读代码、上机验证**。
 
 | 方法 | 路径 | 组件 | 说明 | 状态 |
 |---|---|---|---|---|
 | GET | `/` | sync_server | 内嵌浏览器待办页（`EMBED_FILES web/index.html`，`text/html; charset=utf-8`，`Cache-Control: no-cache`） | ✅ 200 |
 | GET | `/index.html` | sync_server | 同上 | ✅ 200 |
-| GET | `/api/v1/device/info` | sync_server | 芯片/固件版本/IDF/`mac`/`ip`/`hostname`/`wifi_state`/存储状态/`auth_enabled`；**不含任何密钥或 token** | ✅ 200 |
-| GET | `/api/v1/device/status` | sync_server | `uptime_s`/`free_heap`/`min_free_heap`/`free_psram`/`routes`/`sse_clients`/`wifi_rssi`/`wifi_connected`/`time_synced`/`server_ts`/`url` | ✅ 200 |
+| GET | `/api/v1/device/info` | sync_server | 芯片/固件版本/IDF/`mac`/`ip`/`hostname`/`wifi_state`/存储状态/`auth_enabled`；**不含任何密钥或 token**。`version` 来自工程根目录 `version.txt`（规则见 `AGENT.md §8.1`），1.0.0 实测 `"version":"1.0.0"` | ✅ 200 |
+| GET | `/api/v1/device/status` | sync_server | `uptime_s`/`free_heap`/`min_free_heap`/`free_psram`/`routes`/`sse_clients`/`wifi_rssi`/`wifi_connected`/`time_synced`/`server_ts`/`url`；1.0.0 实测 `routes:45`、`sse_clients` 随订阅数变化 | ✅ 200 |
 | POST | `/api/v1/device/reboot` | sync_server | 先回 `{"rebooting":true}`，再 700 ms 后 `esp_restart()`。**强制鉴权** | ✅ 200（需 token） |
 | POST | `/api/v1/device/auth` | sync_server | body `{"token":"..."}`；空串/`null` 关闭鉴权、开启鉴权时长度 ≤63。**强制鉴权** | ✅ 200（需 token） |
-| GET | `/api/v1/events` | sync_server | **SSE** 推送（`text/event-stream`）；最多 4 客户端，15 s keepalive，开场 `retry: 3000`；超限 → 503 | ✅ 200 |
+| GET | `/api/v1/events` | sync_server | **SSE** 推送（`text/event-stream`，**异步 handler + 每客户端任务**）；最多 3 客户端，15 s keepalive，开场 `retry: 3000`；超限 → 503 | ✅ 200 |
 | GET | `/ws/events` | sync_server | WebSocket 占位，`data` = `{"detail":"not implemented","hint":"WebSocket is not available in this build; use /api/v1/events (SSE) instead"}` | ❌ **501 未实现** |
 | GET | `/api/v1/todos` | todo_manager | 全量列表；带 `?updated_since=<unix秒>` 时只回 `updated_at > ts` 的项（`incremental:true`）。`data` 含 `items`/`count`/`incremental`/`server_ts` | ✅ 200 |
 | POST | `/api/v1/todos` | todo_manager | body `{title,desc,due_ts,priority}`，`title` 必填；handler 随后 `todo_mark_synced()` | ✅ **201**（`code:0`） |
@@ -1116,6 +1136,7 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/api/v1/weather` | weather_service | 当前读数；无读数时仍 **200** + `valid:false`（让页面提示选城市）。含 `stale` | ✅ 200 |
 | POST | `/api/v1/weather/refresh` | weather_service | 同步刷新；未设城市 → 400；离线/超时 → 503 | ✅ 200/400/503 |
 | POST | `/api/v1/weather/city` | weather_service | body `{"city":"Beijing"}`，持久化后立即刷新一次 | ✅ 200 |
+| POST | `/api/v1/weather/locate` | weather_service | 纯 IP 定位；`geo_url` 可经 NVS 换服务商；本机网络实测到 `ipapi.co` 不通 → 502（语义正确） | ✅ 200/502 |
 | POST | `/api/v1/weather/config` | weather_service | body 可含 `provider`/`api_key`/`interval_s`；响应只回 `provider`/`has_api_key`/`interval_s`（**不回显 Key**） | ✅ 200 |
 | GET | `/api/v1/calendar/now` | calendar_service | `synced`/`ts`/`tz`/`ntp_server`；已同步时另有 `datetime`/`year`/`month`/`day`/`weekday`，未同步 `datetime` = `"时间未同步"` | ✅ 200 |
 | GET | `/api/v1/calendar/month` | calendar_service | **必须**带 `?year=&month=`（缺 → 400；`year` 1970–2200、`month` 1–12 越界 → 400）。含 `days`/`first_weekday`/`weekdays[]`，本月带 `today` | ✅ 200 |
@@ -1127,21 +1148,24 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/api/v1/words/next` | word_service | 下一张卡 + `position`/`queue_total`；队空 → **404** | ✅ 200/404 |
 | POST | `/api/v1/words/{id}/review` | word_service | body `{"result":"known"|"fuzzy"|"unknown"}`（其它值 → 400），返回该词最新状态 | ✅ 200 |
 | POST | `/api/v1/words/config` | word_service | body 可含 `daily_count`/`book`/`reset:true`，返回统计 | ✅ 200 |
-| GET | `/api/v1/wifi/status` | wifi_manager | 需求 §8.3 要求，**组件里没有任何 `http_router_register()` 调用** | ❌ **未注册 → 404** |
-| POST | `/api/v1/wifi/scan` | wifi_manager | 同上 | ❌ **未注册 → 404** |
-| GET | `/api/v1/wifi/scan` | wifi_manager | 同上 | ❌ **未注册 → 404** |
-| POST | `/api/v1/wifi/connect` | wifi_manager | 同上 | ❌ **未注册 → 404** |
-| POST | `/api/v1/wifi/disconnect` | wifi_manager | 同上 | ❌ **未注册 → 404** |
+| GET | `/api/v1/wifi/status` | wifi_manager | `state`/`connected`/`ssid`/`ip`/`rssi`/`mac`/`hostname`。**1.0.0 实测 200** | ✅ 200 |
+| GET | `/api/v1/wifi/scan` | wifi_manager | **上一次**扫描的缓存结果 `{count,items[]}`；刚开机未扫过时 `count:0`（要新结果先 POST） | ✅ 200 |
+| POST | `/api/v1/wifi/scan` | wifi_manager | 触发异步扫描，立即返回 `{"scanning":true}`；结果靠随后 GET 轮询 | ✅ 200 |
+| POST | `/api/v1/wifi/connect` | wifi_manager | body `{"ssid","password"}`，异步发起；凭据写 NVS | ✅ 200 |
+| POST | `/api/v1/wifi/disconnect` | wifi_manager | 断开并停止自动重连 | ✅ 200 |
+| POST | `/api/v1/wifi/config` | wifi_manager | body `{"ssid","password","auto_connect"}`：只存凭据不连接 | ✅ 200 |
+| POST | `/api/v1/wifi/forget` | wifi_manager | 清除 NVS 里的 SSID/密码（不主动断开） | ✅ 200 |
+| POST | `/api/v1/ai/chat` | ai_service | 阻塞式对话（一次 AI 回复期间会占住 httpd 单任务，见上文长连接警告） | ✅ 200 |
+| POST | `/api/v1/ai/chat/stream` | ai_service | 流式对话（`text/event-stream`）；**同类长连接隐患，用户决定 1.0.0 暂不修** | ✅ 200 |
+| GET | `/api/v1/ai/history` | ai_service | 对话历史。**强制鉴权** | ✅ 200（需 token） |
+| DELETE | `/api/v1/ai/history` | ai_service | 清空历史。**强制鉴权** | ✅ 200（需 token） |
+| POST | `/api/v1/ai/config` | ai_service | 设置 API Key / 模型。**强制鉴权**，响应不回显 Key | ✅ 200（需 token） |
+| POST | `/api/v1/ai/abort` | ai_service | 中断正在进行的流式回答 | ✅ 200 |
+| GET | `/api/v1/voice/status` | voice_service | 录音/回放可用性与 ASR/TTS 端点配置状态（音频按需打开） | ✅ 200 |
+| POST | `/api/v1/voice/config` | voice_service | 配置 ASR/TTS HTTP 端点（选型未定，见需求 FR7） | ✅ 200 |
 
 > **路径参数写法**：路由器只支持**一个** `*`，所以单项接口注册为 `/api/v1/todos/*`、动作为 `/api/v1/todos/*/done`。
 > `*` 必须至少吞掉一个字符，因此 `/api/v1/todos/`（尾斜杠）**不**匹配 `/api/v1/todos/*`，会落到 404。
-
-**未接入但已写好代码的路由（P2 `ai_service`）**：`ai_service_http.c` 里有 6 条路由
-（`POST /api/v1/ai/chat`、`POST /api/v1/ai/chat/stream`、`GET`/`DELETE /api/v1/ai/history`、
-`POST /api/v1/ai/config`、`POST /api/v1/ai/abort`），由 `ai_service_register_http()` 在
-`ai_service_init()` 里注册；但 `ai_service_init()` **不在** `main/app_main.c` 的模块表里，
-因此运行时这些路径是 **404**。`sync_server` 的 always-auth 名单里虽含 `/api/v1/ai/config` 与
-`/api/v1/ai/history`，但路径没注册，实际仍回 404（不是 401）。详见 §5。
 
 ### 2.2 响应信封
 
@@ -1184,7 +1208,7 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | 只读接口 | `GET` 默认不鉴权（当前没有任何 `GET` 路由被标记 `require_auth`） |
 | hook 缺失 | `http_router_check_auth()` **fail-open 返回 `true`**（只在没装 `sync_server` 的测试环境出现） |
 | 失败响应 | HTTP **401** + `{"code":401,"msg":"unauthorized","data":null}`；同时发 `SYNC_EVENT_AUTH_FAILED`（payload = 路径）并打 `TH:sync: auth failed for <path>` |
-| 副作用名单 | `sync_server.c` 的 `s_always_auth[]` 还列了 `/api/v1/ai/config`、`/api/v1/ai/history`；这两条路径当前**未注册**，所以先落到 404 |
+| 副作用名单 | `sync_server.c` 的 `s_always_auth[]` 还列了 `/api/v1/ai/config`、`/api/v1/ai/history`（这两条**已注册**，强制鉴权：无 token → 401，不是 404） |
 
 `curl.exe` 两个例子：
 
@@ -1358,7 +1382,7 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 
 | 项 | 现状 |
 |---|---|
-| **`/ws/events`（WebSocket）** | 本 IDF 构建**没有 WebSocket 组件**，故用 **SSE**：`GET /api/v1/events`（`text/event-stream`，最多 4 客户端，15 s keepalive）。`/ws/events` 仍**注册为 501 占位**并给出 `hint`，让客户端能区分"没做"与"URL 写错"（需求 §8.7） |
+| **`/ws/events`（WebSocket）** | 本 IDF 构建**没有 WebSocket 组件**，故用 **SSE**：`GET /api/v1/events`（`text/event-stream`，最多 3 客户端，15 s keepalive）。`/ws/events` 仍**注册为 501 占位**并给出 `hint`，让客户端能区分"没做"与"URL 写错"（需求 §8.7） |
 | **WiFi HTTP API（5 条）** | `GET /api/v1/wifi/status`、`POST\|GET /api/v1/wifi/scan`、`POST /api/v1/wifi/connect`、`POST /api/v1/wifi/disconnect` 在需求 §8.3 里要求，但 `components/wifi_manager/` 里**没有任何 `http_router_register()` 调用**，也没有注册 501 占位 → 客户端拿到的是 **404**。这是 §2 表格里唯一"既没做也没占位"的一组接口，**建议补 `http_router_register_not_implemented()`** |
 | **FreeType CJK 字体通路** | 代码路径完整（`ui_fonts.c` 的三级回退），但默认构建**不启用**：`CONFIG_TODOHELPER_FONT_FREETYPE` 默认 `n` 且依赖 `CONFIG_ESP_LVGL_ADAPTER_ENABLE_FREETYPE`（`sdkconfig.defaults` 里未开）。此外**子集 TTF 尚未生成**：`components/ui_core/fonts/ui_cjk.ttf` 当前**不存在**，`CMakeLists.txt` 的 `if(EXISTS ...)` 因此跳过 `EMBED_FILES`。要用需先跑 `tools/gen_cjk_font.py` 生成子集，再打开上述 Kconfig（`ui_core/README.md`）。**默认路径靠 LVGL 内置 Source Han Sans SC 16/14 CJK，串口打 `TH:ui_fonts: FreeType disabled, using built-in fonts`** |
 | `ai_service`（P2，FR7） | 组件目录、头文件、`ai_service_http.c`（6 条 `/api/v1/ai/*` 路由）都在，但：① `main/CMakeLists.txt` 未 `REQUIRES ai_service`；② `main/app_main.c` 的模块表里**没有** `ai_service` 一行，`ai_service_init()` 从不被调用 → 运行时那 6 条路由是 **404**，`ai_api_key` 等 NVS 键也不会被读写。另注意其 `REQUIRES` 含 `idle_face`（L4），若接入需一并核对分层方向 |

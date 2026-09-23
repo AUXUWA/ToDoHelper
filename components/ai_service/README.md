@@ -12,7 +12,7 @@
 |---|---|
 | 生命周期 | `ai_service_init()` |
 | 配置 | `ai_service_set_api_key()`、`ai_service_has_api_key()`、`ai_service_set_system_prompt()`、`ai_service_get/set_model()`、`ai_service_get/set_history_rounds()` |
-| 对话 | `ai_service_chat()`（阻塞）、`ai_service_chat_async()`（UI 用）、`ai_service_chat_stream()`（给 HTTP SSE 用） |
+| 对话 | `ai_service_chat()`（阻塞）、`ai_service_chat_async()`（UI 用，推荐）、`ai_service_chat_stream()`（逐段回调，**必须跑在独立任务里**，见下方关键约定第 2 条） |
 | 结果 | `ai_service_get_last_reply()`、`ai_service_get_state()`、`ai_service_state_name()` |
 | 历史 | `ai_service_history_count()`、`ai_service_history_get()`、`ai_service_clear_history()`、`ai_service_save/load_history()` |
 | 控制 | `ai_service_abort()` |
@@ -34,7 +34,16 @@
 2. **三级执行路径**，避免任何一条阻塞 UI：
    - `ai_service_chat_async()` — UI 页面用，入队后立刻返回，结果走事件（worker 任务执行）；
    - `ai_service_chat()` — 阻塞，供 worker 或 HTTP 任务调用；
-   - `ai_service_chat_stream()` — 逐段回调，只有 httpd 任务适合调用（长连接）。
+   - `ai_service_chat_stream()` — 逐段回调。
+
+   > ⚠️ **`/api/v1/ai/chat` 与 `/api/v1/ai/chat/stream` 目前是"已知同类隐患"（1.0.0 未修，
+   > 用户明确决定先不动）**：它们在 **httpd 任务里**跑完整轮 AI 回复，而
+   > `esp_http_server` 的 handler 是**串行**执行的 —— 一次 AI 回复（十几秒）期间整台设备的
+   > HTTP 都会不可用（`ping` 通、TCP 全超时）。网页上位机不使用这两个接口，所以不影响
+   > 浏览器页面。修法与 SSE 相同：`httpd_req_async_handler_begin()` 把 socket 交给独立任务，
+   > 由那个任务调用 `ai_service_chat_stream()`，结束再 `httpd_req_async_handler_complete()`。
+   > 参考 `components/sync_server/src/sync_server.c` 的 `events_get_handler()` + `sse_client_task()`，
+   > 背景见 `AGENT.md §9.0.1` 第 4 条与 `docs/HANDOVER.md §7` 第 3 条。
 3. **中断是真的**：`ai_service_abort()` 置标志，`ai_service.c` 的 HTTP 事件回调检测到后返回
    非 `ESP_OK`，`esp_http_client_perform()` 立即结束，调用方拿到 `ESP_ERR_TIMEOUT`。
 4. **流式解析在设备侧完成**：按行重组 SSE（`data: {...}` 会被 TCP 分片切断），

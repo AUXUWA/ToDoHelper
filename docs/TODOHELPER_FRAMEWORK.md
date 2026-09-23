@@ -369,7 +369,7 @@ size_t    sync_server_sse_clients(void);
 | GET | `/api/v1/device/status` | 运行时长/堆/路由数/SSE 客户端数 |
 | POST | `/api/v1/device/reboot` | **强制鉴权**；先回包再用 700 ms 定时器重启 |
 | POST | `/api/v1/device/auth` | **强制鉴权**；设置 token 并开启鉴权 |
-| GET | `/api/v1/events` | SSE 推送（每客户端独立队列 + 15 s keepalive，最多 4 个） |
+| GET | `/api/v1/events` | SSE 推送（**异步 handler + 每客户端任务**；每客户端独立队列 + 15 s keepalive，最多 3 个） |
 | GET | `/ws/events` | **501 占位**：本 IDF 无 WebSocket 组件，提示改用 SSE（需求 §8.7） |
 
 `sync_server` **不依赖任何业务组件**：它订阅 L0 的 `SYS_NOTIFY_EVENT`（见 §5.8）
@@ -564,12 +564,15 @@ static const app_module_t s_modules[] = {
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **A 框架** | 分区表/工程骨架 + 摘除咖啡机 + `sys_utils`/`http_router`/`storage_manager`/`bsp`/`ui_assets`/`ui_core` + 新 `app_main.c` | ✅ 编译通过 + **已上机** |
-| **B P0 业务** | wifi/todo/weather/calendar/word + sync_server + idle_face + 全部页面 | ✅ 编译通过 + **已上机**（模块全部 ready） |
-| **C P1** | 设置页/鉴权/mDNS/缓存降级/SSE/内嵌 CJK 字体/表情自动触发/IP 定位 | ✅ 编译通过 + **字体与 mDNS 已上机验证** |
+| **B P0 业务** | wifi/todo/weather/calendar/word + sync_server + idle_face + 全部页面 | ✅ 编译通过 + **已上机**（9 个模块全部 ready） |
+| **C P1** | 设置页/鉴权/mDNS/缓存降级/SSE/内嵌 CJK 字体/表情自动触发/IP 定位 | ✅ 编译通过 + **全部已上机验证**（IP 定位受本机网络到 `ipapi.co` 不通所限，返回码语义正确） |
 | **D P2** | ai_service + voice_service + 小眼睛联动 + AI 对话页 | ✅ 编译通过 + **模块 ready / 音频硬件可用**；AI 与 ASR/TTS 真实调用待验 |
 
-> **上机状态**：0 panic、0 看门狗，12 个模块全部 `ready`，中文显示正常，SD/mDNS/HTTP 均正常。
-> 仍待验证的是**输入侧（触摸/按键/待机）与联网侧（WiFi 关联后的全链路）**。
+> **上机状态（`v1.0.0`）**：插卡冷启动 ×3 无 panic、0 看门狗，**9 个模块全部 `ready`**，
+> 中文显示正常，SD / mDNS / HTTP（45 条路由）/ SSE / WiFi 扫描 / 网页上位机均实测正常；
+> 触摸、待机动画、开机滚动日志、待办页按钮已由用户目视确认。
+> 两个曾经阻塞的问题（插卡启动崩溃 = 内部 RAM 被 JSON 解析抽干；SSE 同步 handler 冻住整个
+> HTTP 服务器）已定位真因并修复，详见 `AGENT.md §9.0.5` 与 `§9.0.1` 第 4 条。
 > 首轮上机踩到的五个坑（内部 RAM 碎片化、LVGL 绘制缓冲占内部 RAM、FreeType 不支持内存
 > 字体、渲染栈大小、FatFs mkdir 语义）见 `AGENT.md` §9.0——**那是本工程最值钱的经验**。
 

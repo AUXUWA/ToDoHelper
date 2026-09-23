@@ -1,9 +1,11 @@
 # sys_utils
 
-**L0 基础组件** — 全项目共用的日志、事件循环、时间与 NVS 配置。所有其他组件都依赖它。
+**L0 基础组件** — 全项目共用的日志、事件循环、时间、NVS 配置、堆诊断与 cJSON 分配策略。
+所有其他组件都依赖它。
 
 - 头文件：`include/sys_utils.h`（聚合）、`sys_log.h`、`sys_err.h`、`sys_keys.h`
-- 依赖：IDF `esp_event` / `nvs_flash` / `esp_timer` / `log`
+- 依赖：IDF `esp_event` / `nvs_flash` / `esp_timer` / `log` / `heap`；托管 `espressif/cjson`
+  （仅 `sys_json.c` 用来装分配钩子）
 - 无上游 ToDoHelper 依赖
 
 ## API 摘要
@@ -15,6 +17,35 @@
 | 事件 | `sys_events_init()`、`sys_events_get_loop()`、`sys_event_post_to()`、`sys_events_post()`、`sys_event_subscribe()` |
 | 时间 | `sys_time_ms()`、`sys_time_ts()`、`sys_time_synced()`、`sys_time_set_ts()`、`sys_time_clear()` |
 | 配置 | `sys_config_init()`、`sys_config_get/set_str/i32/bool()`、`sys_config_erase()`、`*_or()` 便捷版 |
+| 堆诊断 | `sys_heap_log(stage)`、`sys_heap_largest_internal()`（`internal / largest / psram / int-low` 四列） |
+| JSON 分配 | `sys_json_use_psram()`（把 cJSON 的分配改成先 PSRAM、失败回退默认堆） |
+
+## 为什么要管 cJSON 的分配（`sys_json.c`）
+
+`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 让**所有 ≤4 KB 的分配优先落在内部 RAM**，而 cJSON
+每个 JSON 元素约 56 B —— 解析一份大 JSON（CET-6 词库 546 KB / 约 7000 个节点）会在解析期间
+把 ~107 KB 的内部空闲抽干。此时任何**只能来自内部 RAM** 的并发分配（例如正在连网的 WiFi 驱动
+`esp_timer_create()`）就会拿到 `ESP_ERR_NO_MEM`，而它外面包着 `ESP_ERROR_CHECK` → 直接 abort。
+**这就是"插 SD 卡即崩溃重启循环"的真因**（`AGENT.md §9.0.5`）。
+
+`sys_json_use_psram()` 用 `cJSON_InitHooks()` 把 cJSON 的 `malloc/free` 换成
+"`MALLOC_CAP_SPIRAM` 优先、失败回退 `MALLOC_CAP_DEFAULT`"，在 `app_main()` 最早期调用一次
+（钩子是全局的）。释放统一用 `heap_caps_free()`，因此**混用**普通 `malloc()` 与 cJSON 分配的内存
+也安全（`heap_caps_free` 会找到所属堆）。
+
+## 堆诊断的四列（`sys_heap.c`）
+
+```
+I (1862) TH:heap: after ui_core        internal    260 KB (largest    216 KB)  psram 11255 KB  int-low    247 KB
+```
+
+- `internal`：内部 RAM 当前空闲；`largest`：内部 **DMA-capable** 最大连续块（`esp_wifi_init()`
+  / I2S / SDMMC 真正争的就是它）；
+- `psram`：PSRAM 空闲；
+- **`int-low`**：内部 RAM 的**历史最低水位**（`heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)`）。
+  它替代了原来那个被 12 MB PSRAM 主导、永远不动的 `esp_get_minimum_free_heap_size()`。
+  **掉到个位数 KB 就说明某个瞬时峰值把内部 RAM 抽干过** —— 这正是插卡崩溃的判据，
+  而当时的当前空闲量看起来还是健康的 107 KB。
 
 ## 日志历史（屏幕启动日志，`sys_log.h`）
 

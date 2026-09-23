@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "calendar_service.h"
+#include "esp_app_desc.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -281,9 +282,15 @@ static void refresh_info(void)
     (void)wifi_manager_get_ip(ip, sizeof(ip));
     (void)wifi_manager_get_mac(mac, sizeof(mac));
 
+    /* Version comes from version.txt at build time (see AGENT.md 8.1); it is the
+     * quickest way to tell which firmware is actually flashed on the board. */
+    const esp_app_desc_t *app = esp_app_get_description();
+
     lv_label_set_text_fmt(s_info_label,
-                          "IP %s · %s\n存储 %s（%s）\n剩余 %llu KB · 时区 %s\n"
+                          "固件 %s · IDF %s\nIP %s · %s\n存储 %s（%s）\n剩余 %llu KB · 时区 %s\n"
                           "天气源 %s · 城市 %s\n单词 %u/日 · 词库 %s",
+                          (app != NULL) ? app->version : "?",
+                          (app != NULL) ? app->idf_ver : "?",
                           ip, mac,
                           storage_root() ? storage_root() : "不可用",
                           storage_sd_available() ? "SD 卡" : "内置",
