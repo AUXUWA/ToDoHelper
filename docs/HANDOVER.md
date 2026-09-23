@@ -1,313 +1,286 @@
 # ToDoHelper 交接说明（HANDOVER）
 
-> 面向**接手的下一个 Agent / 开发者**。本文档描述「当前真实状态、下一步做什么、哪里最容易踩坑」。
-> 配套：`AGENT.md`（环境与命令，**先读它**）、`docs/TODOHELPER_FRAMEWORK.md`（框架设计）、
-> `docs/API.md`（组件与 HTTP 接口）、`docs/TODOHELPER_REQUIREMENTS.md`（需求）。
+> 面向**接手的下一个 Agent / 开发者**。本文档描述「当前真实状态、阻塞问题、下一步做什么、哪里最容易踩坑」。
 >
-> 优先级：**代码实际行为 > `AGENT.md` > 框架设计 > 需求文档**。
+> 配套阅读顺序：**本文档 → `AGENT.md`（环境/命令/全部实测坑，尤其 §9.0~§9.0.5、§9.7）→
+> `docs/TODOHELPER_REQUIREMENTS.md`（需求）→ `docs/TODOHELPER_FRAMEWORK.md`（框架）→ `docs/API.md`（组件与 HTTP 接口）**。
+>
+> 最后更新：第二轮收尾（提交 `2dfa7b7` / `e365448` 及其后一个小改动）。
 
 ---
 
-## 1. 一句话现状
+## 0. 一句话现状
 
-P0/P1/P2 的**代码**基本写完（16 个组件、约 15.5k 行 C，`idf.py build` 全绿，
-app 4.18 MB / 8 MB 分区余 50%），**且已完成首轮真机验证**。
+**8 项需求全部实现并提交，构建 0 错误 0 警告，但有一个阻塞性崩溃没修完：插 SD 卡时设备会
+崩溃重启循环。** 根因已定位到 IDF 内部具体文件行，并已加了一个修复，**该修复的验证当时仍在
+进行中**（见 §2，接手第一件事就是把它验完）。
 
-**已验证（真机 COM34，`idf.py build` 0 警告）**
+---
 
-| 项 | 结果 |
+## 0.5 现阶段的目标与需求
+
+### 0.5.1 项目总目标（缘起，长期有效）
+
+在 **ESP32-S31-Korvo** 上实现 ToDoHelper：以 `docs/TODOHELPER_REQUIREMENTS.md` 为需求书，
+**先规划可扩展的框架（分层 L0~L5、三个表驱动注册点），再逐条完成需求**；允许参考乐鑫官方工程
+或优秀开源项目的代码与 UI。框架设计见 `docs/TODOHELPER_FRAMEWORK.md`，接口见 `docs/API.md`。
+
+### 0.5.2 本轮目标（8 项，即当前正在收尾的这一轮）
+
+> 原文（用户下达）：**「ToDoHelper 第二轮收尾（8 项）：(1) 修复待办无法同步；(2) 优先完成两项
+> 未完成功能——待机眼睛动画（只要眼睛不要嘴巴、零位图）与单词书 cet4→cet6；(3) 在 SD 卡
+> （当前在 PC 的 F:\）准备所需资源：六级词汇、字体/字库等（动画为程序化绘制，无需图片）；
+> (4) 待办逻辑改为设备端只读、仅由网页上位机编辑；(5) 优化网页上位机；(6) 开机在屏幕上滚动
+> 显示启动日志；(7) 时刻更新 harness 待办清单；(8) 部分任务使用子 agent，完成后更新文档并
+> 提交 git。每步烧录 COM34 验证。」**
+
+逐条状态见 **§3**。特别提示两条**已被用户中途修正**的需求，接手时别按字面理解：
+
+| 需求原文 | 中途修正与最终结论 |
 |---|---|
-| 稳定性 | **0 panic、0 task watchdog**，`main_task: Returned from app_main()` 干净收尾 |
-| 12 个功能模块 | WiFi / Todo / 天气 / 日历 / 单词 / sync_server / idle_face / ai_service / voice_service **全部 `ready`** |
-| 中文字体 | FreeType **16/20/28/48 px 全部生效**，用户确认**无方框** |
-| SD 卡 | 挂载 `/sdcard`（SD16G/SDHC/4-bit/40 MHz），应用目录树创建成功，词库写入 `words/cet4.json` 成功 |
-| mDNS | `mDNS published as todohelper.local` |
-| HTTP | `listening on port 80, 37 route(s), auth=off` |
-| 音频 | `mic=1 speaker=1`（I2S DMA 成功） |
-| 内部 RAM | boot 结束余 **118 KB（最大连续块 74 KB）**、PSRAM 余 9655 KB |
-| app 体积 | `0x3fcbf0`，8 MB 分区余 **50%** |
+| (2) 「**优先**完成两项未完成功能」 | 优先级确实最高，已先做；但其中的**待机动画有一个隐藏 bug**（脸不会眨眼、临时表情永不过期），见 §3 的 2a |
+| (4) 「设备端只读、仅网页编辑」 | 用户实测后澄清：**设备端要保留"勾选完成 + 删除"**，只有"新增/编辑"留给网页（本板无 IME，打字不现实）。**最终按修正后的语义实现**（§3 的 4）。注意这不是"完全只读" |
 
-**尚未验证**
+### 0.5.3 更早各轮的需求（历史，供理解上下文）
 
-- WiFi 实际关联（需要 SSID/密码凭据）
-- 联网后的 HTTP 全链路：浏览器待办页双向同步、SSE 推送、`/ws/events` 501、天气 IP 定位、SNTP 校时、单词、AI 对话
-- **触摸与按键交互**（GT1151 已初始化，但从未点过）
-- **待机 30 s 超时 → 眼睛动画 → 触摸唤醒** 完整链路
-- DeepSeek 真实调用、ASR/TTS 端点
+按时间顺序，除上面 8 项外用户还提过并已实现的要求：
 
-> **接手者必读**：首轮上机踩的坑全部记在 `AGENT.md` §9.0（五条实测结论）与
-> §9.0.1（两个自伤 bug）。那两节是最容易重复踩的地方，尤其是
-> "内部 RAM 碎片化 ≠ 总空闲不足" 这一条。
+1. **需求书全量实现 + P1 三项 + 文档回改**（`docs/TODOHELPER_REQUIREMENTS.md` v0.5，含 15 处实现偏差记录）
+2. **硬件 bring-up 与优化**：内存管理（大量数据放 SD 卡）、UI 参考官方工程写法、待机动画参考
+   esp-vocat、字体放 SD 卡解决中文方框、烧录 COM34 实测
+3. **一批现场 bug**（用户实际使用中发现，均已修并上机验证）：WiFi 扫描崩溃、连接崩溃、
+   日志可读性、键盘样式统一、日历排版、天气页显示 "Text"、待机/唤醒行为、待机后设备失联
+4. **天气纯 IP 定位**：去掉手输城市、修 `lat/lon=0` 解析 bug、默认城市设为**南昌**
+5. **性能与体验**：烧录提速（147.9s → 31.6s，4.7×）、丰富待机动画、单词书 cet4→cet6
 
----
+### 0.5.4 明确"不做/未做"的项（避免重复劳动）
 
-## 2. 已完成（对照需求文档）
+- **网页 WiFi 配置面板**：不是原始 8 项需求里的条目，是我在核实子 agent 报告时**自己追加**的想法。
+  子 agent 被中断，**只留下页头注释，没有实现**。若要做得先读
+  `components/wifi_manager/src/wifi_manager_http.c:266-272` 的路由表（7 条路由，均可用）。
+- **L0 `SYS_EVENT_TIME_SYNCED` 事件**：已在 `AGENT.md §9.7` 降级为**可选** —— `weather_task`
+  现在会等时钟最多 75 秒，已覆盖原场景。
 
-| 需求 | 实现位置 | 说明 |
-|---|---|---|
-| FR1 WiFi | `components/wifi_manager` + `page_wifi.c` | 扫描/连接/NVS 保存/开机自动重连/断线退避重试/mDNS hostname/7 条 HTTP 路由 |
-| FR2 Todo | `components/todo_manager` + `page_todo.c`（含详情页） | 设备端列表+勾选、`cache/todos.json` **原子写**（tmp+rename）、完整 REST、PC 端可直接改、断网可操作 |
-| FR3 天气 | `components/weather_service` + `page_weather.c` | 默认 **Open-Meteo（免 Key）**、城市地理编码、**IP 定位**、15 分钟定时刷新、`cache/weather.json` 降级 + `stale` 标记、WMO 码→中文/图标 |
-| FR4 日历 | `components/calendar_service` + `page_calendar.c`（+ 状态栏） | SNTP、POSIX 时区、月历翻页；**无 RTC**，未同步显示"时间未同步"而不是 1970 |
-| FR5 单词 | `components/word_service` + `page_word.c` | 内置 32 词示例（可导出替换）、翻卡、三档评分、间隔复习（known→2^level 天 / fuzzy→1 天 / unknown→10 分钟）、进度持久化 |
-| FR6 待机眼睛 | `components/idle_face` | **纯程序化、零位图**；11 状态**一张参数表**驱动 + 33 ms 插值动画；随机眨眼(3~8 s)/左右看；呼吸相位；**通知触发表情** |
-| FR7 AI 对话 | `components/ai_service` + `page_ai_chat.c` | DeepSeek 阻塞+**流式**、历史轮数、真中断、HTTP+SSE、小眼睛四态联动 |
-| FR7 语音 | `components/voice_service` | **真实录音与回放**；ASR/TTS 走可配置 HTTP 端点；三条降级路径齐全 |
-| 需求 §8 HTTP 契约 | `components/http_router` + `sync_server` | 统一 `{code,msg,data}`；**501/404/405/401 集中实现**；29+ 条路由；`/api/v1/events` SSE；内嵌浏览器待办页 |
-| 需求 §8.8 鉴权 | `sync_server.c` | `X-Auth-Token` 头（**不接受 query**）；`device/reboot`、`device/auth`、`ai/config`、`ai/history` 强制鉴权 |
-| 需求 §9 数据 | `sys_utils/sys_keys.h` + `docs/API.md` §3 | 全部 NVS 键集中登记；组件不得直接 `nvs_open` |
-| 需求 §16 文档 | `docs/API.md`（1381 行）+ 每个组件 README | 函数签名/事件/NVS 键/HTTP 路由/测试步骤 |
-| 工程卫生 | `-Werror` 0 警告；5+2 个 git 提交；`.gitignore` 覆盖生成物 | |
 
----
 
-## 3. 未完成 / 需要决策
-
-### 3.1 阻塞项（**必须你或用户确认，我无法自行判定**）
-
-来自需求 §17.2，直接决定架构：
-
-| # | 问题 | 影响 |
-|---|---|---|
-| 1 | 板上装的是 **SD 卡槽** 还是 **SPI NAND flash**？（GPIO20~25 复用，二者互斥） | 字体/词库/素材该放 SD 还是片内分区；`storage_manager` 的回退路径哪条才是实际路径 |
-| 2 | **麦克风型号**（数字/模拟）、**是否已装喇叭/功放** | FR7 能否做离线 ASR；TTS 播报是否可用（不可用则只上屏） |
-| 3 | **ASR / TTS 选型**（本地离线 / 云端 / 跳过音频） | `voice_service` 的两个端点填什么；本地镜像**没有** `esp-sr`/`esp_tts` |
-| 4 | **天气 API 选型与 Key** | 我默认用了免 Key 的 Open-Meteo；若要和风/OpenWeather，在 `weather_service` 加一个 provider 即可（§4.3） |
-| 5 | **词库来源**（CET4/CET6？格式？要音标/例句/发音？） | 当前是内置 32 词示例；把真实词库按 `docs/API.md` 的格式丢到 `<storage>/todohelper/words/<book>.json` 即可替换 |
-| 6 | **屏幕驱动 IC 型号** | 影响时序微调与背光方案（当前背光为 NC，用软件遮罩调光） |
-| 7 | **DeepSeek Key / 模型 / 是否流式** | 通过 `POST /api/v1/ai/config` 或设置页配置即可，无需改代码 |
-| 8 | 待机眼睛风格（圆眼/椭圆/线条/是否要瞳孔） | 改 `s_effects[]` 参数或 `idle_face.c` 的绘制即可 |
-| 9 | 屏幕方向与触摸校准 | `th_bsp_init()` 里 `bsp_display_config_t.rotation` |
-
-### 3.2 代码侧待办（不需要硬件，可直接做）
-
-| 项 | 位置 | 说明 |
-|---|---|---|
-| `voice_service/README.md` | — | 唯一缺 README 的组件（其余 16 个都有） |
-| ASR/TTS 真机联调 | `voice_service.c` 的 `http_post()` | 端点可配，但从未对真实服务验证过 |
-| `SYNC_EVENT_CLIENT_CONNECTED` | `sync_server.h` 声明了但**从未 post** | 要么补上（在 catch-all 分发器里发），要么删掉声明 |
-| 云同步 / MQTT | — | 需求 §14 P2 的"Mqtt/云同步"未做；本地镜像有 `espressif/mqtt` |
-| OTA | — | 需求 §14 P2 未做；分区表目前**没有** ota 分区，需要先改 `partitions.csv` |
-| 提醒/日程联动 | — | 需求 §14 P2 未做 |
-| CDN/字体换源 | `tools/gen_cjk_font.py` | 若要二级字库加 `--level2`（约 3.8 MB），注意 app 分区余量 |
-| 备份策略 | 需求 §17.2 #13 | `backup/todos_*.json` 的滚动保留未实现（NVS 键 `TODOHELPER_TODO_BACKUP_KEEP` 已留但未用） |
-| IP 定位端点 | `SYS_KEY_GEO_URL`，默认 `https://ipapi.co/json/` | 免费额度有限，可换成自建或其它服务 |
-
-### 3.3 实现与需求文档的**偏离**（需回改进需求文档）
-
-我做了以下偏离，需求文档尚未同步（本文档即为记录；请顺手改 `docs/TODOHELPER_REQUIREMENTS.md`）：
-
-| 偏离 | 原因 |
-|---|---|
-| **新增 L1 组件 `http_router`** | 需求 §7.12 让业务组件"反向注册"路由，但把注册表放 `sync_server`(L4) 会迫使 L3 组件向上依赖。移到 L1 后所有依赖仍然向下 |
-| **新增 L2 组件 `ui_assets`** | 需求 §12 说"复用 `spiffs_create_partition_assets` 流程"；把它放在拥有素材的组件里，才能保证生成的 `mmap_generate_assets.h` 在编译前就绪 |
-| **`UI_PAGE_IDLE_FACE` 由 `idle_face` 自己注册**，不在 `ui_pages` 的 `s_pages[]` 里 | 需求 §10.1 说"由 idle_face 组件接管"；这样 `ui_pages` 不必依赖 `idle_face` |
-| **天气默认 Open-Meteo（免 Key）** | 需求 §17.2 #4 未定；选免 Key 的让 FR3 开箱可用，provider 可插拔 |
-| **WebSocket 用 SSE 代替**（`/api/v1/events`），`/ws/events` 保留为 **501 占位** | 本地组件镜像里**没有** `esp_websocket_client`；需求 §8.7 允许 SSE 且要求未实现返回 501 |
-| **新增 `sys_notify()`（L0 通知通道）** | 需求没有它；没有它，L3 想通知 UI/Web 就得向上依赖 L4。idle_face 的表情触发也建在它上面 |
-| **`sdkconfig.defaults` 强制 `LOG_MAXIMUM_LEVEL_VERBOSE`** | 见 `AGENT.md` §9.1：esp32s31 + XIP_FROM_PSRAM 下否则**链接失败** |
-| **`bsp` 门面符号前缀用 `th_bsp_`** 而非 `bsp_` | 需求 §6 想暴露 `bsp_display_*`，但工程外 Korvo BSP 已占用这些符号 |
-| **设备端不支持中文输入**（屏幕键盘只有拉丁） | 没有 IME；中文待办/AI 提问请用电脑网页或 HTTP API。这是硬件/系统限制，不是遗漏 |
-| **`ESP_LOGD` 用运行时级别**（`sys_log_writev`） | 这样 `sys_log_set_level()` 才能运行时生效；代价是日志前缀固定为 `TH:<tag>` |
-
----
-
-## 4. 代码地图：改哪里做什么
-
-### 4.1 新增一个业务组件
-
-1. 建 `components/<name>/`：`CMakeLists.txt`、`include/<name>.h`、`src/<name>.c`、`README.md`、
-   （可选）`Kconfig`、`idf_component.yml`；
-2. `CMakeLists.txt` 里 `REQUIRES` **只能向下**（`sys_utils` / `storage_manager` / `bsp` / `http_router`）；
-3. 事件基址在头文件里 `ESP_EVENT_DECLARE_BASE(...)`，在 `.c` 里 `ESP_EVENT_DEFINE_BASE(...)`；
-4. 要 HTTP：写 `xxx_register_http()` 并在 `xxx_init()` 里调用（**不要**改 `sync_server`）；
-5. 要通知 UI/Web：`sys_notify("name", NULL)`；
-6. 在 `main/app_main.c` 的 `s_modules[]` 加**一行**；
-7. 在 `main/CMakeLists.txt` 的 `REQUIRES` 加组件名；
-8. 在 `docs/API.md` 追加一节。
-
-### 4.2 新增一个页面
-
-`components/ui_pages/src/page_xxx.c` 导出 `const ui_page_t page_xxx`；
-在 `pages_internal.h` 加 `extern`；在 `ui_pages.c` 的 `s_pages[]` 加一行；
-在 `CMakeLists.txt` 的 `SRCS` 加文件；若需新 id，在 `ui_core.h` 的 `ui_page_id_t` 加枚举
-（**顺序要与需求 §10.1 一致**）。
-
-### 4.3 新增一个天气 provider
-
-1. `components/weather_service/src/weather_provider_<name>.c`，实现 `weather_provider_t`
-   （`geocode` + `fetch` 两个函数指针）；
-2. 在 `weather_service.c` 的 `s_providers[]` 加一行；
-3. 需要 Key 的把 `needs_api_key = true`，用户用 `weather_set_api_key()` 配。
-
-### 4.4 新增一个待机表情
-
-1. `idle_face.h` 的 `idle_face_state_t` 加值；
-2. `idle_face.c` 的 `s_effects[]` 加一行参数（`open/dx/dy/pupil/arc/cross/eye_dy/width_scale/speed`）；
-3. 需求文档 FR6 与 §11.2 同步补一行（**三处必须一致**）。
-
-### 4.5 让某个业务事件驱动表情
-
-在 `idle_face.c` 的 `s_triggers[]` 加一行 `{ "通知名", 状态, 持续毫秒 }`，
-然后让生产者调 `sys_notify("通知名", NULL)`。**两处，无其它改动。**
-
-### 4.6 新增一个 HTTP 接口
-
-在拥有该资源的组件里写 handler，`http_router_register(path, method, handler)`。
-模式里允许**一个 `*`**（`/api/v1/x/*`、`/api/v1/x/*/done`），**最具体者胜**。
-出参用 `http_reply_ok()` / `http_reply_err()`；路径段用 `http_path_segment_u32(req, 3, &id)`。
-预留未实现的用 `http_router_register_not_implemented()`（回 501）。
-
----
-
-## 5. 上机验证清单
-
-### 5.1 首轮已验证 ✅
+- 目标芯片 `esp32s31`（ESP32-S31-Korvo，800×480 RGB 屏 + GT1151 触摸 + ES8389 + SDMMC 4-bit）
+- ESP-IDF **v6.1**，路径 `D:\ESP-IDF\v6.1\esp-idf`；工程 `D:\project\ESP-IDFv6.1\ToDoHelper`
+- 串口 **COM34**（115200）；设备 IP 固定 **192.168.137.110**，mDNS `todohelper.local`
 
 ```powershell
-. C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
-cd D:\project\ESP-IDFv6.1\ToDoHelper
+# 0) 关键前置：先杀掉占用串口的 monitor，否则烧录/抓串口都会失败
+Get-CimInstance Win32_Process -Filter "Name like '%python%'" |
+  Where-Object { $_.CommandLine -match 'idf_monitor|esp_idf_monitor' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+
+# 1) 构建（约 40s）
 idf.py build
-idf.py -p COM34 flash
-# 抓串口（idf.py monitor 会独占终端、不能重定向）
-& 'C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe' tools\monitor_capture.py `
-    --port COM34 --seconds 30 --out build\boot.log
+
+# 2) 快速烧录（约 32s；脚本封装了 921600 波特 + stub 压缩，别用 idf.py flash）
+#    注意：必须在"已加载 IDF 环境"的 pwsh 里运行，否则会静默什么都不做
+. 'C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1'
 ```
 
-| # | 检查项 | 结果 |
-|---|---|---|
-| 1 | 启动无 panic / 无看门狗 | ✅ 全绿 |
-| 2 | 屏幕点亮、状态栏 + 首页 6 个卡片 | ✅（用户确认） |
-| 3 | 中文不是方框 | ✅（用户确认，FreeType 生效） |
-| 4 | 存储挂载 | ✅ `/sdcard`，状态栏显示 `SD` |
-| 5 | 12 个模块 ready | ✅ 全部 ready |
-| 6 | mDNS + HTTP | ✅ `todohelper.local` / 80 端口 / 37 条路由 |
-| 7 | 内嵌字体落盘 | ✅ `fonts/ui_cjk.ttf`（1224120 字节） |
-| 8 | SD 写入 | ✅ 词库 `words/cet4.json` |
-| 9 | 音频硬件 | ✅ `mic=1 speaker=1` |
-| 10 | 内部 RAM 余量 | ✅ 118 KB / 最大连续块 74 KB |
+烧录命令本体（`tools/flash.ps1` 也是这个）：
 
-### 5.2 待验证 ⬜
+```powershell
+python -m esptool --chip esp32s31 -p COM34 -b 921600 --before=default-reset --after=hard-reset `
+  write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB `
+  0x2000  build\bootloader\bootloader.bin `
+  0x8000  build\partition_table\partition-table.bin `
+  0xa10000 build\mmap_build\ui\assets\assets.bin `
+  0x10000 build\todohelper.bin
+```
 
-| # | 检查项 | 期望 | 阻塞原因 |
+抓串口（`idf.py monitor` 无法脚本化，用这个）：
+
+```powershell
+python tools\monitor_capture.py --port COM34 --seconds 16 --out build\boot.log   # 会做一次复位
+python tools\monitor_capture.py --port COM34 --seconds 16 --no-reset --out build\x.log
+```
+
+---
+
+## 2. 🔴 阻塞问题：插卡启动崩溃（**接手第一件事**）
+
+### 现象（100% 可复现）
+
+| 条件 | 结果 |
+|---|---|
+| **拔掉 SD 卡** | 启动干净：0 故障、9 模块 ready、`storage=/littlefs` |
+| **插上 SD 卡** | **3/3 崩溃**，从未到达 `TH:app: ready`；16 秒内崩 3 次 = 重启循环 |
+
+崩点固定：`module 'calendar_service' ready`（约 3.13 s）之后、`word_service` 打出任何日志之前。
+`reset reason: panic (4)`。
+
+### 根因（已用 addr2line 定位到具体文件行）
+
+```
+2f0029b0  lock_acquire_generic  @ esp_libc/src/locks.c:158
+2f00c91a  __assert_func         @ esp_libc/src/assert.c:34
+2f02d15c  ??                    @ esp_security/src/esp_crypto_lock.c:39   ← 关键
+```
+
+`esp_security/src/esp_crypto_lock.c` 把硬件加密引擎的锁写成**零初始化的静态 `_lock_t`**
+（如第 39 行 `static _lock_t s_crypto_sha_aes_lock;`），靠 newlib 的**惰性初始化**：第 61-65 行
+`esp_crypto_hmac_lock_acquire()` 直接 `_lock_acquire()`。而 newlib 的 `lock_acquire_generic()`
+在发现锁"未初始化"时会调 `lock_init_generic()`，里面有 `assert(lock->owner == LOCK_FREE)` ——
+**两个上下文同时首次 acquire 同一把锁，后到者必然断言失败 → abort**。
+
+这解释了全部观察：时序依赖（故间歇）、**只有插卡才崩**（插卡使启动时序偏移约 100 ms 撞进竞态
+窗口）、崩点固定在 `calendar_service` 之后（那正是 WiFi 接上做 WPA2 握手、开始用 SHA/AES/HMAC
+的时刻）、寄存器现场含 `esp_vApplicationTickHook`（另一上下文来自 tick/中断侧）、栈上出现 WiFi
+SSID（崩溃上下文刚碰过 WiFi 配置）。
+
+**已排除**：与 `main/app_main.c` 里"切 HOME 在 `run_modules(true)` 之前还是之后"无关 ——
+恢复原时序后连续 3 次冷启动仍然 3/3 崩溃。
+
+### 已尝试的修复：**实测无效（代码保留，但没解决问题）**
+
+> **结论（重要，别被下文误导）**：在 `main/app_main.c` 里预先 acquire+release 一遍 crypto 锁之后，
+> 构建通过、烧录通过，但**连续 3 次冷启动仍然 `abort=1/1/2`、`app_ready=0` —— 没有修好**。
+> 设备依旧是"插卡即崩溃重启循环"。这个改动保留了（无害），但**不等于问题已解决**。
+>
+> **另一处必须更正的归因**：我最初把栈里的 `2f02d15c` 归到 `esp_crypto_lock.c:39`，这**可能是方法错误**
+> —— 那个地址正好落在静态锁变量 `s_crypto_sha_aes_lock` 的地址上，也就是说它很可能是**栈里的一个
+> 数据值（正在被 acquire 的锁的指针），而不是返回地址**。因此"crypto 锁竞态"这个结论**需要重新论证**，
+> 不要当作定论。真正可信的只有两条帧：`lock_acquire_generic`(locks.c:158) 与 `__assert_func`(assert.c:34)，
+> 即**某个 newlib `_lock_t` 的惰性初始化断言失败**；至于是哪把锁、哪两个上下文在竞争，仍待查。
+
+### 下一步排查建议（按性价比）
+
+1. **先确认是不是真正的栈帧再做归因**：重新抓一次 panic，用
+   `riscv32-esp-elf-objdump -d build\todohelper.elf` 确认候选地址落在**代码段且是返回地址**，
+   而不是数据段。区分"代码地址"和"数据地址"是解析 panic 栈时最容易犯的错。
+2. **拿到完整回溯**：打开 `CONFIG_ESP_SYSTEM_PANIC_PRINT_ALL_REGS=y` 与
+   `CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y`（`sdkconfig.defaults`），重新抓取。
+3. **二分定位触发者**：插卡时崩溃、拔卡正常，且与 `word_service`（读卡上 833 词）时间上重合。
+   可把 `word_service` 的初始化临时注释掉，看崩溃是否消失 —— 这是最直接的因果验证。
+4. **换一条更稳的路**：既然 `lock_init_generic` 断言的是"锁状态不是 FREE"，而这是 newlib 的
+   惰性初始化机制，可考虑让 IDF 在启动时一次性初始化 newlib 锁（`CONFIG_NEWLIB_...` 相关），
+   或在单任务上下文里先把 stdio/malloc/time 各调一次。
+5. 查 IDF v6.1 是否已有此问题的已知 issue / 补丁，考虑升级管理组件。
+
+**临时办法（给用户）**：拔掉 SD 卡即可正常启动（词库退回内置 32 词、字体退回片内字库）。
+
+---
+
+#### 以下是当时的原始分析（保留供参考，注意上面已更正）
+
+`main/app_main.c`：在 `ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH))` 之前，**由单任务上下文
+把 crypto 锁 acquire+release 一遍**（最初含 dma，后因该芯片无实现而删除），从而一次性
+完成初始化，之后不再有惰性初始化竞态。
+
+**注意一个真实的踩坑**：`esp_crypto_lock.h` 声明了全部这些函数，但**并非全部都有实现** ——
+`esp_crypto_dma_lock_{acquire,release}` 在本芯片上**没有实现**，调用会**链接失败**
+（`undefined reference`）。不能因为"头文件里有声明"就假定可链接。
+
+### 接手请你做
+
+1. 跑完验证：构建 → 烧录 → **连续 3 次冷启动**，确认 `abort=0` 且出现 `TH:app: ready`。
+   （当时正在跑的命令：`idf.py build` → esptool 烧录 → 3× `monitor_capture --seconds 16`，
+   逐个统计 `abort\(\) was called` 与 `TH:app: ready` 的出现次数。）
+2. 若**仍然崩溃**：说明 init 时机还不够早，或还有别的锁参与。下一步建议
+   （a）把这段调用再往前挪到 `app_main` 最开头、`th_bsp_init()` 之前；
+   （b）查 IDF v6.1 是否已有此问题的 Kconfig/补丁，考虑升级管理组件；
+   （c）让 WiFi 连接完成前不要有任何其他加密使用方。
+3. 若**修好了**：把 §2 标题里的"阻塞"去掉，并把结论写回 `AGENT.md §9.0.5`。
+
+---
+
+## 3. 八项需求的状态
+
+| # | 需求 | 状态 | 说明 |
 |---|---|---|---|
-| 11 | 触摸 | 点卡片进页面、"返回"能回退 | GT1151 已初始化，但从未点过 |
-| 12 | 按键 | MODE 切首页/待办、SET 返回、能唤醒待机 | 4 个 ADC 按键已注册 |
-| 13 | 待机 | 30 s 无操作 → 全黑 + 白线眼睛 + 眨眼 + 变暗 | `idle timeout 30 s` 已生效 |
-| 14 | 页面切换动画 | 新页面 200 ms 淡入 + 向右滑入 | 本轮新增，未观察 |
-| 15 | WiFi 关联 | 扫描列表 → 输入密码 → 状态栏显示 dBm | **需要凭据** |
-| 16 | 浏览器待办页 | `http://todohelper.local/` 双向同步 | 需要 WiFi |
-| 17 | 501/404 契约 | `/ws/events` → **501**；`/api/v1/nope` → **404** | 需要 WiFi |
-| 18 | 天气 IP 定位 | 无城市时自动定位，`/api/v1/weather` 有温度 | 需要 WiFi |
-| 19 | 日历 SNTP | 状态栏时钟开始走 | 需要 WiFi |
-| 20 | 单词 | 翻卡 + 三档评分 + 进度写入 | 可离线验证 |
-| 21 | 设置页 | 亮度滑杆真的改变暗度；token 后写操作需鉴权 | 可离线验证 |
-| 22 | AI 对话 | 配 Key 后 `/api/v1/ai/chat` 有回复 | 需要凭据 |
-| 23 | 内存稳定性 | 跑 10 分钟 `free_heap` 不持续下降 | `/api/v1/device/status` |
-| 24 | 重启 | `POST /api/v1/device/reboot` 后 WiFi 免配、待办仍在 | 需要 WiFi |
-
-### 5.3 最可能出问题的地方
-
-首轮上机的头号风险（FreeType 字体、渲染栈、内部 RAM、SD mkdir）**已被证实并修复**，
-详见 `AGENT.md` §9.0。**现在剩下的风险按大小排序**：
-
-1. **AI 请求时的 TLS 缓冲** —— boot 结束内部 RAM 最大连续块 74 KB，而 mbedtls 的
-   SSL in/out 缓冲默认各 16 KB。若首次 `POST /api/v1/ai/chat` 报 `ESP_ERR_NO_MEM` 或
-   握手失败，就调小 `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN`/`OUT_CONTENT_LEN`，
-   或开 `CONFIG_MBEDTLS_DYNAMIC_BUFFER`。**这是目前最值得优先实测的一项。**
-2. **`ui_settings` 的滑杆读数** —— 用 `lv_obj_set_user_data` + 共享 250 ms 定时器刷新，
-   逻辑上没问题但没跑过；若数值不刷新，改成每个滑杆自己的 `VALUE_CHANGED` 回调。
-3. **触摸命中区域** —— 页面是 flex 布局，控件位置靠推演，第一次点可能发现偏差。
-4. **`idle_face` 的 X 眼几何** —— 用文件作用域静态点数组，眼形切换时与椭圆是否对齐未验证。
-5. **录音重采样边界** —— 48k 立体声下混 + 3 倍抽取到 16k，缓冲边界未实测
-   （`mic=1` 只证明 I2S 通道开起来了）。
+| 1 | 修复待办无法同步 | ✅ **结论：不是同步的问题** | 端到端实测通的：`POST /api/v1/todos`→201→设备串口 `TH:todo: added #2`；`todo_manager.c:183-190` 同时发 `TODO_EVENT_LIST_CHANGED`（设备页刷新）与 `sys_notify("todo_changed")`（SSE 推网页）。用户遇到的"无法同步"是**设备从 PC 不可达** —— Windows 移动热点的间歇性丢包（实测：设备自称 `connected rssi=-33` 而 PC 同时 100% 丢包，本地 RTT 112 ms）。建议用 IP 而非 mDNS、关掉 WLAN 网卡"允许关闭以省电"、或换手机热点 |
+| 2a | 待机眼睛动画（只眼睛/无嘴巴/零位图） | ✅ 已实现，**待你目视确认** | 交叉淡入(180/420ms smoothstep)、随机眨眼 2.6~7.5s/110~165ms 且 18% 连眨、左右看 4~12s、微扫视 1.8~5.2s、呼吸 12~19s 重抽；约 +230B 静态内存、零新对象、单 `lv_timer`。**修掉一个真 bug**：`tick_behaviour()` 曾被编译器报 unused，而眨眼/扫视/微扫视的**全部触发逻辑**和临时表情到期恢复都只在它里面 —— 即那张脸原本**根本不会自己眨眼**、`idle_face_express()` 的表情**永不结束**。已把它接回 `idle_face_tick()`（且必须在 `effective_state()` 之前调用）。**待上机确认**：`idle_face_standby_exit()` 的 700ms 睁眼几乎看不见 —— `ui_core` 在 `on_hide()` 后立刻给页面容器加 `LV_OBJ_FLAG_HIDDEN` |
+| 2b | 单词书 cet4→cet6 | ✅ **已端到端验证** | 卡上 `F:\todohelper\words\cet6.json` 与仓库 `assets/words/cet6.json`，**833 条**/120311 字节/sha256 一致。真机日志：`loaded 833 words from 'words/cet6.json'`、`ready (book 'cet6', 833 words, 10/day)`、HTTP `words/stats`→`book=cet6 total=833`。**注意：833 条是自编精选子集，不是官方约 2000 词表**。`WORD_DEFAULT_BOOK` 已改为 `cet6`；**已存在的设备必须 `POST /api/v1/words/config {"book":"cet6"}` 才会切**（NVS 存的是书名）。顺带修了 `progress_key()` 未按书名命名空间（裸 `w<id>` 会让 CET4 进度套到 CET6 前 32 词），现为 `<book>#w<id>` |
+| 3 | SD 卡资源 | ✅ | 六级词库已上卡；字体 `ui_cjk.ttf` 本就在卡上；**待机动画是程序化绘制，不需要任何图片** |
+| 4 | 设备端待办逻辑 | ✅ **按用户最终确认实现** | 用户中途澄清：设备端**保留"勾选完成 + 删除"**，只是不能新增（新增/编辑要中文输入，本板无 IME）。已加回 `row_toggle_cb`（失败回滚勾选状态，不让 UI 撒谎）与行尾 52×34「删除」按钮；**新增浮层与软键盘保持移除**；详情页只读；提示语「此页可勾选完成 / 删除 \| 新增请到电脑网页端」 |
+| 5 | 优化网页上位机 | ✅ 主体完成 | `components/sync_server/web/index.html` 重写为 1214 行/54KB，纯原生 JS + 内联 CSS、**零外部资源**。SSE 实时（无 token 用 `EventSource`；有 token 改用 `fetch`+`ReadableStream` 以便带 `X-Auth-Token`）、指数退避重连 + 断开降级 15s 轮询、`pagehide` 关流释放设备仅有的 5 个 socket、增删改查失败**回滚 UI 不假装成功**、筛选/搜索、设备状态面板、离线/401/501 分类错误横幅。**未做**：WiFi 配置面板（子 agent 被中断，只留下页头注释，无 DOM/无函数） |
+| 6 | 开机屏幕滚动启动日志 | ✅ 已实现，**待你目视确认** | `sys_log` 新增无锁 64×80 环形缓冲（seqlock 发布、PSRAM 分配+内部 RAM 兜底、serial 路径不变）；`page_splash.c` 用 `lv_timer` 刷新并 tail 最新行。`main/app_main.c` 改为固定 3s 延迟（用户要求）后切 HOME |
+| 7 | 时刻更新 harness 待办 | ✅ | 各轮均同步维护 |
+| 8 | 子 agent + 文档 + git | ✅ | 用了 8 个子 agent 分工；构建 0 错误 0 警告；文档已同步；全部提交见 §6 |
 
 ---
 
-## 6. 已知风险与不确定点（诚实清单）
+## 4. 只有"人"能完成的验证（AI 做不了）
 
-- **联网相关功能全部未验证**（WiFi 关联、HTTP 全链路、天气、SNTP、AI）——这是当前
-  最大的未知面，因为它们的代码路径从未真正执行过。
-- **触摸/按键/待机链路未验证** —— 屏幕能显示、能渲染，但输入侧一次都没试过。
-- **AI 首次调用的内部 RAM 是否够** —— 见 §5.3 第 1 条。TLS 会话要 16~32 KB 内部 RAM，
-  而最大连续块 74 KB，理论上够但没验证过；同理 `esp_http_client` 的缓冲。
-- **天气 IP 定位端点**（ipapi.co）免费额度有限，返回字段依赖第三方；已做成可配置且
-  解析器兼容 `latitude/lat`、`longitude/lon/lng` 两种拼写。
-- **`voice_service` 的 ASR/TTS** 只定义了协议（ASR 收 raw PCM 回 `{"text":...}`；
-  TTS 收 `{"text":...}` 回 `audio/pcm`），**没有对任何真实服务验证过**。
-- **看门狗策略**：`CONFIG_ESP_TASK_WDT_TIMEOUT_S=5`。已刻意避免在 LVGL 任务里做网络/
-  阻塞 IO（天气/语音/AI 都在自己的任务里）。首轮上机出现过的唯一一次看门狗已定位为
-  "`app_main` 未持 LVGL 锁"并修复（`AGENT.md` §9.0.1）。
-- **`sys_log_set_level()` 会把 `wifi`/`phy`/`pp`/`net80211` 压到 ERROR** —— 这是刻意的
-  （每条 PHY 速率都打一行 W 级日志，十几行淹没应用日志）。要抓 WiFi 详细日志时，
-  临时把 `sys_log.c` 里 `quiet[]` 的对应 TAG 摘掉。
-- **app 分区余量 50%**：OTA 需要额外分区，届时要重新规划 `partitions.csv`
-  （当前 `factory` 8 MB + `storage` 2 MB + `assets` 5.9 MB ≈ 15.9 MB 已用满 16 MB flash）。
-- **字体写入是首次启动的一次性成本**：约 1~2 秒写 1.2 MB 到 SD。若换更慢的卡可能更久；
-  日志会打印耗时。想避免就预先手动把 TTF 放到 `fonts/ui_cjk.ttf`。
+1. **待机动画**：待机时是否**保持睁眼并按时眨眼/扫视**（这正是修 bug 的地方）、进出待机是否平滑。
+2. **开机日志**：3 秒内日志是否顺畅滚动、是否卡启动。
+3. **待办页**：勾选完成/删除按钮的观感与误触率（删除按钮 52×34，放在行尾）。
+4. **网页**：SSE 实时联动、离线/401 横幅、移动端布局。
+5. 若要继续做 WiFi 面板：先在浏览器确认 `/api/v1/wifi/status` 能返回（设备端 7 条路由都已注册，实测 GET 返回 200）。
 
 ---
 
-## 7. 推荐的下一步顺序
+## 5. 容易踩的坑（这些是我实际踩过的，别再踩）
 
-1. **上机验证**（§5 清单），修运行期问题。预计这是收益最大的一步。
-2. **落实 §3.1 的 9 个决策**（尤其 SD/NAND、麦克风/喇叭、ASR/TTS 选型）。
-3. **文档收尾**：把 §3.3 的偏离回改进需求文档；补 `voice_service/README.md`。
-4. **P2 剩余**：MQTT/云同步、OTA、提醒与日程联动、词库替换为真实 CET4/CET6。
-5. （可选）**把 `ui_pages` 的中文输入问题绕过**：例如接入蓝牙键盘或做一个拼音候选条——
-   但这属于新增需求，需先与用户确认。
-
----
-
-## 8. 命令与验证速查
-
-```powershell
-# 构建 / 烧录 / 监视
-. C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
-cd D:\project\ESP-IDFv6.1\ToDoHelper
-idf.py build
-idf.py -p COM34 flash monitor
-
-# 改素材或组件后
-idf.py reconfigure ; idf.py build
-
-# 从零复现（会清 NVS 配置）
-idf.py fullclean
-patch -p1 < patches/esp_lvgl_adapter_idf61_support.patch
-idf.py build
-
-# 重新生成内嵌中文字体
-& 'C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe' tools\gen_cjk_font.py
-```
-
-```powershell
-# HTTP 冒烟测试（把 <dev> 换成设备 IP 或 todohelper.local）
-curl.exe http://<dev>/api/v1/device/info
-curl.exe http://<dev>/api/v1/todos
-curl.exe -X POST http://<dev>/api/v1/todos -H "Content-Type: application/json" -d "{\"title\":\"test\"}"
-curl.exe -X POST http://<dev>/api/v1/sync
-curl.exe -i http://<dev>/ws/events          # 期望 501
-curl.exe -i http://<dev>/api/v1/nope        # 期望 404
-curl.exe http://<dev>/api/v1/weather
-curl.exe -X POST http://<dev>/api/v1/weather/locate
-curl.exe http://<dev>/api/v1/voice/status
-```
-
-**验收判据**（需求 §15）：功能 10 条 + 健壮性 6 条 + `idf.py build` 出现
-`Project build complete.`；烧录每个镜像后 `Hash of data verified.`，
-结尾 `Hard resetting via RTS pin...` + `Done`。
+1. **子 agent 的自述不能当验收。** 本轮 8 个子 agent 里有 3 个的自述与事实不符：
+   - 一个声称动画完成、还声称 `-fsyntax-only` 零诊断，但它的触发层函数**从未被调用**（那张脸不会眨眼）；
+   - 一个报告 `/api/v1/wifi/*` 未注册（404），实测**有 7 条路由且返回 200**；
+   - 一个交回的是**页头注释**而非它声称的面板。
+   → **验收必须自己 grep/读代码/上机**，`编译通过 ≠ 被调用`。
+2. **不要让子 agent 构建或烧录。** `build/` 目录和 COM34 都只有一个，并行 `idf.py build` 会互相
+   破坏。让它们只改文件，构建/烧录由你统一做。
+3. **解析 panic 栈时的 addr2line 陷阱**：不要用 `-pfiaC` 然后"两行一取" —— 遇到内联函数时
+   每个地址会输出多行，配对会**静默错位**（我第一次就是这么读错的）。正确做法：**逐个地址
+   单独调用** `addr2line -f -C -e build\todohelper.elf 0x...`。
+4. **`-Werror` 很严**：`format-truncation`（缓冲区要留够，例如 `char key[48]` 存 `"<book>#w<id>"`）、
+   `unused-function`、隐式声明都会让构建失败。**但注意 `unused-function` 只是警告**（构建仍过），
+   所以它会掩盖"函数根本没被调用"这类真 bug —— 看到这类警告**要查语义，不要直接删**。
+5. **设备从 PC 不可达 ≠ 代码错**。先 `ping` + 看设备自报的 `link:` 日志；Windows 热点会间歇性丢包
+   （ARP 缓存/网卡省电）。`arp -d` 需要提权。
+6. **换存储介质会"丢数据"观感**：存储根在 `/littlefs` 与 `/sdcard` 之间切换时，待办数据文件也
+   跟着换位置（无卡时建的待办插卡后看不见）。这是设计使然，但用户会当成 bug。
+7. **字体**：LVGL v9 的 FreeType **不能**用内存字体，必须从文件路径加载（现在是
+   `/sdcard/todohelper/fonts/ui_cjk.ttf`）；无卡时回退片内字库（约 2500 字，生僻字会方框）。
+   字库已从 app 里移出（镜像 4.16MB→2.94MB，烧录 43.6s→31.6s）；要恢复内嵌需**同时**改
+   `ui_core/CMakeLists.txt` 与 `ui_fonts.c` 两半，否则链接失败。
+8. 更完整的坑位清单（内部 RAM 最紧处、PSRAM 栈不能碰 flash、日志格式陷阱、
+   `esp_log_writev` 原样输出、PHY 需 30KB 连续块……）全部在 **`AGENT.md §9.0 ~ §9.0.5**。
 
 ---
 
-## 9. 交接检查单（接手者勾一遍）
+## 6. 提交记录（最新在前）
 
-- [ ] 读完 `AGENT.md`（环境/命令/两条不可删配置/两个坑）
-- [ ] 读完 `docs/TODOHELPER_FRAMEWORK.md` §2（分层）与 §7（扩展点）
-- [ ] 能独立跑通 `idf.py build`，认得 `Project build complete.`
-- [ ] 知道 `sdkconfig` 是生成物（改默认值要改 `sdkconfig.defaults` 并删 `sdkconfig`）
-- [ ] 知道 `managed_components/` 重新下载后**必须重新打 patch**
-- [ ] 知道 `assets/ui/` **必须扁平**、字体走 `EMBED_FILES`
-- [ ] 知道 **无 RTC / 无 GPS / 无传感器** 三条硬件前提
-- [ ] 知道 `sys_time_ts()` 未同步返回 0，UI 不得显示 1970
-- [ ] 按 §5 清单完成了首次上机验证，并把结果回填到本文档
-- [ ] 从 §3.1 挑了下一项决策，或已向用户提问
+| commit | 内容 |
+|---|---|
+| `e365448` | `AGENT.md 9.0.5`：把启动崩溃定位到 crypto 锁惰性初始化竞态 |
+| `2dfa7b7` | 开机日志改为固定 3 秒延迟 + 恢复原启动时序 + 崩溃实测数据 |
+| `e126c31` | 设备端待办：保留勾选完成 + 删除，仅新增留给网页 |
+| `561a591` | 第二轮收尾：待机动画、cet6 词库、设备端只读、网页上位机、开机滚动日志 |
+| `1ae576d` | `AGENT.md 9.7` 更新 + 目标项 2 验收证据 |
+| `0397874` | 删除天气页残留的不可达输入浮层代码 |
+| `162ba2d` | 字库移出 app：镜像 4.16MB→2.94MB，烧录 43.6s→31.6s |
+
+> 交接时工作区应当是**干净**的。若 `git status` 有改动，先判断是不是构建产物。
+
+---
+
+## 7. 建议的接手顺序
+
+1. **验完 §2 的崩溃修复**（这是唯一阻塞项，且已有明确假设与可复现判据）。
+2. 请用户做 §4 的四项目视确认，按反馈微调（动画/日志时长/按钮尺寸都是单个 `#define` 或一行）。
+3. 若要继续加功能：**网页 WiFi 配置面板**是性价比最高的一项 —— 设备端输 WiFi 密码体验很差
+   （480px 屏、无 IME），而 `/api/v1/wifi/*` 7 条路由都已就绪。先读
+   `components/wifi_manager/src/wifi_manager_http.c`（266-272 行是路由表）确认真实报文格式，
+   再照 `index.html` 现有的请求漏斗与样式写，**不要**另起一套。
+4. 若用户反馈"插拔卡数据丢失"不可接受：把待办存储固定在片内存储，只把词库/字体放卡上
+   （需要看 `storage_manager` 的根选择逻辑）。
+
+---
+
+## 8. 关键文件索引
+
+| 关注点 | 文件 |
+|---|---|
+| 环境/命令/全部实测坑 | `AGENT.md`（**§9.0 起必读**，§9.0.5 = 崩溃，§9.7 = 剩余待办） |
+| 启动流程与这次修复 | `main/app_main.c` |
+| 待办页面（设备端） | `components/ui_pages/src/page_todo.c` |
+| 待机动画 | `components/idle_face/src/idle_face.c`（`tick_behaviour()` 必须被调用！） |
+| 开机日志缓冲 | `components/sys_utils/src/sys_log.c`、`include/sys_log.h` |
+| 开机日志页面 | `components/ui_pages/src/page_splash.c` |
+| 词库与进度 | `components/word_service/src/word_service.c`（`progress_key()`、`parse_book()`） |
+| HTTP 路由总览 | `docs/API.md` |
+| 网页上位机 | `components/sync_server/web/index.html` |

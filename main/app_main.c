@@ -186,6 +186,48 @@ void app_main(void)
      * abort() (newlib lazy lock race, see AGENT.md 9.0.5), so the original ordering
      * is restored and the readability is bought with a plain delay instead.
      */
+
+    /*
+     * Linearise the crypto peripheral locks BEFORE anything concurrent can touch them.
+     *
+     * IDF's esp_security keeps these as zero-initialised static `_lock_t`s and relies
+     * on newlib's lazy lock init, which is "check then initialise" with no guard:
+     * when two contexts (here the WiFi WPA2 supplicant and the tick hook) call
+     * _lock_acquire() on the same lock for the first time, the second one hits
+     * `assert(lock->owner == LOCK_FREE)` in lock_init_generic() and the device
+     * aborts, reboots and loops. Acquiring and releasing each lock here - while
+     * app_main is the only context running - initialises them once and for all.
+     *
+     * See AGENT.md 9.0.5: the panic was resolved to esp_crypto_lock.c and this is
+     * the fix for it. The empty stubs IDF provides for unsupported peripherals make
+     * every one of these calls safe (and linkable) on any target, which is why they
+     * are declared here instead of pulling esp_security into main's REQUIRES.
+     */
+    extern void esp_crypto_sha_aes_lock_acquire(void);
+    extern void esp_crypto_sha_aes_lock_release(void);
+    extern void esp_crypto_hmac_lock_acquire(void);
+    extern void esp_crypto_hmac_lock_release(void);
+    /* NOTE: esp_crypto_dma_lock_{acquire,release} is *declared* in esp_crypto_lock.h
+     * but has no implementation on this target - calling it fails to link. Only use
+     * pairs that the linker has confirmed (see git log for the failure). */
+    extern void esp_crypto_mpi_lock_acquire(void);
+    extern void esp_crypto_mpi_lock_release(void);
+    extern void esp_crypto_ecc_lock_acquire(void);
+    extern void esp_crypto_ecc_lock_release(void);
+    extern void esp_crypto_ecdsa_lock_acquire(void);
+    extern void esp_crypto_ecdsa_lock_release(void);
+
+    esp_crypto_sha_aes_lock_acquire();
+    esp_crypto_sha_aes_lock_release();
+    esp_crypto_hmac_lock_acquire();
+    esp_crypto_hmac_lock_release();
+    esp_crypto_mpi_lock_acquire();
+    esp_crypto_mpi_lock_release();
+    esp_crypto_ecc_lock_acquire();
+    esp_crypto_ecc_lock_release();
+    esp_crypto_ecdsa_lock_acquire();
+    esp_crypto_ecdsa_lock_release();
+
     ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH));
 
     (void)run_modules(false);
