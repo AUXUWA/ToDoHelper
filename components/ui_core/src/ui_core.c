@@ -335,13 +335,28 @@ static lv_obj_t *page_container_create(lv_obj_t *parent)
  * are applied through *styles* rather than lv_obj_set_x(): page containers are
  * flex children, so the next layout pass would immediately overwrite a plain
  * position.
+ *
+ * A switch is a **cross-fade**, not a cut: the incoming page is moved to the
+ * foreground and slides+fades in while the outgoing page fades out and drifts up
+ * underneath it, and the outgoing container is hidden only when its animation
+ * finishes. This used to hide it in the same frame, which (a) made the boot-log
+ * -> home hand-off an abrupt swap between two full-screen pages and (b) cut every
+ * exit animation off before its first frame - the idle face's wake-up widening
+ * (idle_face_standby_exit()) was never visible at all.
  */
-#define UI_PAGE_ANIM_MS     200
-#define UI_PAGE_ANIM_OFFSET 56
+#define UI_PAGE_ANIM_MS         220
+#define UI_PAGE_ANIM_OFFSET     28
+#define UI_PAGE_ANIM_OUT_MS     240
+#define UI_PAGE_ANIM_OUT_OFFSET (-16)
 
 static void page_anim_translate_cb(void *obj, int32_t value)
 {
     lv_obj_set_style_translate_x((lv_obj_t *)obj, value, 0);
+}
+
+static void page_anim_drift_cb(void *obj, int32_t value)
+{
+    lv_obj_set_style_translate_y((lv_obj_t *)obj, value, 0);
 }
 
 static void page_anim_opa_cb(void *obj, int32_t value)
@@ -349,11 +364,40 @@ static void page_anim_opa_cb(void *obj, int32_t value)
     lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
 }
 
+/**
+ * Hide a page once its exit animation is done, and put it back to its neutral
+ * look so that showing it again starts from a clean slate.
+ *
+ * Deliberately only touches styles: it runs from inside LVGL's animation handler,
+ * where deleting animation objects would be a structural change mid-iteration.
+ */
+static void page_anim_out_done(lv_anim_t *anim)
+{
+    lv_obj_t *page = (lv_obj_t *)anim->var;
+    if (page == NULL) {
+        return;
+    }
+    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_translate_y(page, 0, 0);
+    lv_obj_set_style_opa(page, LV_OPA_COVER, 0);
+}
+
+/** Drop whatever animation is on @p page and reset it to the neutral look. */
+static void page_anim_reset(lv_obj_t *page)
+{
+    lv_anim_delete(page, page_anim_translate_cb);
+    lv_anim_delete(page, page_anim_drift_cb);
+    lv_anim_delete(page, page_anim_opa_cb);
+    lv_obj_set_style_translate_x(page, 0, 0);
+    lv_obj_set_style_translate_y(page, 0, 0);
+    lv_obj_set_style_opa(page, LV_OPA_COVER, 0);
+}
+
 static void page_animate_in(lv_obj_t *page)
 {
-    /* Re-entering a page quickly must not stack animations on it. */
-    lv_anim_delete(page, page_anim_translate_cb);
-    lv_anim_delete(page, page_anim_opa_cb);
+    /* Re-entering a page quickly must not stack animations on it (and must cancel
+     * an exit animation that would otherwise hide it again behind our back). */
+    page_anim_reset(page);
 
     lv_anim_t anim;
     lv_anim_init(&anim);
@@ -370,6 +414,37 @@ static void page_animate_in(lv_obj_t *page)
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
     lv_anim_set_exec_cb(&anim, page_anim_opa_cb);
     lv_anim_set_values(&anim, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_start(&anim);
+}
+
+/**
+ * Fade the page we are leaving out and hide it when it is done.
+ *
+ * The container keeps rendering its last frame for UI_PAGE_ANIM_OUT_MS, which is
+ * the window a page gets to finish an exit animation: the idle face widens its
+ * eyes in it (idle_face_standby_exit()), the boot log simply fades away.
+ */
+static void page_animate_out(lv_obj_t *page)
+{
+    lv_anim_delete(page, page_anim_drift_cb);
+    lv_anim_delete(page, page_anim_opa_cb);
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, page);
+    lv_anim_set_duration(&anim, UI_PAGE_ANIM_OUT_MS);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
+    lv_anim_set_exec_cb(&anim, page_anim_drift_cb);
+    lv_anim_set_values(&anim, 0, UI_PAGE_ANIM_OUT_OFFSET);
+    lv_anim_start(&anim);
+
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, page);
+    lv_anim_set_duration(&anim, UI_PAGE_ANIM_OUT_MS);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
+    lv_anim_set_exec_cb(&anim, page_anim_opa_cb);
+    lv_anim_set_values(&anim, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_completed_cb(&anim, page_anim_out_done);
     lv_anim_start(&anim);
 }
 
@@ -397,7 +472,9 @@ static esp_err_t page_switch_locked(ui_page_id_t id)
             cur->desc->on_hide();
         }
         if (cur->container != NULL) {
-            lv_obj_add_flag(cur->container, LV_OBJ_FLAG_HIDDEN);
+            /* Fades out under the incoming page and hides itself when done, so the
+             * switch is a cross-fade and exit animations get their 240 ms. */
+            page_animate_out(cur->container);
         }
         if (cur->tick != NULL) {
             lv_timer_pause(cur->tick);
@@ -426,11 +503,11 @@ static esp_err_t page_switch_locked(ui_page_id_t id)
     }
 
     lv_obj_remove_flag(slot->container, LV_OBJ_FLAG_HIDDEN);
+    /* Foreground first: the cross-fade draws the incoming page *over* the one that
+     * is leaving, so the new content is never dimmed by the old. */
     lv_obj_move_foreground(slot->container);
-    /* Reset the visual state before animating in: a hidden object keeps whatever
-     * transform/opacity a previous animation left behind. */
-    lv_obj_set_style_translate_x(slot->container, 0, 0);
-    lv_obj_set_style_opa(slot->container, LV_OPA_COVER, 0);
+    /* Resets the visual state (a page may still carry the transform/opacity of an
+     * exit animation) and then slides + fades it in. */
     page_animate_in(slot->container);
 
     s_current = id;

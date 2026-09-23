@@ -940,8 +940,8 @@ curl.exe -i http://todohelper.local/ws/events              # 501
 | `esp_err_t idle_face_set_state(idle_face_state_t state);` | 切换表情，任意任务可调 |
 | `idle_face_state_t idle_face_get_state(void);` | 当前表情 |
 | `esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms);` | 临时显示某表情 `duration_ms` 后回到原表情 |
-| `esp_err_t idle_face_standby_enter(void);` | 待机页 `on_show` 调用的钩子。**当前是记账式的：不做闭眼入睡**，待机期间脸部保持 `NORMAL`、交叉淡入/眨眼/扫视/呼吸全部照常跑（见 `AGENT.md` 9.7 为何如此）；非中性脸时返回 `ESP_ERR_INVALID_STATE` 且不打断表情 |
-| `esp_err_t idle_face_standby_exit(void);` | 待机页 `on_hide` 调用的预留钩子。因为待机不再进入 `SLEEPY`，当前恒返回 `ESP_ERR_INVALID_STATE`；且 `ui_core` 在 `on_hide()` 之后立即隐藏页面容器，所以即使启用也只有最初几帧可见 |
+| `esp_err_t idle_face_standby_enter(void);` | 待机页 `on_show` 调用的钩子。**刻意不闭眼入睡**：待机期间脸部保持 `NORMAL` 并重启整套行为时间线（眨眼/注视/自发表情/瞳孔），然后靠"困倦度"自己慢慢沉下去（见下）。活动表情在显示时返回 `ESP_ERR_INVALID_STATE`（不打断它），否则 `ESP_OK` |
+| `esp_err_t idle_face_standby_exit(void);` | 待机页 `on_hide` 调用的钩子：一次约 420 ms 的睁眼过冲（峰值在 ~200 ms），并清掉困倦度与当前自发表情。**可见**是因为 `ui_core` 现在让离场页面淡出 240 ms（`UI_PAGE_ANIM_OUT_MS`）；表情占用脸部时返回 `ESP_ERR_INVALID_STATE` |
 | `esp_err_t idle_face_tick(uint32_t now_ms);` | 推进动画（内部 33 ms 定时器调用；暴露给自建循环的宿主） |
 | `esp_err_t idle_face_set_brightness(uint8_t percent);` | 调暗/恢复；**何时调由 `ui_core` 决定**，本组件只转发 |
 | `bool idle_face_is_attached(void);` | 眼睛是否已建好 |
@@ -955,9 +955,17 @@ curl.exe -i http://todohelper.local/ws/events              # 501
 
 - **表情之间是交叉淡入**：目标状态变化时把当前视觉值冻结为起点，用 `smoothstep` 在
   180 ms（`SPEED_FAST`，眨眼）或 420 ms（其余）内走到目标参数并吸附，**不会跳变**；
-- **随机化**：眨眼 2.6–7.5 s / 110–165 ms 且 18% 连眨、左右看 4–12 s、微扫视 1.8–5.2 s、
-  呼吸周期 12–19 s（每周期重抽）；
-- **待机过场**：进入待机时眼睛缓缓闭上并保持半闭（`SLEEPY`），唤醒时睁眼一次再回 `NORMAL`；
+- **随机化**：眨眼 2.6–7.5 s / 110–165 ms 且 18% 连眨、左右看 4–12 s（22% 会立刻向另一侧再看一眼）、
+  微扫视 1.8–5.2 s、呼吸周期 12–19 s（每周期重抽）；
+- **1.1 新增的四层"慢动作"**（这是"待机时不能看起来像静止图"的关键）：
+  1. **自发表情**：每 13–34 s 随机做一个 320–1100 ms 的表情（SLEEPY/HAPPY/LISTENING/THINKING/SPEAKING），
+     通过正常交叉淡入进出，绝不超过自己的时长；
+  2. **困倦度** 0→1：无人交互时约 2.5 分钟累积（眨眼更密更慢、眼睛缩短 10%、视线下垂 5 px），
+     任何真实交互（表情/唤醒）瞬间清零；自发表情**不清零**（那只是发呆，不是注意）；
+  3. **瞳孔缩放**：5–11 s 重抽一次 0.91–1.14 的缓慢随机游走（LISTENING 再额外放大 6%）；
+  4. **整脸微漂移**：两条不相干频率的正弦（±3 px / ±2 px）合成"轻微转头"，表情占用时缓动归零
+     （这样 ERROR 的 X 线与眼睛始终对齐）；
+- **待机过场**：进入待机**不闭眼**（保持 NORMAL + 上述全部动作），离开待机时睁眼过冲一次再回 `NORMAL`；
 - 过场与切换都只改已有对象的属性，**不分配内存**；动画器是 `lv_timer`，回调天然在 LVGL 任务里，无需加锁。
 
 > 状态定义在三处必须同步：本头文件、`idle_face.c` 的效果表、需求文档 FR6 / §11.2。

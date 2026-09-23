@@ -18,9 +18,13 @@
  *     state to the new table row through an ease curve (never a snap);
  *   - blinking, glancing, pupil drift and breathing are each randomised every
  *     cycle, so nothing repeats on a fixed period;
- *   - entering standby eases the eyes shut (SLEEPY) and leaving it widens them
- *     back open (idle_face_standby_enter/exit, driven by the idle page's
- *     on_show/on_hide).
+ *   - on top of those, three slower layers keep a long standby session alive:
+ *     spontaneous moods (a brief random expression every 13-34 s), pupil
+ *     dilation, whole-face drift, and a drowsiness value that builds up while
+ *     nobody interacts and is wiped out by any real activity;
+ *   - entering standby keeps the live NORMAL face (see
+ *     idle_face_standby_enter()) and leaving it widens the eyes briefly
+ *     (idle_face_standby_exit(), driven by the idle page's on_show/on_hide).
  *
  * State definitions live in exactly three places and must stay in sync:
  *   - idle_face_state_t below,
@@ -66,19 +70,32 @@ typedef enum {
 } idle_face_state_t;
 
 /**
- * @brief Play the standby entry animation (eyes ease shut into SLEEPY).
+ * @brief Standby entry: hand the face over to the standby screen.
  *
- * Called by the idle page's @c on_show, so it runs every time the standby
- * screen is (re-)entered. It refuses to run when a notification expression is
- * live; the caller does not need to check anything.
+ * Called by the idle page's @c on_show, so it runs every time the standby screen
+ * is (re-)entered. It deliberately does **not** ease the eyes shut: the standby
+ * screen is the one place where the face is on display, and freezing it in a
+ * SLEEPY pose suppressed blinking, glancing, saccades and everything else that
+ * makes it look alive. Instead the face stays on its live NORMAL parameters,
+ * restarts its playbook (blink/glance/mood/dilation schedules) and then winds
+ * down on its own through the drowsiness layer.
+ *
+ * Refuses to run (and returns @c ESP_ERR_INVALID_STATE) when a notification or
+ * AI expression is live; the caller does not need to check anything.
  */
 esp_err_t idle_face_standby_enter(void);
 
 /**
- * @brief Play the standby exit animation (eyes widen and settle to NORMAL).
+ * @brief Standby exit: a brief wide-eyed "I am back" before the screen goes away.
  *
- * Called by the idle page's @c on_hide, i.e. when the screen is woken. Returns
- * @c ESP_ERR_INVALID_STATE when the face was not in the standby pose.
+ * Called by the idle page's @c on_hide, i.e. when the screen is woken. Also wipes
+ * the drowsiness and any spontaneous mood, because the user is back.
+ *
+ * Visible only because `ui_core` keeps the outgoing page around for
+ * `UI_PAGE_ANIM_OUT_MS` (240 ms) while it cross-fades to the next page - the
+ * overshoot peak sits at ~200 ms, inside that window. Returns
+ * @c ESP_ERR_INVALID_STATE when an expression owns the face (which must not be
+ * replaced by a yawn).
  */
 esp_err_t idle_face_standby_exit(void);
 

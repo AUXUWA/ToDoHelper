@@ -27,6 +27,13 @@
 - **一个屏幕**：`ui_core` 独自持有 `lv_screen_active()`；每个页面是内容区下的一个全屏容器，
   页面**不得**调用 `lv_screen_load()` / 自己建 screen（需求 §16 第 10 条）。
 - **延迟创建**：页面首次 `ui_page_switch()` 时才 `create()`；之后只切 `LV_OBJ_FLAG_HIDDEN`。
+- **切页是交叉淡入，不是硬切**（1.1 起）：新页面先 `lv_obj_move_foreground()`，然后
+  `translate_x 28→0` + 透明度 0→255（220 ms ease-out）滑入；旧页面同时 `translate_y 0→-16`
+  + 透明度 255→0（240 ms ease-in）淡出，**动画结束才加 `HIDDEN`**。
+  两个后果：① 全屏页面之间的交接（开机日志 → 主界面）不再是一瞬间的跳变；
+  ② 页面**第一次**有了可用的"离场动画窗口"——`idle_face_standby_exit()` 的睁眼过冲
+  正好落在 240 ms 里，以前在同一帧就被隐藏掉，一帧都看不到。
+  离开的页面在窗口内仍会渲染最后一帧（它的 `on_tick` 已经暂停，内容是静止的）。
 - **`on_tick` 只在页面可见时运行**，周期由 `tick_period_ms` 决定。
 - 未注册的页面 id：`ui_page_switch()` 返回 `ESP_ERR_NOT_FOUND` 并告警，不崩溃。
 

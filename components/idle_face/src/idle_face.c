@@ -88,8 +88,63 @@ ESP_EVENT_DEFINE_BASE(IDLE_FACE_EVENT);
 
 /** Standby enter (eyes droop shut) / exit (eyes widen and settle). */
 #define IDLE_FACE_SLEEP_MS           950
-#define IDLE_FACE_WAKE_MS            700
+#define IDLE_FACE_WAKE_MS            420
 #define IDLE_FACE_WAKE_OVERSHOOT     0.12f
+
+/*
+ * Richer idle behaviour (1.1).
+ *
+ * The face used to do four things: blink, glance, drift its pupils a little and
+ * breathe. That is enough to look alive for a few seconds and repetitive after a
+ * minute, which is exactly how long the standby screen stays up. Three more
+ * layers fix that, all of them additive and all of them bounded:
+ *
+ *   1. spontaneous moods (s_antic_*) - a brief, random expression every 13-34 s;
+ *   2. drowsiness (s_drowsy) - the longer nobody interacts, the shorter and
+ *      more frequent the blinks, the droopier the gaze; any real interaction
+ *      (an expression, waking up) wipes it out instantly;
+ *   3. pupil dilation + whole-face drift - slow random walks that make the eye
+ *      look alive rather than drawn.
+ */
+
+/** Spontaneous mood: how often, and how long one lasts. */
+#define IDLE_FACE_ANTIC_MIN_MS          13000
+#define IDLE_FACE_ANTIC_MAX_MS          34000
+#define IDLE_FACE_ANTIC_HOLD_MIN_MS     320
+#define IDLE_FACE_ANTIC_HOLD_MAX_MS     900
+#define IDLE_FACE_ANTIC_LONG_MIN_MS     600   /**< for the slower moods (SLEEPY/THINKING) */
+#define IDLE_FACE_ANTIC_LONG_MAX_MS     1100
+
+/** Pupil dilation: slow random walk between constricted and dilated. */
+#define IDLE_FACE_DILATE_MIN_MS         5000
+#define IDLE_FACE_DILATE_MAX_MS         11000
+#define IDLE_FACE_DILATE_GAIN           0.05f
+#define IDLE_FACE_PUPIL_WIDE_MIN        1.05f
+#define IDLE_FACE_PUPIL_NARROW_MIN      0.91f
+
+/** Whole-face drift: two slow sines (irrational ratio) read as head movement. */
+#define IDLE_FACE_DRIFT_X_PX            3.0f
+#define IDLE_FACE_DRIFT_Y_PX            2.0f
+#define IDLE_FACE_DRIFT_GAIN            0.05f
+
+/** Drowsiness: 0 -> 1 while nothing happens, wiped out by activity. */
+#define IDLE_FACE_DROWSY_RISE_MS        150000  /**< fully drowsy after 2.5 minutes */
+#define IDLE_FACE_DROWSY_FALL_MS        3000
+#define IDLE_FACE_DROWSY_OPEN           0.10f   /**< eyes end up 10% shorter */
+#define IDLE_FACE_DROWSY_EYE_DY         5.0f    /**< and look 5 px lower */
+#define IDLE_FACE_DROWSY_BLINK_SPEEDUP  0.35f   /**< blink intervals shrink by up to 35% */
+#define IDLE_FACE_DROWSY_BLINK_LONGER   0.60f   /**< blink durations grow by up to 60% */
+
+/** Partial (squint) blink: the eyelid only comes part of the way down. */
+#define IDLE_FACE_BLINK_PARTIAL_PCT     28
+#define IDLE_FACE_BLINK_PARTIAL_MIN     0.40f
+#define IDLE_FACE_BLINK_PARTIAL_SPAN    0.22f
+/** The rare slow blink of someone reading or tired. */
+#define IDLE_FACE_BLINK_SLOW_PCT        9
+#define IDLE_FACE_BLINK_SLOW_MIN_MS     240
+#define IDLE_FACE_BLINK_SLOW_MAX_MS     380
+/** Chance that a glance is immediately followed by one to the other side. */
+#define IDLE_FACE_LOOK_DOUBLE_PCT       22
 
 /* ------------------------------------------------------------------------ */
 /* Effect table (requirement 11.2)                                           */
@@ -192,6 +247,21 @@ static uint32_t s_saccade_hold_ms;
 static uint32_t s_saccade_from_ms;
 static float s_saccade_dx;
 static float s_saccade_dy;
+
+/* spontaneous idle moods (1.1): a brief random expression of its own */
+static bool s_antic_active;
+static idle_face_state_t s_antic_state = IDLE_FACE_NORMAL;
+static uint32_t s_antic_until_ms;
+static uint32_t s_next_antic_ms;
+
+/* longer-term liveliness: dilation, head drift, drowsiness */
+static float s_pupil_scale = 1.0f;
+static float s_pupil_scale_target = 1.0f;
+static uint32_t s_next_dilate_ms;
+static float s_drift_x;
+static float s_drift_y;
+static float s_blink_depth = 1.0f;   /**< 1 = full blink, < 1 = squint */
+static float s_drowsy;               /**< 0 = alert, 1 = about to nod off */
 
 /* standby enter/exit envelope (see idle_face_standby_enter/exit) */
 static uint32_t s_motion_from_ms;
@@ -370,6 +440,13 @@ static void apply_params(uint32_t now)
     const float breath =
         1.0f + (IDLE_FACE_BREATH_AMP * motion_env(now)) * sinf(breath_phase * 2.0f * (float)M_PI);
     float open = s_current.open * breath * motion_env(now) + wake_env(now);
+
+    /* Drowsiness shortens the eye; a partial blink then only closes it part of
+     * the way, which is what turns a mechanical shutter into a squint. */
+    open *= 1.0f - (IDLE_FACE_DROWSY_OPEN * s_drowsy);
+    if (state == IDLE_FACE_BLINK && s_blink_depth < 0.999f) {
+        open = 1.0f - (1.0f - open) * s_blink_depth;
+    }
     open = clampf(open, 0.04f, 1.6f);
 
     const int32_t eye_h = (int32_t)((float)s_eye_base_h * open);
@@ -380,6 +457,12 @@ static void apply_params(uint32_t now)
     const bool arc_mode = !cross_mode && s_current.arc > 0.5f;
     const float pupil_fade = sqrtf(clampf(open, 0.0f, 1.0f));
 
+    /* Whole-face drift and the drowsy droop move both eyes (and the X strokes,
+     * which are aligned here as well so they stay in register) together. */
+    const int32_t face_x = (int32_t)s_drift_x;
+    const int32_t face_y =
+        (int32_t)(s_current.eye_dy + (IDLE_FACE_DROWSY_EYE_DY * s_drowsy) + s_drift_y);
+
     for (int i = 0; i < 2; i++) {
         lv_obj_t *eye = s_face.eye[i];
         lv_obj_t *pupil = s_face.pupil[i];
@@ -387,11 +470,11 @@ static void apply_params(uint32_t now)
             continue;
         }
 
+        const int32_t eye_x = (i == 0) ? -(int32_t)(s_eye_gap / 2 + s_eye_base_w / 2)
+                                       : (int32_t)(s_eye_gap / 2 + s_eye_base_w / 2);
+
         lv_obj_set_size(eye, eye_w, arc_mode ? eye_h / 2 : eye_h);
-        lv_obj_align(eye, LV_ALIGN_CENTER,
-                     (i == 0) ? -(int32_t)(s_eye_gap / 2 + s_eye_base_w / 2)
-                              : (int32_t)(s_eye_gap / 2 + s_eye_base_w / 2),
-                     (int32_t)s_current.eye_dy);
+        lv_obj_align(eye, LV_ALIGN_CENTER, eye_x + face_x, face_y);
 
         lv_obj_set_style_border_width(eye, border, 0);
         lv_obj_set_style_border_opa(eye, cross_mode ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
@@ -402,7 +485,12 @@ static void apply_params(uint32_t now)
 
         /* Pupil: kept inside the eye and shifted by dx/dy. */
         if (pupil != NULL) {
-            const int32_t pupil_size = (int32_t)(eye_h * 0.34f);
+            /* Dilation + a little extra when the face is paying attention. */
+            float scale = s_pupil_scale;
+            if (state == IDLE_FACE_LISTENING) {
+                scale *= 1.06f;
+            }
+            const int32_t pupil_size = (int32_t)((float)eye_h * 0.34f * scale);
             const int32_t travel_x = (eye_w - pupil_size) / 2 - border;
             const int32_t travel_y = (eye_h - pupil_size) / 2 - border;
 
@@ -447,6 +535,7 @@ static void apply_params(uint32_t now)
             }
             lv_obj_set_style_line_opa(line, cross_mode ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
             lv_obj_set_style_line_width(line, border, 0);
+            lv_obj_align(line, LV_ALIGN_CENTER, eye_x + face_x, face_y);
         }
     }
 }
@@ -455,9 +544,28 @@ static void apply_params(uint32_t now)
 /* Auto behaviour                                                            */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Blink interval. Drowsiness shortens it (tired eyes blink more often), which is
+ * the effect that makes a long standby session feel like it winds down.
+ */
 static void schedule_next_blink(uint32_t now)
 {
-    s_next_blink_ms = now + rand_between(IDLE_FACE_BLINK_MIN_MS, IDLE_FACE_BLINK_MAX_MS);
+    const uint32_t span = IDLE_FACE_BLINK_MAX_MS - IDLE_FACE_BLINK_MIN_MS;
+    const uint32_t shrink =
+        (uint32_t)((float)span * IDLE_FACE_DROWSY_BLINK_SPEEDUP * s_drowsy);
+    const uint32_t hi = (shrink < span) ? (IDLE_FACE_BLINK_MAX_MS - shrink)
+                                        : IDLE_FACE_BLINK_MIN_MS;
+    s_next_blink_ms = now + rand_between(IDLE_FACE_BLINK_MIN_MS, hi);
+}
+
+static void schedule_next_antic(uint32_t now)
+{
+    s_next_antic_ms = now + rand_between(IDLE_FACE_ANTIC_MIN_MS, IDLE_FACE_ANTIC_MAX_MS);
+}
+
+static void schedule_next_dilate(uint32_t now)
+{
+    s_next_dilate_ms = now + rand_between(IDLE_FACE_DILATE_MIN_MS, IDLE_FACE_DILATE_MAX_MS);
 }
 
 static void schedule_next_look(uint32_t now)
@@ -473,30 +581,99 @@ static void schedule_next_saccade(uint32_t now)
 /**
  * Blinking, glancing and pupil drift only make sense for the plain idle
  * expression: an ERROR or THINKING face must not blink itself back to neutral.
- * The standby pose (SLEEPY) is excluded on purpose - it is reached by falling
- * asleep, and it stays that way until the screen is woken.
+ * A deliberately requested SLEEPY face (notification trigger or AI state) is
+ * excluded for the same reason - it means something, so it must not be blinked
+ * away. Standby itself does *not* use SLEEPY any more (see standby_enter): it
+ * keeps NORMAL and lets all of this keep running.
  */
 static bool state_allows_idle_antics(idle_face_state_t state)
 {
     return state == IDLE_FACE_NORMAL;
 }
 
-static void tick_behaviour(uint32_t now)
+/**
+ * Drop a temporary expression whose time is up.
+ *
+ * Shared by the animator tick and the standby hand-over on purpose: the animator
+ * timer only starts when the idle page is created, so the *first* hand-over can
+ * still see an override that expired minutes ago (measured on hardware: a 2.5 s
+ * `wifi_connected` expression from t=7.7 s was still flagged active at t=82 s,
+ * which made the first standby entry silently refuse). Expiring it here as well
+ * makes the hand-over independent of whether a tick has run yet.
+ */
+static void override_expire_due(uint32_t now)
 {
-    if (s_override_active && now >= s_override_until_ms) {
-        s_override_active = false;
-        const idle_face_state_t restore = s_state_before_override;
-        if (restore != s_state) {
-            s_state = restore;
-            (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
-                                    &s_state, sizeof(s_state));
-        }
+    if (!s_override_active || (int32_t)(now - s_override_until_ms) < 0) {
+        return;
     }
 
-    const idle_face_state_t base = s_override_active ? s_override_state : s_state;
+    s_override_active = false;
+    const idle_face_state_t restore = s_state_before_override;
+    if (restore != s_state) {
+        s_state = restore;
+        (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
+                                &s_state, sizeof(s_state));
+    }
+}
 
-    if (!state_allows_idle_antics(base)) {
-        /* Let a glance that is already in flight settle back to centre. */
+/**
+ * Start a spontaneous idle mood: a short, random expression with no reason
+ * behind it, which is what an otherwise perfectly regular face lacks.
+ *
+ * The table is the whole "personality": repetition is the weighting, so the two
+ * human-looking moods dominate and the rest are seasoning. Every mood is short,
+ * every mood cross-fades in and out through the normal machinery, and none of
+ * them can outlive its hold (tick_behaviour drops it on a timer).
+ */
+static void start_antic(uint32_t now)
+{
+    static const idle_face_state_t moods[] = {
+        IDLE_FACE_HAPPY,      /* squint-smile */
+        IDLE_FACE_HAPPY,
+        IDLE_FACE_SLEEPY,     /* lazy half-close */
+        IDLE_FACE_LISTENING,  /* a moment of attention: eyes widen */
+        IDLE_FACE_THINKING,   /* glance up, as if recalling something */
+        IDLE_FACE_SPEAKING,   /* tiny arc pulse, the mouth-free mumble */
+    };
+
+    const idle_face_state_t mood = moods[esp_random() % (sizeof(moods) / sizeof(moods[0]))];
+
+    uint32_t hold;
+    if (mood == IDLE_FACE_SLEEPY || mood == IDLE_FACE_THINKING) {
+        hold = rand_between(IDLE_FACE_ANTIC_LONG_MIN_MS, IDLE_FACE_ANTIC_LONG_MAX_MS);
+    } else {
+        hold = rand_between(IDLE_FACE_ANTIC_HOLD_MIN_MS, IDLE_FACE_ANTIC_HOLD_MAX_MS);
+    }
+
+    s_antic_active = true;
+    s_antic_state = mood;
+    s_antic_until_ms = now + hold;
+    schedule_next_antic(now + hold);
+
+    SYS_LOGD(TAG, "idle mood %d for %u ms (drowsy %u%%)", (int)mood, (unsigned)hold, (unsigned)(s_drowsy * 100.0f));
+}
+
+static void tick_behaviour(uint32_t now)
+{
+    override_expire_due(now);
+
+    const idle_face_state_t base = s_override_active ? s_override_state : s_state;
+    /* Idle antics are allowed only when nothing else is expressing anything. */
+    const bool idle_ok = state_allows_idle_antics(base) && !s_override_active;
+
+    /* A spontaneous mood never outlives its hold, and is dropped the moment
+     * something more important takes over the face. Rescheduling the blink and
+     * the glance here also keeps a mood from ending in an immediate blink. */
+    if (s_antic_active && (now >= s_antic_until_ms || !idle_ok)) {
+        s_antic_active = false;
+        schedule_next_blink(now);
+        schedule_next_look(now);
+    }
+
+    if (!idle_ok || s_antic_active) {
+        /* Let a glance that is already in flight settle back to centre. The blink
+         * is cancelled rather than completed: cutting a mood in half with an
+         * eyelid looks broken, and the mood itself is the more interesting shape. */
         s_look_dx_target = 0.0f;
         s_saccade_dx = 0.0f;
         s_saccade_dy = 0.0f;
@@ -518,8 +695,18 @@ static void tick_behaviour(uint32_t now)
 
     if (s_look_until_ms != 0 && now >= s_look_until_ms) {
         s_look_until_ms = 0;
-        s_look_dx_target = 0.0f;
-        schedule_next_look(now);
+        if (((esp_random() % 100u) < IDLE_FACE_LOOK_DOUBLE_PCT) &&
+            (s_look_dx_target > 0.2f || s_look_dx_target < -0.2f)) {
+            /* Second glance to the other side: people rarely look exactly once,
+             * and the pair reads as "scanning the room" rather than a twitch. */
+            s_look_dx_target = -s_look_dx_target * (0.55f + (float)rand_between(0, 2500) / 10000.0f);
+            s_look_until_ms = now + rand_between(IDLE_FACE_LOOK_HOLD_MIN_MS,
+                                                 IDLE_FACE_LOOK_HOLD_MAX_MS);
+            schedule_next_look(now + IDLE_FACE_LOOK_HOLD_MAX_MS);
+        } else {
+            s_look_dx_target = 0.0f;
+            schedule_next_look(now);
+        }
     }
 
     /* Micro-saccade: a few pixels of pupil drift, held for a moment and then
@@ -540,8 +727,23 @@ static void tick_behaviour(uint32_t now)
     }
 
     if (s_blink_until_ms == 0 && (int32_t)(now - s_next_blink_ms) >= 0) {
-        const uint32_t duration = rand_between(IDLE_FACE_BLINK_DUR_MIN_MS,
-                                               IDLE_FACE_BLINK_DUR_MAX_MS);
+        uint32_t duration;
+        if ((esp_random() % 100u) < IDLE_FACE_BLINK_SLOW_PCT) {
+            duration = rand_between(IDLE_FACE_BLINK_SLOW_MIN_MS, IDLE_FACE_BLINK_SLOW_MAX_MS);
+        } else {
+            duration = rand_between(IDLE_FACE_BLINK_DUR_MIN_MS, IDLE_FACE_BLINK_DUR_MAX_MS);
+        }
+        /* Drowsy lids move slower. */
+        duration += (uint32_t)((float)duration * IDLE_FACE_DROWSY_BLINK_LONGER * s_drowsy);
+
+        /* Full or partial: an eyelid that sometimes stops halfway is most of the
+         * difference between a face and an animation. */
+        s_blink_depth = ((esp_random() % 100u) < IDLE_FACE_BLINK_PARTIAL_PCT)
+                            ? (IDLE_FACE_BLINK_PARTIAL_MIN +
+                               (float)rand_between(0, (uint32_t)(IDLE_FACE_BLINK_PARTIAL_SPAN * 1000.0f)) /
+                                   1000.0f)
+                            : 1.0f;
+
         s_blink_until_ms = now + duration;
         schedule_next_blink(now + duration);
     }
@@ -557,15 +759,35 @@ static void tick_behaviour(uint32_t now)
         schedule_next_look(now + rand_between(IDLE_FACE_LOOK_HOLD_MIN_MS,
                                               IDLE_FACE_LOOK_HOLD_MAX_MS));
     }
+
+    /* Spontaneous mood: only from a settled, centred face, so it never fights a
+     * glance that is still moving. */
+    if (s_blink_until_ms == 0 && s_look_until_ms == 0 &&
+        (s_look_dx < 0.15f && s_look_dx > -0.15f) && s_next_antic_ms != 0 &&
+        (int32_t)(now - s_next_antic_ms) >= 0) {
+        start_antic(now);
+    }
+}
+
+/** True while a spontaneous mood owns the face (used by the renderer). */
+static bool antic_showing(void)
+{
+    return s_antic_active;
 }
 
 /** The expression that should actually be rendered right now. */
 static idle_face_state_t effective_state(void)
 {
     if (s_blink_until_ms != 0) {
-        return IDLE_FACE_BLINK;
+        return IDLE_FACE_BLINK;      /* an eyelid is not a mood: it always wins */
     }
-    return s_override_active ? s_override_state : s_state;
+    if (s_override_active) {
+        return s_override_state;     /* notifications and AI outrank idle moods */
+    }
+    if (antic_showing()) {
+        return s_antic_state;        /* a spontaneous idle mood */
+    }
+    return s_state;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -613,7 +835,7 @@ static void notify_handler(void *arg, esp_event_base_t base, int32_t id, void *d
         if (strcmp(note->name, s_triggers[i].notification) != 0) {
             continue;
         }
-        SYS_LOGD(TAG, "trigger '%s' -> state %d", note->name, (int)s_triggers[i].state);
+        SYS_LOGD(TAG, "trigger '%s' -> state %d for %u ms", note->name, (int)s_triggers[i].state, (unsigned)s_triggers[i].duration_ms);
         (void)idle_face_express(s_triggers[i].state, s_triggers[i].duration_ms);
         return;
     }
@@ -678,6 +900,55 @@ esp_err_t idle_face_tick(uint32_t now_ms)
         s_saccade_dy = xfade_value(s_saccade_dy, 0.0f, 0.18f, 0.002f);
     }
 
+    /*
+     * Slow layers (1.1): drowsiness, head drift and pupil dilation.
+     *
+     * They share one property: they change over seconds to minutes, not frames,
+     * so they read as a living face rather than as an animation. All three are
+     * eased, so switching them off (an expression arrives) never snaps.
+     */
+    const bool neutral_face =
+        state_allows_idle_antics(s_override_active ? s_override_state : s_state) &&
+        !s_override_active;
+
+    if (neutral_face) {
+        /* A spontaneous mood is fidgeting, not attention: it must NOT reset the
+         * drowsiness, otherwise the accumulation below would never get anywhere. */
+        s_drowsy += (float)dt_ms / (float)IDLE_FACE_DROWSY_RISE_MS;
+        if (s_drowsy > 1.0f) {
+            s_drowsy = 1.0f;
+        }
+    } else {
+        s_drowsy -= (float)dt_ms / (float)IDLE_FACE_DROWSY_FALL_MS;
+        if (s_drowsy < 0.0f) {
+            s_drowsy = 0.0f;
+        }
+    }
+
+    /* Two sines with an irrational frequency ratio: the pattern never repeats
+     * audibly, and the amplitude is small enough to read as head movement. It
+     * keeps running during a mood - it is the head, not the expression. */
+    const float slow_s = (float)now_ms * 0.001f;
+    const float drift_gate = neutral_face ? 1.0f : 0.0f;
+    const float drift_x_want = IDLE_FACE_DRIFT_X_PX * drift_gate *
+                               (0.6f * sinf(slow_s * 0.31f) + 0.4f * sinf(slow_s * 0.17f));
+    const float drift_y_want = IDLE_FACE_DRIFT_Y_PX * drift_gate *
+                               (0.6f * sinf(slow_s * 0.23f) + 0.4f * sinf(slow_s * 0.13f));
+    s_drift_x = xfade_value(s_drift_x, drift_x_want, IDLE_FACE_DRIFT_GAIN, 0.01f);
+    s_drift_y = xfade_value(s_drift_y, drift_y_want, IDLE_FACE_DRIFT_GAIN, 0.01f);
+
+    if (s_next_dilate_ms == 0 || (int32_t)(now_ms - s_next_dilate_ms) >= 0) {
+        if ((esp_random() & 1u) != 0u) {
+            s_pupil_scale_target = IDLE_FACE_PUPIL_WIDE_MIN +
+                                   (float)rand_between(0, 90) / 1000.0f;
+        } else {
+            s_pupil_scale_target = IDLE_FACE_PUPIL_NARROW_MIN +
+                                   (float)rand_between(0, 60) / 1000.0f;
+        }
+        schedule_next_dilate(now_ms);
+    }
+    s_pupil_scale = xfade_value(s_pupil_scale, s_pupil_scale_target, IDLE_FACE_DILATE_GAIN, 0.001f);
+
     /* Breathing runs on its own clock; the period is re-rolled every cycle so
      * the rhythm never becomes a metronome. */
     s_breath_ms += dt_ms;
@@ -719,16 +990,21 @@ esp_err_t idle_face_set_state(idle_face_state_t state)
     s_override_active = false;
     s_state = state;
 
-    /* A new explicit expression cancels any pending blink/look/standby motion. */
+    /* A new explicit expression cancels any pending blink/look/standby motion,
+     * ends a spontaneous mood and resets the drowsiness: this is activity. */
     s_blink_until_ms = 0;
     s_look_until_ms = 0;
     s_look_dx_target = 0.0f;
     s_motion_active = false;
     s_wake_active = false;
+    s_antic_active = false;
+    s_drowsy = 0.0f;
     const uint32_t now = now_ms32();
     schedule_next_blink(now);
     schedule_next_look(now);
     schedule_next_saccade(now);
+    schedule_next_antic(now);
+    schedule_next_dilate(now);
 
     SYS_LOGD(TAG, "state -> %d", (int)state);
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
@@ -757,6 +1033,11 @@ esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms)
     s_override_state = state;
     s_override_until_ms = now_ms32() + duration_ms;
 
+    /* Something real is happening: drop the mood and the drowsiness so the
+     * expression is not shown through half-closed, tired eyes. */
+    s_antic_active = false;
+    s_drowsy = 0.0f;
+
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
                             &state, sizeof(state));
     return ESP_OK;
@@ -773,8 +1054,12 @@ esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms)
 esp_err_t idle_face_standby_enter(void)
 {
     /* Only from a neutral face: a live notification expression (WiFi failed,
-     * syncing, AI thinking) must not be buried under the sleep pose. */
+     * syncing, AI thinking) must not be buried under the sleep pose. An expression
+     * that has already timed out does not count - see override_expire_due(). */
+    override_expire_due(now_ms32());
     if (s_state != IDLE_FACE_NORMAL || s_override_active) {
+        SYS_LOGD(TAG, "standby enter refused (state=%d override=%d)", (int)s_state,
+                 (int)s_override_active);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -800,6 +1085,18 @@ esp_err_t idle_face_standby_enter(void)
      * exercised (and keeps begin_motion() referenced). */
     begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 1.0f);
 
+    /* Standby is the one place the long-term behaviour matters, so make sure the
+     * playbook starts from scratch: alert, no leftover mood, first blink, glance
+     * and mood scheduled from now. Drowsiness then builds up on its own over the
+     * next couple of minutes (see the slow layers in idle_face_tick). */
+    s_drowsy = 0.0f;
+    s_antic_active = false;
+    schedule_next_blink(now);
+    schedule_next_look(now);
+    schedule_next_saccade(now);
+    schedule_next_antic(now);
+    schedule_next_dilate(now);
+
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
                             &s_state, sizeof(s_state));
     SYS_LOGD(TAG, "standby enter (face stays awake)");
@@ -807,14 +1104,25 @@ esp_err_t idle_face_standby_enter(void)
 }
 
 /**
- * Wake up: eyes widen briefly and settle back. Called by the idle page's
- * on_hide, i.e. the moment the standby screen is left. The page container is
- * hidden right after, so only the first frames of this are normally visible -
- * which is why it is a short widening rather than a full sequence.
+ * Wake up: the eyes widen briefly and settle back.
+ *
+ * Called by the idle page's on_hide, i.e. the moment the standby screen is left.
+ * ui_core keeps the outgoing page visible for UI_PAGE_ANIM_OUT_MS (240 ms) while
+ * it cross-fades to the next page, and that window is exactly what makes this
+ * animation visible - the page used to be hidden in the same frame, which cut
+ * the whole sequence off before a single frame of it could be rendered.
+ *
+ * The overshoot peak therefore sits at ~200 ms (see IDLE_FACE_WAKE_MS), i.e.
+ * inside the visible window.
  */
 esp_err_t idle_face_standby_exit(void)
 {
-    if (s_state != IDLE_FACE_SLEEPY || s_override_active) {
+    /* A notification/AI expression is on screen: it owns the face and must not be
+     * replaced by a yawn. (Standby itself no longer uses the SLEEPY pose, so there
+     * is no pose to check for - see idle_face_standby_enter().) A stale override
+     * does not count here either. */
+    override_expire_due(now_ms32());
+    if (s_override_active) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -823,10 +1131,19 @@ esp_err_t idle_face_standby_exit(void)
     s_wake_active = true;
     s_motion_active = false;
 
+    /* Waking up wipes out the drowsiness and the current mood: the user is back. */
+    s_drowsy = 0.0f;
+    s_antic_active = false;
+    s_blink_until_ms = 0;
+    s_look_until_ms = 0;
+    s_look_dx_target = 0.0f;
+
     s_state = IDLE_FACE_NORMAL;
-    schedule_next_blink(now);
+    schedule_next_blink(now + IDLE_FACE_WAKE_MS);
     schedule_next_look(now);
     schedule_next_saccade(now);
+    schedule_next_antic(now);
+    schedule_next_dilate(now);
 
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
                             &s_state, sizeof(s_state));
@@ -966,6 +1283,10 @@ esp_err_t idle_face_attach(lv_obj_t *parent)
     schedule_next_blink(now);
     schedule_next_look(now);
     schedule_next_saccade(now);
+    /* Seed the long-term clocks too, so the face is fully alive even before the
+     * first standby_enter() (which re-seeds them anyway). */
+    schedule_next_antic(now);
+    schedule_next_dilate(now);
     apply_params(now);
 
     s_face.timer = lv_timer_create(face_timer_cb, IDLE_FACE_TICK_MS, NULL);

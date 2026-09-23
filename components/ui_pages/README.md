@@ -12,7 +12,7 @@
 
 | 页面 | 枚举 | 状态 | 文件 |
 |---|---|---|---|
-| 启动页 | `UI_PAGE_SPLASH` | ✅ 已实现 | `page_splash.c` |
+| 启动页 | `UI_PAGE_SPLASH` | ✅ 已实现（滚动启动日志 + 动画省略号 + 真实固件版本） | `page_splash.c` |
 | 主菜单 | `UI_PAGE_HOME` | ✅ 已实现 | `page_home.c` |
 | WiFi | `UI_PAGE_WIFI` | ✅ 已实现 | `page_wifi.c` |
 | 待办列表 | `UI_PAGE_TODO` | ✅ 已实现（**可勾选完成 / 删除**，见下） | `page_todo.c` |
@@ -28,8 +28,17 @@
 > 原有的"先注册占位页、再逐个替换"策略已完成使命：新增页面时按下面 5 步直接加即可。
 
 > **设置页显示固件版本**（1.0.0 起）：`page_settings.c` 的 `refresh_info()` 用
-> `esp_app_get_description()` 输出「固件 1.0.0 · IDF v6.1」—— 这是判断"板子上到底烧的是哪个
+> `esp_app_get_description()` 输出「固件 1.1.0 · IDF v6.1」—— 这是判断"板子上到底烧的是哪个
 > 版本"最快的方式。版本来自工程根目录 `version.txt`（规则见 `AGENT.md §8.1`）。
+
+> **启动页（`page_splash.c`）的两处细节**（1.1）：
+> 1. 副标题的固件版本同样来自 `esp_app_get_description()->version`。以前它读
+>    `CONFIG_APP_PROJECT_VER`，而那个符号只在 `CONFIG_APP_PROJECT_VER_FROM_CONFIG` 打开时
+>    才存在，所以屏幕上**一直显示 `0.1.0`**；
+> 2. 状态行有**动画省略号**（每 `SPLASH_DOTS_MS` = 420 ms 多一个点）。它由页面自己的
+>    100 ms `lv_timer` 驱动，**与日志序号无关**——否则两次日志之间（模块初始化慢的时候可能
+>    好几秒）状态行会完全不动，看起来像死机。
+> 离场时的淡出+上移由 `ui_core` 的交叉淡入负责，本页不需要写任何退出动画。
 
 ## 待办页：设备端可「勾选完成 + 删除」，新增/编辑只在网页端
 

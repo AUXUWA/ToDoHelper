@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 
 #include "pages_internal.h"
@@ -35,12 +36,11 @@
 
 static const char *TAG = "page_splash";
 
-#ifndef CONFIG_APP_PROJECT_VER
-#define CONFIG_APP_PROJECT_VER "0.1.0"
-#endif
-
 /** How often the log view is rebuilt while new lines arrive. */
 #define SPLASH_TICK_MS 100
+
+/** Animated ellipsis: one more dot every this many ms while the boot runs. */
+#define SPLASH_DOTS_MS 420
 
 /** Hidden pixels below the viewport that still count as "at the newest line". */
 #define SPLASH_TAIL_SLACK 4
@@ -62,6 +62,13 @@ static char *s_text;
 static lv_timer_t *s_timer;
 /** sys_log_recent_seq() the label currently shows. */
 static uint32_t s_rendered_seq;
+
+/* Status line state: the ellipsis animates even when no new line arrives, so the
+ * page never looks frozen while the (slow) modules come up. */
+static uint32_t s_started_ms;      /**< sys_time_ms() when the page was shown */
+static uint32_t s_dots_phase;      /**< last rendered dot count, 0..3 */
+static bool s_have_newest;         /**< s_newest holds a complete log line */
+static sys_log_recent_info_t s_newest;
 
 /* ------------------------------------------------------------------------- */
 /* Log rendering                                                             */
@@ -102,19 +109,31 @@ static size_t text_put_char(char *dst, size_t cap, size_t used, char c)
     return used;
 }
 
+/** Animated ellipsis, so "启动中" never looks like a hung screen. */
+static const char *dots_for(uint32_t phase)
+{
+    static const char *const s_dots[] = { "", ".", "..", "..." };
+    return s_dots[phase & 3u];
+}
+
 static void splash_update_status(const sys_log_recent_info_t *newest)
 {
     if (s_status_label == NULL) {
         return;
     }
+
+    const char *dots = dots_for(s_dots_phase);
     if (newest == NULL) {
-        lv_label_set_text(s_status_label, "正在等待第一条日志…");
+        lv_label_set_text_fmt(s_status_label, "正在等待第一条日志%s", dots);
         return;
     }
 
-    lv_label_set_text_fmt(s_status_label, "启动日志 %u 条 · 最新 %u.%us", (unsigned)newest->seq,
+    /* The page is up while main/app_main.c brings the optional services up, so it
+     * says so instead of just sitting there with a frozen counter. */
+    lv_label_set_text_fmt(s_status_label, "启动日志 %u 条 · 最新 %u.%us · 启动中%s",
+                          (unsigned)newest->seq,
                           (unsigned)(newest->uptime_ms / 1000u),
-                          (unsigned)((newest->uptime_ms % 1000u) / 100u));
+                          (unsigned)((newest->uptime_ms % 1000u) / 100u), dots);
 }
 
 /**
@@ -193,12 +212,29 @@ static void splash_refresh_log(void)
         s_rendered_seq = seq;
     }
 
-    splash_update_status(have_newest ? &newest : NULL);
+    if (have_newest) {
+        s_newest = newest;
+        s_have_newest = true;
+    }
+
+    /* Keep the newest line around for the ellipsis ticks, which run when no new
+     * line arrives and therefore have nothing else to render. */
+    splash_update_status(s_have_newest ? &s_newest : NULL);
 }
 
 static void splash_tick(lv_timer_t *timer)
 {
     (void)timer;
+
+    /* The ellipsis runs on its own clock: between two log lines nothing else on
+     * this page changes, and a frozen status line reads as a hung device. */
+    const uint32_t elapsed = (uint32_t)sys_time_ms() - s_started_ms;
+    const uint32_t phase = elapsed / SPLASH_DOTS_MS;
+    if (phase != s_dots_phase) {
+        s_dots_phase = phase;
+        splash_update_status(s_have_newest ? &s_newest : NULL);
+    }
+
     splash_refresh_log();
 }
 
@@ -253,7 +289,13 @@ static esp_err_t splash_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
 
     lv_obj_t *subtitle = lv_label_create(box);
-    lv_label_set_text_fmt(subtitle, "桌面待办助手 · 启动日志 · 固件 %s", CONFIG_APP_PROJECT_VER);
+    /* The real firmware version: `CONFIG_APP_PROJECT_VER` only exists when
+     * CONFIG_APP_PROJECT_VER_FROM_CONFIG is set, which it is not, so the old code
+     * fell back to a hardcoded "0.1.0" and the splash screen lied about the build.
+     * version.txt -> esp_app_desc_t is the single source of truth (AGENT.md 8.1). */
+    const esp_app_desc_t *app = esp_app_get_description();
+    lv_label_set_text_fmt(subtitle, "桌面待办助手 · 启动日志 · 固件 %s",
+                          (app != NULL) ? app->version : "?");
     lv_obj_set_style_text_font(subtitle, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(subtitle, UI_COLOR_PRIMARY, 0);
 
@@ -311,7 +353,12 @@ static esp_err_t splash_create(lv_obj_t *parent)
 
 static esp_err_t splash_on_show(void)
 {
+    /* Restart the ellipsis clock: this page is also re-shown after a return from
+     * another page, and the dots must not pick up an old phase. */
+    s_started_ms = (uint32_t)sys_time_ms();
+    s_dots_phase = 0;
     splash_refresh_log();
+    splash_update_status(s_have_newest ? &s_newest : NULL);
     splash_timer_start();
     return ESP_OK;
 }

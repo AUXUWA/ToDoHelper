@@ -267,7 +267,8 @@ esp_err_t ui_nav_back(void);
 
 页面实现者只提供 `ui_page_t` 并把它登记进 `ui_pages` 的表；**不得**自建 LVGL screen、
 不得调用 `lv_disp_load_scr()`。`ui_core` 在单个 `lv_obj_t` 屏幕下为每个页面建一个全屏容器，
-切换即 `lv_obj_add_flag(HIDDEN)` 切换，状态栏常驻不重建。
+切换是**交叉淡入**（新页面滑入淡入 220 ms，旧页面淡出上移 240 ms 后才加 `HIDDEN`，
+见 `ui_core/README.md`），状态栏常驻不重建。
 
 ### 5.5 `ui_core/ui_fonts`（字体，扩展点）
 

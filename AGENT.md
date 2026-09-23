@@ -10,7 +10,7 @@
 > 变更历史见 `CHANGELOG.md`。
 > 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
 >
-> **当前版本 `1.0.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
+> **当前版本 `1.1.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
 
 ---
 
@@ -283,7 +283,7 @@ Project build complete.
 
 | 项 | 值 |
 |---|---|
-| app bin | `build/todohelper.bin`，`0x2da5f0` 字节（约 2.85 MB，含 `1.0.0` 版本号；字库已移出到 SD/`storage`，见 §9.7） |
+| app bin | `build/todohelper.bin`，`0x2db470` 字节（约 2.86 MB，含 `1.1.0` 版本号；字库已移出到 SD/`storage`，见 §9.7） |
 | app 分区余量 | `0x800000` 分区，剩 **64%** |
 | bootloader | `build/bootloader/bootloader.bin`，`0x5a80`，余 6% |
 | 编译警告 | 0（`-Werror` 全开） |
@@ -330,9 +330,9 @@ Project build complete.
 **不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
 改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
 
-- **当前版本：`1.0.0`**
+- **当前版本：`1.1.0`**
 - 版本进 `esp_app_desc_t`，于是**三处可见**：
-  设备「设置」页顶部「固件 1.0.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
+  设备「设置」页顶部与开机页「固件 1.1.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
   以及 `build/todohelper.bin` 的 app descriptor（离线核对：
   `riscv32-esp-elf-objdump -s -j .flash.appdesc build/todohelper.elf`）。
 - 规则（三段式）：**MAJOR** = 一轮需求全部完成、或有破坏性变更（存储格式 / HTTP API /
@@ -733,23 +733,37 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 > 75 秒才需要它。要做的话仍是三步：`sys_utils.h` 加事件 → `calendar_service.c` 的
 > `sntp_sync_cb()` 里额外 post → `weather_service.c` 订阅并入队 `WEATHER_REQ_DETECT`。
 
-**① 待机眼睛动画** —— ✅ **已实现**（表情交叉淡入 + 全随机节奏，仍**只要眼睛、零位图**）。
-设计见 `components/idle_face/README.md`：`face_transition_t` 做 180/420 ms 的 `smoothstep`
-交叉淡入（从"当前屏幕真实值"起步，中途被打断不会跳变）；眨眼 2.6~7.5 s / 110~165 ms 且 18% 连眨、
-左右看 4~12 s、微扫视 1.8~5.2 s、呼吸周期 12~19 s 每周期重抽；约 +230 B 静态内存、零新对象。
+**① 待机眼睛动画** —— ✅ **已实现并两次加密**（表情交叉淡入 + 全随机节奏 + 慢动作三层，
+仍**只要眼睛、零位图、零新对象**）。设计见 `components/idle_face/README.md`。
+
+- **基础层**：`face_transition_t` 做 180/420 ms 的 `smoothstep` 交叉淡入（从"当前屏幕真实值"
+  起步，中途被打断不会跳变）；眨眼 2.6~7.5 s / 110~165 ms、18% 连眨、**28% 只眯一半**、
+  9% 慢眨 240~380 ms；左右看 4~12 s（**22% 立刻往另一侧再看一眼**）；微扫视 1.8~5.2 s；
+  呼吸 12~19 s 每周期重抽。
+- **1.1 慢动作三层**（解决"看一分钟就那几下"）：① **自发表情**每 13~34 s 随机演一个
+  320~1100 ms 的表情（HAPPY/SLEEPY/LISTENING/THINKING/SPEAKING，优先级
+  `眨眼 > 通知/AI 表情 > 自发表情 > 基础状态`）；② **困倦度** 0→1（约 2.5 分钟攒满：
+  眨眼更密更慢、眼睛矮 10%、视线下垂 5 px，任何真实交互立刻清零，**自发表情不清零**）；
+  ③ **瞳孔缩放**（5~11 s 重抽 0.91~1.14）与**整脸 ±3/±2 px 缓慢漂移**（表情占用时缓动归零）。
+- 内存：全部只改已有对象属性，**无分配**；实测 `int-low` 未变（55 KB）。
 
 > **"待机保持清醒"是刻意的设计决定。** 初版让眼睛闭合成 SLEEPY 姿态并整个待机期保持，
 > 那会**抑制眨眼/扫视 —— 即让待机画面动画变少**，与"丰富待机动画"的要求相反。所以
 > `idle_face_standby_enter()` 现在只做记账（用一个常量 1.0 包络保留 `begin_motion()` 调用，
-> 以免触发 `-Werror=unused-function`），脸部保持 NORMAL、全部动画照常跑。
+> 以免触发 `-Werror=unused-function`），脸部保持 NORMAL、全部动画照常跑，靠困倦度慢慢"沉"。
 > 想要"睡觉的脸"，同时改这三行：
 > `s_state = IDLE_FACE_SLEEPY;` / `begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 0.0f);` /
 > `s_current = *params_for(IDLE_FACE_SLEEPY);`
 
-**已由用户目视确认正常（2026-09-23）**：交叉淡入与呼吸/扫视的主观观感。
-**仅剩一个已知小瑕疵**：`idle_face_standby_exit()` 的 700 ms 睁眼几乎看不见 —— `ui_core`
-在 `on_hide()` 之后**立刻**给页面容器加 `LV_OBJ_FLAG_HIDDEN`；要看到完整唤醒得在 `ui_core`
-侧延后约 200~300 ms 再隐藏（用户认为可接受，故未改）。
+**用户已确认基础层观感正常（2026-09-23）**；1.1 的三层慢动作与退出过场**待目视确认**。
+两个已修的坑（都在 1.1）：
+1. `idle_face_standby_exit()` 以前要求"处于 SLEEPY 姿态"，而 `standby_enter()` 已不再进入
+   SLEEPY → 该函数**恒返回 `ESP_ERR_INVALID_STATE`**，属于死代码。现在只要求没有有效表情占用；
+2. 动画器定时器是**页面创建时**才起的，所以第一次进待机可能看到一个几分钟前就该过期的
+   临时表情（实测 t=7.7 s 的 2.5 s `wifi_connected` 表情在 t=82 s 仍被当成有效，
+   **首次进待机被静默拒绝**）。现在 `standby_enter/exit` 都先调 `override_expire_due()`。
+3. 退出过场**现在真的可见**：`ui_core` 的切页改成交叉淡入，离场页面淡出 240 ms 后才隐藏
+   （以前同一帧就 `HIDDEN`，一帧都渲染不出来）。
 
 **② 单词书 cet4 → cet6** —— ✅ **已完成**。`WORD_DEFAULT_BOOK` 已改为 `"cet6"`
 （`word_service.h`）。卡上是 `words/cet6.json`：**833 条自编精选**（BrE 音标 + 简体释义 +
