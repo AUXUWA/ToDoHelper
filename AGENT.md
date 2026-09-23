@@ -755,8 +755,8 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 > `s_state = IDLE_FACE_SLEEPY;` / `begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 0.0f);` /
 > `s_current = *params_for(IDLE_FACE_SLEEPY);`
 
-**用户已确认基础层观感正常（2026-09-23）**；1.1 的三层慢动作与退出过场**待目视确认**。
-两个已修的坑（都在 1.1）：
+**用户已确认基础层观感正常（2026-09-23），1.1 的三层慢动作与退出过场/交接淡入也已确认**
+（"可以了"）。三个已修的坑（都在 1.1）：
 1. `idle_face_standby_exit()` 以前要求"处于 SLEEPY 姿态"，而 `standby_enter()` 已不再进入
    SLEEPY → 该函数**恒返回 `ESP_ERR_INVALID_STATE`**，属于死代码。现在只要求没有有效表情占用；
 2. 动画器定时器是**页面创建时**才起的，所以第一次进待机可能看到一个几分钟前就该过期的
