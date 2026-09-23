@@ -286,6 +286,12 @@ static esp_err_t weather_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(s_icon_fallback, ui_font(UI_FONT_TITLE), 0);
     lv_obj_set_style_text_color(s_icon_fallback, UI_COLOR_TEXT_MUTED, 0);
     lv_obj_align(s_icon_fallback, LV_ALIGN_CENTER, 0, 0);
+    /* lv_label_create() starts with LVGL's built-in default text, which is the
+     * literal string "Text" - so an unpopulated fallback label showed "Text" on
+     * the weather card. Start empty and hidden; weather_update() reveals it only
+     * when the icon image is unavailable. */
+    lv_label_set_text(s_icon_fallback, "");
+    lv_obj_add_flag(s_icon_fallback, LV_OBJ_FLAG_HIDDEN);
 
     s_detail_label = lv_label_create(body);
     lv_obj_set_width(s_detail_label, LV_PCT(100));
