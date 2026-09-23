@@ -697,17 +697,27 @@ esp_err_t voice_service_init(void)
 
     s_initialized = true;
 
-    /* Audio is opened lazily by start_record()/play() so a broken codec does not
-     * slow down boot. */
-    ensure_audio();
-
+    /*
+     * Deliberately do NOT open the codec here.
+     *
+     * The comment used to say "lazy" while calling ensure_audio() anyway, which
+     * cost ~20 KB of internal RAM for the whole uptime - and internal RAM is the
+     * scarcest resource on this board. That mattered: with the codec open, the
+     * largest free internal block was 33 KB, and the Wi-Fi PHY's re-init on scan
+     * (phy_track_pll_init -> esp_timer_create) then failed with ESP_ERR_NO_MEM and
+     * aborted the device.
+     *
+     * start_record() and play() still call ensure_audio() on demand, and
+     * voice_service_status() does too, so the capability flags are filled in the
+     * first time anything actually asks about the audio hardware.
+     */
     esp_err_t http_err = voice_service_register_http();
     if (http_err != ESP_OK) {
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
     }
 
-    SYS_LOGI(TAG, "ready (mic=%d speaker=%d asr=%d tts=%d wake '%s')",
-             s_mic_ok, s_speaker_ok, voice_service_asr_configured(),
-             voice_service_tts_configured(), voice_service_wake_mode_name(s_wake_mode));
+    SYS_LOGI(TAG, "ready (wake '%s', asr=%d tts=%d, audio opened on first use)",
+             voice_service_wake_mode_name(s_wake_mode),
+             voice_service_asr_configured(), voice_service_tts_configured());
     return ESP_OK;
 }

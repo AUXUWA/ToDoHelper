@@ -529,6 +529,22 @@ esp_err_t wifi_manager_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    /*
+     * No modem sleep.
+     *
+     * With the default power save the PHY is powered down and re-enabled around
+     * radio activity, and that re-enable path (pm_wake_up -> esp_phy_enable ->
+     * phy_track_pll_init -> esp_timer_create) needs internal RAM. On this board
+     * internal RAM is the scarcest resource, and the allocation failed with
+     * ESP_ERR_NO_MEM, aborting the device:
+     *
+     *   ESP_ERROR_CHECK failed: esp_err_t 0x101 (ESP_ERR_NO_MEM)
+     *     at phy_track_pll_init (phy_common.c:126)
+     *
+     * This is a mains-powered desktop device, so modem sleep buys nothing and
+     * costs both internal RAM churn and latency.
+     */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     const esp_timer_create_args_t timer_args = {

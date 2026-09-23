@@ -397,7 +397,29 @@ Project build complete.
 `ESP_LOGx` 宏同一条格式化路径）。修好后启动日志从"1 行"变成 **782 行**，
 `scan done: 18 AP(s)` 立刻就看到了。**排障时如果怀疑"某段代码没执行"，先确认日志格式。**
 
-### 9.0.3 字体缺字：用 fallback 链，不要逐个控件打补丁
+### 9.0.3 内部 RAM 的最紧处：WiFi PHY 重新使能需要约 30 KB 连续块
+
+`esp_phy_enable()`（扫描/唤醒等射频活动时触发）会先分配自己的缓冲，**然后**才
+`esp_timer_create()` 一个 PLL 跟踪定时器。若此时内部 RAM 最大连续块不足，这个
+**100 字节**的分配会失败，而 IDF 用的是 `ESP_ERROR_CHECK`，直接 abort：
+
+```
+ESP_ERROR_CHECK failed: esp_err_t 0x101 (ESP_ERR_NO_MEM)
+  at phy_track_pll_init (phy_common.c:126)
+  expression: esp_timer_create(&phy_track_pll_timer_args, &phy_track_pll_timer)
+```
+
+**判据是「最大连续块」，不是总空闲量**。实测：boot 结束内部 77 KB 空闲但最大连续块
+只有 33 KB 时就会崩；把 `after voice_service` 从 78 KB/33 KB 提到
+**97 KB/52 KB** 后不再出现。所以：
+
+- **boot 阶段别占用内部 RAM**。`voice_service` 曾经注释写着"lazy"却在 init 里调了
+  `ensure_audio()`，白占 20 KB 整个运行期——现已改为真正按需打开（首次录音/回放/
+  查询状态时才初始化 codec）。
+- **`esp_wifi_set_ps(WIFI_PS_NONE)`**：默认省电模式会让 PHY 反复 power-down/up，
+  正是上面那条路径。本设备是市电供电的桌面设备，关掉省电既省内部 RAM 抖动也降低延迟。
+
+### 9.0.4 字体缺字：用 fallback 链，不要逐个控件打补丁
 
 内嵌的 CJK 子集只有 GB2312 一级 + ASCII，**没有 LVGL 的符号字形**
 （`LV_SYMBOL_*` 在 U+F000 区），所以屏幕键盘的退格/确定/切键盘键全变成空方框。
