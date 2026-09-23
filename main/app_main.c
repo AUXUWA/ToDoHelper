@@ -177,26 +177,26 @@ void app_main(void)
     sys_heap_log("ui_pages");
 
     /*
-     * Show the splash before the slow, optional services come up.
+     * Show the splash before the slow, optional services come up and keep it up for
+     * a fixed 3 s so the boot log is readable (user request).
      *
-     * The splash now also scrolls the boot log, so it stays up for the whole of
-     * startup: the interesting lines (WiFi, mDNS, HTTP, AI, voice) are produced by
-     * run_modules(true), and handing over to HOME *before* that is why the log used
-     * to be visible for only ~400 ms. Reordering costs no extra boot time - those
-     * modules were going to run anyway.
+     * The hand-off deliberately happens BEFORE run_modules(true). An earlier revision
+     * moved it *after*, which spread the splash's log-refresh lv_timer across the
+     * whole module-init window; that revision ran into a reproducible startup
+     * abort() (newlib lazy lock race, see AGENT.md 9.0.5), so the original ordering
+     * is restored and the readability is bought with a plain delay instead.
      */
     ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH));
 
     (void)run_modules(false);
-    (void)run_modules(true);
 
-    /* A short floor so the log is readable even when everything is cached and the
-     * modules above returned in a few hundred milliseconds. */
-    vTaskDelay(pdMS_TO_TICKS(600));
+    vTaskDelay(pdMS_TO_TICKS(3000));
 
     if (ui_page_switch(UI_PAGE_HOME) != ESP_OK) {
         SYS_LOGE(TAG, "home page unavailable");
     }
+
+    (void)run_modules(true);
 
     /* Do not touch the status bar from here: ui_core owns it, and LVGL must only
      * be driven from the LVGL task or under the lock. Ask for a refresh instead. */

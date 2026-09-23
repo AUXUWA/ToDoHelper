@@ -462,6 +462,53 @@ FreeType 子集 --fallback--> Montserrat(同尺寸) --fallback--> 内置 CJK 16p
 
 这样符号、少见的汉字都能显示，且**全局生效**，不用在键盘上写特例。
 
+### 9.0.5 启动期 `abort()`：newlib 惰性锁初始化竞态（**未修，下次优先**）
+
+现象：烧录后**第一次**启动，走到 `module 'calendar_service' ready`（约 3.0 s）后 `abort()` 并
+`Rebooting...`；复位后第二次启动**完全干净**（所有模块 ready 到 `voice_service`）。
+**间歇性**，所以很容易被当成"偶发"忽略掉。
+
+抓现场的完整方法（这次就是这么做出来的，值得照抄）：
+
+```powershell
+# 1) 抓含 panic 的启动日志
+python tools\monitor_capture.py --port COM34 --seconds 26 --out build\boot.log
+# 2) 从 dump 里读 MEPC / RA / abort PC，再用 addr2line 对着 ELF 解析
+riscv32-esp-elf-addr2line -pfiaC -e build\todohelper.elf 0x2f0029ad 0x2f00f602 0x2f00f098
+```
+
+解析结果：
+
+```
+0x2f0029ad: lock_init_generic      esp_libc/src/locks.c:77   ← abort 调用点
+ (inlined)  lock_acquire_generic   esp_libc/src/locks.c:133
+0x2f00c91a: __assert_func          esp_libc/src/assert.c:34
+0x2f00f098: esp_vApplicationTickHook  esp_system/freertos_hooks.c:31
+```
+
+即 `lock_init_generic` 里的断言被 `__assert_func` 触发 —— **newlib 惰性锁初始化的竞态**：
+两个上下文同时首次使用同一个 libc 锁，后者看到锁状态不是"未初始化"就断言失败。
+这与本工程早前修过的**「SNTP 校时 abort」是同一族**问题。
+
+现场里的旁证（都在 panic 栈内存里，值得注意）：
+- 寄存器含 `esp_vApplicationTickHook` → 其中一个上下文来自 tick 钩子/中断侧
+- 栈上出现 `xuaoxe_computer`（WiFi SSID），说明崩溃上下文最近碰过 WiFi/`sys_config`
+- 栈上残留大量 `0x36363636` / `0x5c5c5c5c` / `0x64646464` 填充图案，说明该栈不深
+
+**怀疑与本轮的一次改动有关**：为了让开机日志可读，`main/app_main.c` 把切 HOME 从
+`run_modules(true)` 之前挪到了之后，于是 `page_splash` 的日志刷新 `lv_timer` 现在
+**贯穿整个模块初始化窗口**，启动期并发度高于改动前，竞态窗口随之变大。
+
+下次怎么查（按性价比排序，**不要再盲改并发**）：
+1. 先确认是否真与 splash 有关：把 `app_main.c` 的切 HOME 挪回 `run_modules(true)` 之前
+   跑 10 次冷启动对比 —— 若崩溃消失，就锁定是启动期并发，再决定用别的办法显示日志
+   （例如只显示已缓冲的最后若干行、不做逐 tick 刷新）。
+2. 让 panic 打印更完整：`CONFIG_ESP_SYSTEM_PANIC_PRINT_ALL_REGS` +
+   `CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT`，并考虑把 newlib 锁改成启动时一次性初始化
+   （单任务上下文先调用一次 `localtime()`/`malloc()`），从根上消掉惰性初始化。
+3. 检查是否有人从 ISR / tick 回调里做 libc 调用（`vsnprintf`、`time`、`malloc`）——
+   这类调用在中断上下文里本来就不合法，且正好能造成上面这个断言。
+
 ### 9.1 三条**不可删**的 `sdkconfig.defaults` 配置
 
 1. **`CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y`（且 `LOG_MAXIMUM_EQUALS_DEFAULT=n`）**
