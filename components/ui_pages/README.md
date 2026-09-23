@@ -14,15 +14,15 @@
 |---|---|---|---|
 | 启动页 | `UI_PAGE_SPLASH` | ✅ 已实现 | `page_splash.c` |
 | 主菜单 | `UI_PAGE_HOME` | ✅ 已实现 | `page_home.c` |
-| WiFi | `UI_PAGE_WIFI` | 占位 | `page_placeholders.c` |
-| 待办列表 | `UI_PAGE_TODO` | 占位 | 同上 |
-| 待办详情 | `UI_PAGE_TODO_DETAIL` | 占位 | 同上 |
-| 天气 | `UI_PAGE_WEATHER` | 占位 | 同上 |
-| 日历 | `UI_PAGE_CALENDAR` | 占位 | 同上 |
-| 单词 | `UI_PAGE_WORD` | 占位 | 同上 |
-| AI 对话 | `UI_PAGE_AI_CHAT` | 占位 | 同上 |
-| 设置 | `UI_PAGE_SETTINGS` | 占位 | 同上 |
-| 待机眼睛 | `UI_PAGE_IDLE_FACE` | 占位（将由 `idle_face` 接管） | 同上 |
+| WiFi | `UI_PAGE_WIFI` | ✅ 已实现 | `page_wifi.c` |
+| 待办列表 | `UI_PAGE_TODO` | ✅ 已实现 | `page_todo.c` |
+| 待办详情 | `UI_PAGE_TODO_DETAIL` | ✅ 已实现 | `page_todo.c`（与列表页同文件，导出 `page_todo_detail`） |
+| 天气 | `UI_PAGE_WEATHER` | ✅ 已实现 | `page_weather.c` |
+| 日历 | `UI_PAGE_CALENDAR` | ✅ 已实现 | `page_calendar.c` |
+| 单词 | `UI_PAGE_WORD` | ✅ 已实现 | `page_word.c` |
+| AI 对话 | `UI_PAGE_AI_CHAT` | 占位（仅剩这一个） | `page_placeholders.c` |
+| 设置 | `UI_PAGE_SETTINGS` | ✅ 已实现 | `page_settings.c` |
+| 待机眼睛 | `UI_PAGE_IDLE_FACE` | ✅ 已实现，但**由 `idle_face` 组件自己注册**，不在 `s_pages[]` 里 | `components/idle_face/src/idle_face.c`（`idle_face_init()` → `ui_page_register()`） |
 
 > 所有页面 id 从第一天就注册，因此导航、状态栏、待机策略可以立刻端到端联调；
 > 每实现一个功能，就删掉 `page_placeholders.c` 里的对应块，新建 `page_xxx.c`

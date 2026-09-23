@@ -1,0 +1,18 @@
+menu "ToDoHelper: AI service"
+
+    config TODOHELPER_AI_TIMEOUT_MS
+        int "DeepSeek request timeout (ms)"
+        range 5000 120000
+        default 45000
+        help
+            Reasoner models can take a while; the UI stays responsive because the
+            request runs in this component's worker task, not in the LVGL task.
+
+    config TODOHELPER_AI_SAVE_HISTORY
+        bool "Persist the conversation to storage by default"
+        default n
+        help
+            Default for the NVS key `ai_save_hist`. When enabled the conversation
+            is written to <storage>/todohelper/ai/chat_history.json.
+
+endmenu

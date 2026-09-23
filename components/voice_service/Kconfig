@@ -1,0 +1,26 @@
+menu "ToDoHelper: voice service"
+
+    config TODOHELPER_VOICE_HTTP_TIMEOUT_MS
+        int "ASR / TTS request timeout (ms)"
+        range 5000 120000
+        default 30000
+        help
+            Cloud speech endpoints can be slow; the request runs in this
+            component's task so the UI stays responsive.
+
+    config TODOHELPER_VOICE_SAVE_PCM
+        bool "Save each recording to storage"
+        default y
+        help
+            Writes <storage>/todohelper/ai/rec_<timestamp>.pcm so a recording can
+            be inspected or replayed. Raw 16 kHz / 16-bit / mono, no WAV header.
+
+    config TODOHELPER_VOICE_KEEP_PCM
+        int "Number of recordings kept on storage"
+        range 0 50
+        default 5
+        help
+            0 disables saving. Older files are not deleted automatically yet;
+            see docs/API.md 已知限制.
+
+endmenu

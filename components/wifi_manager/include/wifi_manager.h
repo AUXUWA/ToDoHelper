@@ -139,6 +139,15 @@ bool wifi_manager_is_connected(void);
 /** @brief Human readable name of a state, for logs and JSON. */
 const char *wifi_manager_state_name(wifi_mgr_state_t state);
 
+/**
+ * @brief Publish the /api/v1/wifi/... routes on the shared HTTP router
+ *        (requirement 8.3).
+ *
+ * Called by wifi_manager_init(); kept separate so the component still works on a
+ * device without an HTTP server.
+ */
+esp_err_t wifi_manager_register_http(void);
+
 #ifdef __cplusplus
 }
 #endif

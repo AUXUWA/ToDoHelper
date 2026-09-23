@@ -1,0 +1,6 @@
+version: "0.1.0"
+description: ToDoHelper voice capture, playback and ASR/TTS bridges
+
+dependencies:
+  idf: ">=6.1.0"
+  espressif/cjson: "^1.7.19"

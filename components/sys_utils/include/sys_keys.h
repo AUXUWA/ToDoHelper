@@ -68,6 +68,8 @@ extern "C" {
 #define SYS_KEY_AI_SAVE_HIST   "ai_save_hist"
 #define SYS_KEY_VOICE_WAKE     "voice_wake"
 #define SYS_KEY_TTS_ENABLED    "tts_enabled"
+#define SYS_KEY_ASR_URL        "asr_url"
+#define SYS_KEY_TTS_URL        "tts_url"
 
 #ifdef __cplusplus
 }

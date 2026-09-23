@@ -10,7 +10,7 @@ idf_component_register(
         "src/page_calendar.c"
         "src/page_word.c"
         "src/page_settings.c"
-        "src/page_placeholders.c"
+        "src/page_ai_chat.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES
@@ -24,5 +24,6 @@ idf_component_register(
         weather_service
         word_service
         sync_server
+        ai_service
         lvgl
 )

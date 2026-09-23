@@ -1,5 +1,7 @@
 idf_component_register(
-    SRCS "src/wifi_manager.c"
+    SRCS
+        "src/wifi_manager.c"
+        "src/wifi_manager_http.c"
     INCLUDE_DIRS "include"
-    REQUIRES sys_utils bsp esp_wifi esp_netif esp_event nvs_flash
+    REQUIRES sys_utils bsp http_router cjson esp_wifi esp_netif esp_event nvs_flash
 )

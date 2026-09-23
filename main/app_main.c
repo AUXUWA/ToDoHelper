@@ -25,6 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "ai_service.h"
 #include "calendar_service.h"
 #include "idle_face.h"
 #include "storage_manager.h"
@@ -38,6 +39,7 @@
 #include "ui_theme.h"
 #include "weather_service.h"
 #include "wifi_manager.h"
+#include "voice_service.h"
 #include "word_service.h"
 
 static const char *TAG = "app";
@@ -60,6 +62,8 @@ static const app_module_t s_modules[] = {
     { .name = "word_service",     .init = word_service_init, .optional = true,  .after_ui = true },
     { .name = "sync_server",      .init = sync_server_init, .optional = true,  .after_ui = true },
     { .name = "idle_face",        .init = idle_face_init, .optional = true,  .after_ui = true },
+    { .name = "ai_service",       .init = ai_service_init, .optional = true, .after_ui = true },
+    { .name = "voice_service",    .init = voice_service_init, .optional = true, .after_ui = true },
 };
 
 static esp_err_t run_modules(bool after_ui)

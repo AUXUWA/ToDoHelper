@@ -425,6 +425,11 @@ esp_err_t wifi_manager_init(void)
     (void)wifi_manager_get_mac(mac, sizeof(mac));
     SYS_LOGI(TAG, "ready (hostname '%s', mac %s)", WIFI_MANAGER_HOSTNAME, mac);
 
+    esp_err_t http_err = wifi_manager_register_http();
+    if (http_err != ESP_OK) {
+        SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
+    }
+
 #if CONFIG_TODOHELPER_WIFI_AUTO_CONNECT
     esp_err_t auto_err = wifi_manager_auto_connect();
     if (auto_err == ESP_ERR_NOT_FOUND) {

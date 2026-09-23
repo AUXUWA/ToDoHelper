@@ -19,4 +19,6 @@ idf_component_register(
         word_service
         sync_server
         idle_face
+        ai_service
+        voice_service
 )
