@@ -59,7 +59,7 @@ idf.py build && idf.py -p COM34 flash monitor
 期望日志：
 
 ```
-I (xxx) TH:wifi: ready (hostname 'todohelper', mac 1C:29:04:D0:71:B6)
+I (xxx) TH:wifi: ready (hostname 'todohelper', mac 1c:29:04:xx:xx:xx)
 I (xxx) TH:wifi: no saved network yet            # 首次上电
 I (xxx) TH:wifi: auto connecting to stored network 'MyWiFi'
 I (xxx) TH:wifi: state -> connecting

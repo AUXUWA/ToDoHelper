@@ -98,7 +98,7 @@ L0 sys_utils
 | `IDF_TOOLS_PATH` | `C:\Espressif\tools` |
 | Python venv | `C:\Espressif\tools\python\v6.1\venv`（idf.py 用它运行） |
 | 激活脚本 | `C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1`（eim 生成） |
-| 板子串口 | **COM34** = Silicon Labs CP210x = ESP32-S31 板（MAC `1c:29:04:d0:71:b6`） |
+| 板子串口 | **COM34** = Silicon Labs CP210x = ESP32-S31 板（MAC `1c:29:04:xx:xx:xx`） |
 | 另一串口 | COM26 = CH340，**不是**本板（且常被其它程序占用） |
 | 工具链 | riscv32-esp-elf `esp-15.2.0_20251204`（esp32s31 走 RISC-V） |
 | 组件源 | `IDF_COMPONENT_LOCAL_STORAGE_URL=file://C:\Espressif\tools`（本地镜像，部分组件不可得） |

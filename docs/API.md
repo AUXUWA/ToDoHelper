@@ -24,7 +24,7 @@ HTTP 接口、NVS 键、运行时目录树也集中登记在这里。对应需�
 ## 0. 构建、烧录与运行
 
 环境事实（详见 `AGENT.md` §3）：IDF `D:\ESP-IDF\v6.1\esp-idf`（**v6.1.0**），目标 **`esp32s31`**（RISC-V），
-串口 **COM34**（Silicon Labs CP210x，板子 MAC `1c:29:04:d0:71:b6`）；`COM26`(CH340) 不是本板。
+串口 **COM34**（Silicon Labs CP210x，板子 MAC `1c:29:04:xx:xx:xx`）；`COM26`(CH340) 不是本板。
 
 ```powershell
 . C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
@@ -541,7 +541,7 @@ NVS `idle_bright`（默认 20%）；唤醒 → 恢复 NVS `brightness` 并切回
 按 §0 构建烧录后，串口期望：
 
 ```
-I (xxx) TH:wifi: ready (hostname 'todohelper', mac 1C:29:04:D0:71:B6)
+I (xxx) TH:wifi: ready (hostname 'todohelper', mac 1c:29:04:xx:xx:xx)
 I (xxx) TH:wifi: no saved network yet            # 首次上电
 I (xxx) TH:wifi: auto connecting to stored network 'MyWiFi'
 I (xxx) TH:wifi: state -> connecting
