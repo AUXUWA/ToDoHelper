@@ -8,8 +8,6 @@
 
 #include "pages_internal.h"
 
-static const char *TAG = "ui_pages";
-
 /**
  * The page table.
  *

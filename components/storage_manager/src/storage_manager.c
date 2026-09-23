@@ -16,6 +16,8 @@
 
 #include "esp_littlefs.h"
 #include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "th_bsp.h"
 
@@ -72,13 +74,40 @@ esp_err_t storage_abspath(const char *rel, char *buf, size_t len)
     return storage_path(buf, len, rel);
 }
 
+/**
+ * Create one directory level, treating "already there" as success.
+ *
+ * The errno check is deliberately not `errno == EEXIST`. FatFs's f_mkdir()
+ * returns FR_EXIST only when the path ends with a separator; for a plain path
+ * that already names a directory it sets NS_NONAME|NS_DOT and returns
+ * **FR_INVALID_NAME**, which the ESP-IDF FATFS VFS maps to EINVAL (vfs_fat.c
+ * `fresult_to_errno`). Believing errno alone therefore reported every existing
+ * directory as a hard failure, so the real check is a stat().
+ */
 static esp_err_t mkdir_one(const char *path)
 {
-    if (mkdir(path, 0777) == 0) {
-        return ESP_OK;
-    }
-    if (errno == EEXIST) {
-        return ESP_OK;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (mkdir(path, 0777) == 0) {
+            return ESP_OK;
+        }
+        const int err = errno;
+
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            /* Already exists (as a directory), which is exactly what we want. */
+            return ESP_OK;
+        }
+
+        if (attempt == 0) {
+            /* Creating a child immediately after its parent can fail while the
+             * parent's directory entry is still only in the FatFs window cache;
+             * one short retry is enough and costs nothing. */
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        SYS_LOGW(TAG, "mkdir '%s' failed (errno %d)", path, err);
+        return ESP_FAIL;
     }
     return ESP_FAIL;
 }
@@ -97,19 +126,57 @@ esp_err_t storage_mkdir_p(const char *rel)
             continue;
         }
         path[i] = '\0';
+        /* Log each level's outcome at DEBUG so a partially created tree is
+         * immediately visible in the boot trace. */
         err = mkdir_one(path);
+        SYS_LOGD(TAG, "mkdir -p level '%s' -> %s", path, esp_err_to_name(err));
         path[i] = '/';
         if (err != ESP_OK) {
-            SYS_LOGW(TAG, "mkdir '%s' failed (errno %d)", path, errno);
             return err;
         }
     }
 
     err = mkdir_one(path);
-    if (err != ESP_OK) {
-        SYS_LOGW(TAG, "mkdir '%s' failed (errno %d)", path, errno);
-    }
+    SYS_LOGD(TAG, "mkdir -p leaf '%s' -> %s", path, esp_err_to_name(err));
     return err;
+}
+
+/**
+ * Log what is actually on the card root. Cheap, and it is the fastest way to
+ * tell "the tree was never created" from "the tree is there but a write failed".
+ */
+static void storage_log_root_listing(void)
+{
+    DIR *dir = opendir(s_root);
+    if (dir == NULL) {
+        SYS_LOGW(TAG, "cannot list '%s' (errno %d)", s_root, errno);
+        return;
+    }
+
+    char names[256];
+    size_t used = 0;
+    names[0] = '\0';
+
+    struct dirent *entry = NULL;
+    int count = 0;
+    while ((entry = readdir(dir)) != NULL && count < 24) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        const size_t len = strlen(entry->d_name);
+        if (used + len + 2 >= sizeof(names)) {
+            break;
+        }
+        memcpy(names + used, entry->d_name, len);
+        used += len;
+        names[used++] = ' ';
+        names[used] = '\0';
+        count++;
+    }
+    closedir(dir);
+
+    SYS_LOGI(TAG, "%s contains %d entr%s: %s", s_root, count, (count == 1) ? "y" : "ies",
+             count > 0 ? names : "(empty)");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -205,10 +272,36 @@ static const char *const s_app_subdirs[] = {
 
 static void storage_prepare_tree(void)
 {
+    size_t failed = 0;
     for (size_t i = 0; i < sizeof(s_app_subdirs) / sizeof(s_app_subdirs[0]); i++) {
-        /* Missing optional directories are harmless; mkdir_p already logs. */
-        (void)storage_mkdir_p(s_app_subdirs[i]);
+        if (storage_mkdir_p(s_app_subdirs[i]) != ESP_OK) {
+            failed++;
+        }
     }
+
+    if (failed > 0) {
+        SYS_LOGW(TAG, "%u of %u application directories could not be created",
+                 (unsigned)failed, (unsigned)(sizeof(s_app_subdirs) / sizeof(s_app_subdirs[0])));
+    } else {
+        SYS_LOGI(TAG, "application directory tree ready under '%s'", s_app_dir);
+    }
+    storage_log_root_listing();
+}
+
+/** Mirror the storage state into sys_status for the status bar and home page. */
+static void storage_status_mutator(sys_status_t *st, void *arg)
+{
+    const bool *sd = (const bool *)arg;
+    st->sd_available = *sd;
+    st->storage_available = (storage_root() != NULL);
+}
+
+static void storage_publish_status(void)
+{
+    const bool sd = s_sd;
+    /* Without this the UI keeps showing "无存储" even though /sdcard is mounted,
+     * because nothing else ever writes these two fields. */
+    (void)sys_status_update(storage_status_mutator, (void *)&sd);
 }
 
 esp_err_t storage_manager_init(void)
@@ -230,6 +323,7 @@ esp_err_t storage_manager_init(void)
 
     if (err != ESP_OK) {
         SYS_LOGE(TAG, "no usable storage backend; running without persistence");
+        storage_publish_status();
         sys_event_post_to(STORAGE_EVENT, STORAGE_EVENT_UNMOUNTED, NULL, 0);
         return ESP_OK;
     }
@@ -239,6 +333,7 @@ esp_err_t storage_manager_init(void)
 
     storage_prepare_tree();
     storage_probe_space();
+    storage_publish_status();
 
     sys_event_post_to(STORAGE_EVENT, STORAGE_EVENT_MOUNTED, s_root, strlen(s_root) + 1);
     sys_events_post(SYS_EVENT_STORAGE_READY, NULL, 0);

@@ -108,6 +108,17 @@ esp_err_t ui_statusbar_refresh(void)
         return ESP_FAIL;
     }
 
+    /* Take the LVGL lock here instead of trusting the caller. This function is
+     * reached from three places with different locking situations: the
+     * once-a-second lv_timer (already inside the LVGL task; the adapter lock is
+     * recursive so this is safe), an event marshalled into the LVGL task, and
+     * app_main. The app_main path used to run without the lock, which corrupted
+     * LVGL's object lists while the render task walked them and wedged the main
+     * task hard enough to trip the task watchdog. */
+    if (!ui_lock(-1)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     /* ---- WiFi ---- */
     if (s_wifi_label != NULL) {
         if (st.wifi_connected) {
@@ -171,5 +182,6 @@ esp_err_t ui_statusbar_refresh(void)
         }
     }
 
+    ui_unlock();
     return ESP_OK;
 }

@@ -181,6 +181,31 @@ bool sys_config_get_bool_or(const char *key, bool fallback);
  */
 esp_err_t sys_config_get_str_or(const char *key, char *out, size_t len, const char *fallback);
 
+/* ------------------------------------------------------------------------ */
+/* Diagnostics                                                               */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * @brief Log the heap situation with a stage label.
+ *
+ * This board has only ~310 KB of **internal** RAM against 12.4 MB of PSRAM, and
+ * several subsystems (esp_wifi_init, mDNS, I2S DMA, task stacks) need large
+ * contiguous *internal* blocks. When one of them fails with ESP_ERR_NO_MEM it is
+ * almost always internal exhaustion, so every boot stage logs this trace:
+ *
+ *     I TH:heap: after bsp            internal    231 KB (largest    180 KB)  ...
+ *
+ * `largest` (the biggest free internal block) is the number that matters for
+ * esp_wifi_init(); the total can look healthy while fragmentation still breaks a
+ * large allocation.
+ *
+ * @param stage Short stage label, e.g. "bsp", "ui_core", "wifi".
+ */
+void sys_heap_log(const char *stage);
+
+/** @brief Largest free block of internal DMA-capable RAM, in bytes. */
+size_t sys_heap_largest_internal(void);
+
 #ifdef __cplusplus
 }
 #endif

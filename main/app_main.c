@@ -83,6 +83,11 @@ static esp_err_t run_modules(bool after_ui)
         const esp_err_t err = m->init();
         if (err == ESP_OK) {
             SYS_LOGI(TAG, "module '%s' ready", m->name);
+            /* This board has only ~310 KB of internal RAM against 12.4 MB of
+             * PSRAM, and WiFi/mDNS/I2S all need large *internal* blocks. Tracing
+             * every stage is how we find out which module eats the scarce pool;
+             * see sys_heap_log() and AGENT.md section 9. */
+            sys_heap_log(m->name);
             continue;
         }
 
@@ -145,21 +150,28 @@ void app_main(void)
     ESP_ERROR_CHECK(sys_events_init());
 
     log_reset_reason();
+    sys_heap_log("startup");
 
     /* Board first: everything visual depends on the display/LVGL chain. */
     ESP_ERROR_CHECK(th_bsp_init());
+    sys_heap_log("bsp (display+LVGL)");
 
     /* Storage is optional by design: no SD card means the internal LittleFS,
      * and if that fails too the app still runs without persistence. */
     ESP_ERROR_CHECK(storage_manager_init());
+    sys_heap_log("storage");
 
     /* Packed icons (weather symbols). Missing assets only degrade the UI. */
     if (ui_assets_init() != ESP_OK) {
         SYS_LOGW(TAG, "UI assets unavailable, pages will use text fallbacks");
     }
+    sys_heap_log("ui_assets");
 
     ESP_ERROR_CHECK(ui_core_init());
+    sys_heap_log("ui_core");
+
     ESP_ERROR_CHECK(ui_pages_init());
+    sys_heap_log("ui_pages");
 
     /* Show the splash before the slow, optional services come up. */
     ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH));
@@ -175,8 +187,11 @@ void app_main(void)
 
     (void)run_modules(true);
 
-    (void)ui_statusbar_refresh();
+    /* Do not touch the status bar from here: ui_core owns it, and LVGL must only
+     * be driven from the LVGL task or under the lock. Ask for a refresh instead. */
+    (void)sys_status_publish();
     (void)sys_events_post(SYS_EVENT_READY, NULL, 0);
 
     SYS_LOGI(TAG, "ready (storage=%s)", storage_root() ? storage_root() : "none");
+    sys_heap_log("boot complete");
 }

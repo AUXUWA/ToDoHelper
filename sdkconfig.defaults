@@ -13,12 +13,34 @@ CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_SPIRAM_MEMTEST=n
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=12768
+# THE critical knob on this board.
+#
+# Internal RAM is ~310 KB total, PSRAM is 12.4 MB. The IDF default of 16384 makes
+# every allocation below 16 KB prefer internal RAM, and esp_wifi_init() makes a
+# *lot* of those, which defeats SPIRAM_TRY_ALLOCATE_WIFI_LWIP. Measured on the
+# device: with 16384, WiFi dropped internal free from 172 KB to 15 KB with a
+# largest free block of 0 KB, so SDMMC DMA, httpd, the AI worker and I2S then all
+# failed with "not enough mem" / ESP_ERR_NO_MEM.
+#
+# Keeping the threshold at 4 KB sends the generic mid-size allocations to PSRAM
+# and leaves internal RAM available for the allocations that genuinely require it
+# (MALLOC_CAP_DMA descriptors, task stacks, net80211's large blocks).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
 CONFIG_FREERTOS_HZ=1000
+# Lets the components that support it place their worker task stacks in PSRAM.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 
-# ToDoHelper: app_main does module orchestration (WiFi/HTTP/NVS), needs more than the 3.5 KB default.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# mDNS must not take internal RAM. Its task stack and its internal allocation
+# both default to internal RAM, and both failed outright on this board
+# ("failed to allocate memory for the mDNS task's stack", free heap 10 MB).
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+
+# ToDoHelper: app_main does module orchestration, and page objects are created
+# from it (ui_page_switch -> page create) while FreeType fonts are in play.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 
 # ToDoHelper: file names under <root>/todohelper/... need long filename support.
 CONFIG_FATFS_LFN_HEAP=y
@@ -76,7 +98,9 @@ CONFIG_LV_USE_CLIB_SPRINTF=y
 CONFIG_LV_DEF_REFR_PERIOD=15
 CONFIG_LV_DPI_DEF=60
 CONFIG_LV_DRAW_LAYER_SIMPLE_BUF_SIZE=29152
-CONFIG_LV_CACHE_DEF_SIZE=4194304
+# Only a handful of small PNG icons are ever cached; the 4 MB default is pure
+# waste on a device with 310 KB of internal RAM.
+CONFIG_LV_CACHE_DEF_SIZE=1048576
 CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=32
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_18=y

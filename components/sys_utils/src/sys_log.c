@@ -6,6 +6,7 @@
 
 #include "sys_log.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,6 +33,18 @@ void sys_log_set_level(sys_log_level_t level)
 
     /* Keep the IDF logger in sync so third-party components honour the same level. */
     esp_log_level_set("*", (esp_log_level_t)(level + 1));
+
+    /*
+     * Tags that are noisy by design and drown out everything useful.
+     *
+     * `wifi` prints a W-level line for every PHY rate it settles on (a dozen lines
+     * on association) and `pp`/`net80211`/`phy` print firmware banners. None of
+     * them indicate a problem, and on a 115200 console they hide the app log.
+     */
+    static const char *const quiet[] = { "wifi", "phy", "pp", "net80211", "wifi_init" };
+    for (size_t i = 0; i < sizeof(quiet) / sizeof(quiet[0]); i++) {
+        esp_log_level_set(quiet[i], ESP_LOG_ERROR);
+    }
 }
 
 sys_log_level_t sys_log_get_level(void)
