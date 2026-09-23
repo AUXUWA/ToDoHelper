@@ -248,7 +248,21 @@ static esp_err_t parse_book(const char *json)
 
 static void progress_key(char *out, size_t len, uint32_t id)
 {
-    snprintf(out, len, "w%lu", (unsigned long)id);
+    /*
+     * Namespaced by book.
+     *
+     * Ids restart at 1 in every book, so the previous bare "w<id>" let CET-4 review
+     * state land on unrelated CET-6 words after a book switch: the key matched, the
+     * entry was an object, and the load path even logged "no saved progress for
+     * this book yet" while silently applying the stale state. Putting the book in
+     * the key makes progress per-book, so switching books starts clean and
+     * switching back restores the earlier progress.
+     *
+     * Both the save and the load path build the key through here, so the format
+     * stays consistent. Keys written by older firmware simply stop matching and are
+     * ignored (the file is device-private and is rewritten on the next save).
+     */
+    snprintf(out, len, "%s#w%lu", s_book, (unsigned long)id);
 }
 
 esp_err_t word_save_progress(void)
@@ -281,7 +295,8 @@ esp_err_t word_save_progress(void)
         if (p->review_count == 0) {
             continue;   /* untouched words stay out of the file */
         }
-        char key[24];
+        /* Big enough for the longest possible key: s_book (31) + "#w" + 10 digits. */
+    char key[48];
         progress_key(key, sizeof(key), s_words[i].id);
 
         cJSON *entry = cJSON_CreateObject();
@@ -354,7 +369,8 @@ static esp_err_t load_progress(void)
     if (cJSON_IsObject(items)) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         for (size_t i = 0; i < s_count; i++) {
-            char key[24];
+            /* Big enough for the longest possible key: s_book (31) + "#w" + 10 digits. */
+    char key[48];
             progress_key(key, sizeof(key), s_words[i].id);
             const cJSON *entry = cJSON_GetObjectItemCaseSensitive(items, key);
             if (!cJSON_IsObject(entry)) {

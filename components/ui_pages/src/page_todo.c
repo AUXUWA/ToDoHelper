@@ -6,67 +6,43 @@
 
 /**
  * @file page_todo.c
- * @brief FR2: the device side of the todo list.
+ * @brief FR2: the device side of the todo list — a read-only viewer.
+ *
+ * All todo creation/editing/completion/deletion happens on the PC web page.
+ * The touch panel has no keyboard worth typing Chinese on, and letting two
+ * writers race on the same record made the sync state hard to reason about, so
+ * this page deliberately exposes **no** control that can change a todo. It
+ * stays useful as a viewer: the list shows title, done state and sync state,
+ * the detail page shows the remaining fields, and both point the user at the
+ * web page.
  *
  * Binds TODO_EVENT_LIST_CHANGED so a change made from the PC browser (which
  * arrives through sync_server -> todo_manager) redraws this page immediately.
  * The rows are rebuilt from a snapshot each time; with <= 256 items that is
  * cheaper and far less error-prone than delta-updating widgets.
+ *
+ * Every LVGL call below runs in the LVGL task: create()/on_show()/on_event()
+ * are invoked by ui_core, and ui_event_bind() marshals into that task — see
+ * AGENT.md 9.0.1.
  */
 
 #include "pages_internal.h"
 
-#include <string.h>
-
 #include "todo_manager.h"
-#include "ui_assets.h"
 
 static const char *TAG = "page_todo";
 
+/** Shown in place of the removed editing controls. */
+#define TODO_READONLY_HINT "设备端只读 | 请在电脑网页端编辑"
+
 static lv_obj_t *s_list;
 static lv_obj_t *s_stats;
-static lv_obj_t *s_input_overlay;
-static lv_obj_t *s_input_area;
 
 /* ------------------------------------------------------------------------ */
 /* Row callbacks                                                             */
 /* ------------------------------------------------------------------------ */
 
-static void row_toggle_cb(lv_event_t *e)
-{
-    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
-    lv_obj_t *checkbox = lv_event_get_target(e);
-    const bool checked = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
-
-    esp_err_t err = todo_set_done(id, checked);
-    if (err == ESP_ERR_NOT_FOUND) {
-        ui_toast("该待办已不存在");
-        return;
-    }
-    if (err != ESP_OK) {
-        ui_toast("更新失败：%s", esp_err_to_name(err));
-        return;
-    }
-
-    /* Completing something is a moment worth celebrating (FR6 HAPPY). */
-    if (checked) {
-        ui_toast("已完成");
-    }
-}
-
-static void row_delete_cb(lv_event_t *e)
-{
-    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
-    esp_err_t err = todo_delete(id);
-    if (err == ESP_ERR_NOT_FOUND) {
-        ui_toast("该待办已不存在");
-    } else if (err != ESP_OK) {
-        ui_toast("删除失败：%s", esp_err_to_name(err));
-    } else {
-        ui_toast("已删除");
-    }
-}
-
+/** Tapping a row is navigation only: it opens the read-only detail page. */
 static void row_open_cb(lv_event_t *e)
 {
     const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
@@ -75,139 +51,20 @@ static void row_open_cb(lv_event_t *e)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Input overlay                                                             */
-/* ------------------------------------------------------------------------ */
-
-static void input_close(void)
-{
-    if (s_input_overlay != NULL) {
-        lv_obj_delete(s_input_overlay);
-        s_input_overlay = NULL;
-        s_input_area = NULL;
-    }
-}
-
-static void input_cancel_cb(lv_event_t *e)
-{
-    (void)e;
-    input_close();
-}
-
-static void input_submit_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_input_area == NULL) {
-        return;
-    }
-
-    const char *text = lv_textarea_get_text(s_input_area);
-    if (text == NULL || text[0] == '\0') {
-        ui_toast("请输入内容");
-        return;
-    }
-
-    todo_item_t item;
-    memset(&item, 0, sizeof(item));
-    strlcpy(item.title, text, sizeof(item.title));
-
-    uint32_t id = 0;
-    esp_err_t err = todo_add(&item, &id);
-    input_close();
-
-    if (err == ESP_OK) {
-        ui_toast("已添加 #%lu", (unsigned long)id);
-    } else {
-        ui_toast("添加失败：%s", esp_err_to_name(err));
-    }
-}
-
-static void input_open(void)
-{
-    if (s_input_overlay != NULL) {
-        return;
-    }
-
-    s_input_overlay = lv_obj_create(lv_layer_top());
-    if (s_input_overlay == NULL) {
-        return;
-    }
-    lv_obj_remove_style_all(s_input_overlay);
-    lv_obj_set_size(s_input_overlay, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(s_input_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_input_overlay, LV_OPA_70, 0);
-    lv_obj_set_flex_flow(s_input_overlay, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(s_input_overlay, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(s_input_overlay, 8, 0);
-    lv_obj_set_style_pad_row(s_input_overlay, 8, 0);
-    lv_obj_remove_flag(s_input_overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *row = lv_obj_create(s_input_overlay);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(row, 8, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_input_area = lv_textarea_create(row);
-    lv_textarea_set_one_line(s_input_area, true);
-    lv_textarea_set_max_length(s_input_area, TODO_TITLE_MAX - 1);
-    lv_textarea_set_placeholder_text(s_input_area, "新待办（英文/数字，中文请用电脑网页）");
-    lv_obj_set_flex_grow(s_input_area, 1);
-    lv_obj_set_style_text_font(s_input_area, ui_font(UI_FONT_BODY), 0);
-
-    lv_obj_t *ok = lv_button_create(row);
-    lv_obj_set_height(ok, UI_TOUCH_MIN);
-    lv_obj_t *ok_label = lv_label_create(ok);
-    lv_label_set_text(ok_label, "添加");
-    lv_obj_center(ok_label);
-    lv_obj_add_event_cb(ok, input_submit_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *cancel = lv_button_create(row);
-    lv_obj_set_height(cancel, UI_TOUCH_MIN);
-    lv_obj_set_style_bg_color(cancel, UI_COLOR_SURFACE_ALT, 0);
-    lv_obj_t *cancel_label = lv_label_create(cancel);
-    lv_label_set_text(cancel_label, "取消");
-    lv_obj_center(cancel_label);
-    lv_obj_add_event_cb(cancel, input_cancel_cb, LV_EVENT_CLICKED, NULL);
-
-    (void)ui_keyboard_create(s_input_overlay, s_input_area);
-}
-
-/* ------------------------------------------------------------------------ */
-/* Toolbar callbacks                                                         */
-/* ------------------------------------------------------------------------ */
-
-static void add_clicked_cb(lv_event_t *e)
-{
-    (void)e;
-    input_open();
-}
-
-static void sync_clicked_cb(lv_event_t *e)
-{
-    (void)e;
-    esp_err_t err = todo_mark_all_synced();
-    if (err == ESP_OK) {
-        ui_toast("已标记为同步");
-    } else {
-        ui_toast("同步失败：%s", esp_err_to_name(err));
-    }
-}
-
-static void clear_done_clicked_cb(lv_event_t *e)
-{
-    (void)e;
-    size_t removed = 0;
-    if (todo_clear_done(&removed) == ESP_OK) {
-        ui_toast(removed > 0 ? "已清除 %u 项" : "没有已完成项", (unsigned)removed);
-    }
-}
-
-/* ------------------------------------------------------------------------ */
 /* Render                                                                    */
 /* ------------------------------------------------------------------------ */
+
+/** One muted line telling the user where a todo can actually be changed. */
+static void readonly_hint_create(lv_obj_t *parent)
+{
+    lv_obj_t *hint = lv_label_create(parent);
+    lv_obj_set_width(hint, LV_PCT(100));
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(hint, TODO_READONLY_HINT);
+    lv_obj_set_style_text_font(hint, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(hint, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+}
 
 static void render_list(void)
 {
@@ -225,7 +82,7 @@ static void render_list(void)
 
     if (count == 0) {
         lv_obj_t *empty = lv_label_create(s_list);
-        lv_label_set_text(empty, "还没有待办。\n在电脑浏览器打开设备地址即可添加。");
+        lv_label_set_text(empty, "还没有待办。\n请在电脑网页端新增（浏览器打开设备地址）。");
         lv_obj_set_style_text_font(empty, ui_font(UI_FONT_BODY), 0);
         lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
         lv_obj_set_style_pad_all(empty, 24, 0);
@@ -252,14 +109,16 @@ static void render_list(void)
                               LV_FLEX_ALIGN_CENTER);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+        /* The checkbox is a *done indicator*, not a control: without
+         * LV_OBJ_FLAG_CLICKABLE it cannot be toggled by touch, so tapping it
+         * falls through to the row and only opens the detail page. */
         lv_obj_t *checkbox = lv_checkbox_create(row);
         lv_checkbox_set_text(checkbox, "");
         lv_obj_set_size(checkbox, 34, 34);
+        lv_obj_remove_flag(checkbox, LV_OBJ_FLAG_CLICKABLE);
         if (item->done) {
             lv_obj_add_state(checkbox, LV_STATE_CHECKED);
         }
-        lv_obj_add_event_cb(checkbox, row_toggle_cb, LV_EVENT_VALUE_CHANGED,
-                            (void *)(uintptr_t)item->id);
 
         lv_obj_t *title = lv_label_create(row);
         lv_label_set_text(title, item->title);
@@ -283,22 +142,10 @@ static void render_list(void)
                                         0);
         }
 
-        /* Tapping the title opens the detail page; the delete button sits at the
-         * end so it is never hit by accident while scrolling. */
+        /* Tapping the row (or its title) opens the read-only detail page. */
         lv_obj_add_flag(title, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(title, row_open_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)item->id);
         lv_obj_add_event_cb(row, row_open_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)item->id);
-
-        lv_obj_t *del = lv_button_create(row);
-        lv_obj_set_size(del, 60, UI_TOUCH_MIN);
-        lv_obj_set_style_bg_color(del, UI_COLOR_SURFACE_ALT, 0);
-        lv_obj_t *del_label = lv_label_create(del);
-        lv_label_set_text(del_label, "删除");
-        lv_obj_set_style_text_font(del_label, ui_font(UI_FONT_SMALL), 0);
-        lv_obj_center(del_label);
-        lv_obj_add_event_cb(del, row_delete_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)item->id);
-
-        lv_obj_move_foreground(row);
     }
 
     todo_free_list(items);
@@ -353,41 +200,15 @@ static esp_err_t todo_create(lv_obj_t *parent)
     lv_obj_add_flag(s_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
 
-    lv_obj_t *bar = lv_obj_create(parent);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_width(bar, LV_PCT(100));
-    lv_obj_set_height(bar, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(bar, 10, 0);
-    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    const struct {
-        const char *text;
-        lv_event_cb_t cb;
-        lv_color_t color;
-    } buttons[] = {
-        { "新增", add_clicked_cb, UI_COLOR_PRIMARY },
-        { "标记已同步", sync_clicked_cb, UI_COLOR_SURFACE_ALT },
-        { "清除已完成", clear_done_clicked_cb, UI_COLOR_SURFACE_ALT },
-    };
-
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        lv_obj_t *btn = lv_button_create(bar);
-        lv_obj_set_height(btn, UI_TOUCH_MIN);
-        lv_obj_set_flex_grow(btn, 1);
-        lv_obj_set_style_bg_color(btn, buttons[i].color, 0);
-        lv_obj_t *label = lv_label_create(btn);
-        lv_label_set_text(label, buttons[i].text);
-        lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
-        lv_obj_center(label);
-        lv_obj_add_event_cb(btn, buttons[i].cb, LV_EVENT_CLICKED, NULL);
-    }
+    /* The "新增 / 标记已同步 / 清除已完成" toolbar used to live here; editing is
+     * done on the PC web page, so its slot now carries that hint instead. */
+    readonly_hint_create(parent);
 
     refresh();
 
     /* Data can change from the HTTP task, so only refresh through events. */
     (void)ui_event_bind(TODO_EVENT, TODO_EVENT_LIST_CHANGED, UI_PAGE_TODO, 0);
-    SYS_LOGD(TAG, "todo page built");
+    SYS_LOGD(TAG, "todo page built (read-only)");
     return ESP_OK;
 }
 
@@ -414,7 +235,7 @@ const ui_page_t page_todo = {
 };
 
 /* ------------------------------------------------------------------------ */
-/* Detail page (FR2 / UI_PAGE_TODO_DETAIL)                                   */
+/* Detail page (FR2 / UI_PAGE_TODO_DETAIL) — display only                    */
 /* ------------------------------------------------------------------------ */
 
 static uint32_t s_detail_id;
@@ -448,50 +269,14 @@ static void detail_refresh(void)
     const char *sync = (item.sync_state < 4) ? sync_names[item.sync_state] : "?";
 
     if (item.due_ts > 0) {
-        lv_label_set_text_fmt(s_detail_meta, "#%lu · 优先级 %u · %s · 到期 %lld",
-                              (unsigned long)item.id, item.priority, sync,
-                              (long long)item.due_ts);
+        lv_label_set_text_fmt(s_detail_meta, "#%lu · %s · 优先级 %u · %s · 到期 %lld",
+                              (unsigned long)item.id, item.done ? "已完成" : "未完成",
+                              item.priority, sync, (long long)item.due_ts);
     } else {
-        lv_label_set_text_fmt(s_detail_meta, "#%lu · 优先级 %u · %s · 无到期时间",
-                              (unsigned long)item.id, item.priority, sync);
+        lv_label_set_text_fmt(s_detail_meta, "#%lu · %s · 优先级 %u · %s · 无到期时间",
+                              (unsigned long)item.id, item.done ? "已完成" : "未完成",
+                              item.priority, sync);
     }
-}
-
-static void detail_toggle_cb(lv_event_t *e)
-{
-    (void)e;
-    todo_item_t item;
-    if (todo_get(s_detail_id, &item) != ESP_OK) {
-        ui_toast("该待办已不存在");
-        return;
-    }
-    if (todo_set_done(s_detail_id, !item.done) == ESP_OK) {
-        ui_toast(item.done ? "已取消完成" : "已完成");
-    }
-    detail_refresh();
-}
-
-static void detail_priority_cb(lv_event_t *e)
-{
-    (void)e;
-    todo_item_t item;
-    if (todo_get(s_detail_id, &item) != ESP_OK) {
-        return;
-    }
-    item.priority = (uint8_t)((item.priority + 1) % 3);
-    if (todo_update(s_detail_id, &item) == ESP_OK) {
-        ui_toast("优先级：%u", item.priority);
-    }
-    detail_refresh();
-}
-
-static void detail_delete_cb(lv_event_t *e)
-{
-    (void)e;
-    if (todo_delete(s_detail_id) == ESP_OK) {
-        ui_toast("已删除");
-    }
-    (void)ui_nav_back();
 }
 
 static esp_err_t todo_detail_create(lv_obj_t *parent)
@@ -519,35 +304,9 @@ static esp_err_t todo_detail_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(s_detail_desc, ui_font(UI_FONT_BODY), 0);
     lv_obj_set_style_text_color(s_detail_desc, UI_COLOR_TEXT, 0);
 
-    lv_obj_t *bar = lv_obj_create(parent);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_width(bar, LV_PCT(100));
-    lv_obj_set_height(bar, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(bar, 10, 0);
-    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    const struct {
-        const char *text;
-        lv_event_cb_t cb;
-        lv_color_t color;
-    } buttons[] = {
-        { "完成/取消", detail_toggle_cb, UI_COLOR_SUCCESS },
-        { "优先级", detail_priority_cb, UI_COLOR_SURFACE_ALT },
-        { "删除", detail_delete_cb, UI_COLOR_DANGER },
-    };
-
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        lv_obj_t *btn = lv_button_create(bar);
-        lv_obj_set_height(btn, UI_TOUCH_MIN);
-        lv_obj_set_flex_grow(btn, 1);
-        lv_obj_set_style_bg_color(btn, buttons[i].color, 0);
-        lv_obj_t *label = lv_label_create(btn);
-        lv_label_set_text(label, buttons[i].text);
-        lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
-        lv_obj_center(label);
-        lv_obj_add_event_cb(btn, buttons[i].cb, LV_EVENT_CLICKED, NULL);
-    }
+    /* The "完成/取消 / 优先级 / 删除" bar used to live here; the detail page is
+     * a viewer now, so its slot carries the read-only hint instead. */
+    readonly_hint_create(parent);
 
     detail_refresh();
     (void)ui_event_bind(TODO_EVENT, TODO_EVENT_LIST_CHANGED, UI_PAGE_TODO_DETAIL, 0);

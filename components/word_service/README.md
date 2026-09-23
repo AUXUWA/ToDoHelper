@@ -19,7 +19,7 @@
 
 ## 词库格式
 
-词库文件放在 `<app_dir>/words/<book>.json`（默认 `<book>` = `WORD_DEFAULT_BOOK` = `cet4`，
+词库文件放在 `<app_dir>/words/<book>.json`（默认 `<book>` = `WORD_DEFAULT_BOOK` = `cet6`，
 NVS 键 `word_book` 可改）。`parse_book()` 接受的字段：
 
 ```json
@@ -54,7 +54,9 @@ NVS 键 `word_book` 可改）。`parse_book()` 接受的字段：
 1. `<app_dir>/words/<book>.json` 存在 → 从存储加载（`word_load_from_sd()`）；
 2. 否则，若 `CONFIG_TODOHELPER_WORD_EXPORT_TEMPLATE`（默认 `y`）打开，就把内置词库**写到存储**，
    给出一个可直接编辑/替换的模板文件；
-3. 无论写没写成功，最后都用**编译进固件的** `WORD_DEFAULT_BOOK_JSON` 解析，保证功能可用。
+3. 读不到卡上文件时（没插卡、文件缺失或 JSON 不合法），回退到**编译进固件的**
+   `WORD_DEFAULT_BOOK_JSON`（32 个示例词），保证功能可用。注意这只是兜底：
+   优先使用的始终是 `<app_dir>/words/<book>.json`。
 
 需求 §17.2 仍把"词库来源"列为待确认项，所以这条"内置兜底 + 导出模板"的路径是刻意的：
 换词库不需要重新烧录。`word_load_from_sd()` 同时接受相对路径和 `<app_dir>` 下的绝对路径。
@@ -150,15 +152,15 @@ idf.py -p COM34 flash monitor
 首次上电（无词库文件时）：
 
 ```
-I (xxx) TH:word: starter wordbook written to 'words/cet4.json'
+I (xxx) TH:word: starter wordbook written to 'words/cet6.json'
 I (xxx) TH:word: using the compiled-in starter wordbook
-I (xxx) TH:word: ready (book 'cet4', 32 words, 10/day)
+I (xxx) TH:word: ready (book 'cet6', 32 words, 10/day)
 ```
 
 第二次上电（文件已在存储上）：
 
 ```
-I (xxx) TH:word: loaded 32 words from 'words/cet4.json'
+I (xxx) TH:word: loaded 32 words from 'words/cet6.json'
 I (xxx) TH:word: progress restored for 3 word(s)
 ```
 

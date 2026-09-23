@@ -13,6 +13,15 @@
  * material). Every state shares one set of objects whose properties are tweened,
  * so switching expressions never allocates (requirement 11.3).
  *
+ * Animation model:
+ *   - switching between two expressions cross-fades from the *current* visual
+ *     state to the new table row through an ease curve (never a snap);
+ *   - blinking, glancing, pupil drift and breathing are each randomised every
+ *     cycle, so nothing repeats on a fixed period;
+ *   - entering standby eases the eyes shut (SLEEPY) and leaving it widens them
+ *     back open (idle_face_standby_enter/exit, driven by the idle page's
+ *     on_show/on_hide).
+ *
  * State definitions live in exactly three places and must stay in sync:
  *   - idle_face_state_t below,
  *   - the effect table in idle_face.c,
@@ -42,19 +51,36 @@ typedef enum {
 } idle_face_event_id_t;
 
 typedef enum {
-    IDLE_FACE_NORMAL = 0,   /**< default: oval eyes, gentle breathing */
-    IDLE_FACE_BLINK,        /**< eyes close and reopen (random 3-8 s) */
-    IDLE_FACE_LOOK_LEFT,    /**< pupils move left */
-    IDLE_FACE_LOOK_RIGHT,   /**< pupils move right */
+    IDLE_FACE_NORMAL = 0,   /**< default: oval eyes, randomised breathing */
+    IDLE_FACE_BLINK,        /**< eyes close and reopen (random 2.6-7.5 s) */
+    IDLE_FACE_LOOK_LEFT,    /**< pupils move left (kept for the API/trigger table) */
+    IDLE_FACE_LOOK_RIGHT,   /**< pupils move right (kept for the API/trigger table) */
     IDLE_FACE_HAPPY,        /**< arcs: todo done, WiFi connected */
-    IDLE_FACE_SLEEPY,       /**< half closed: night, long inactivity */
+    IDLE_FACE_SLEEPY,       /**< half closed: night, long inactivity, *standby pose* */
     IDLE_FACE_ERROR,        /**< crossed eyes: WiFi / sync failure */
     IDLE_FACE_SYNCING,      /**< pupils circling: sync in progress */
     IDLE_FACE_THINKING,     /**< one pupil looks up: network request */
     IDLE_FACE_LISTENING,    /**< eyes enlarged: voice wake, AI recording (P2) */
-    IDLE_FACE_SPEAKING,     /**< rhythmic: AI is talking (P2) */
+    IDLE_FACE_SPEAKING,     /**< rhythmic arcs: AI is talking (P2) */
     IDLE_FACE_MAX,
 } idle_face_state_t;
+
+/**
+ * @brief Play the standby entry animation (eyes ease shut into SLEEPY).
+ *
+ * Called by the idle page's @c on_show, so it runs every time the standby
+ * screen is (re-)entered. It refuses to run when a notification expression is
+ * live; the caller does not need to check anything.
+ */
+esp_err_t idle_face_standby_enter(void);
+
+/**
+ * @brief Play the standby exit animation (eyes widen and settle to NORMAL).
+ *
+ * Called by the idle page's @c on_hide, i.e. when the screen is woken. Returns
+ * @c ESP_ERR_INVALID_STATE when the face was not in the standby pose.
+ */
+esp_err_t idle_face_standby_exit(void);
 
 /**
  * @brief Component entry point: register the idle page and start the animator.

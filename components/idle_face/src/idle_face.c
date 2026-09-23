@@ -41,16 +41,55 @@ ESP_EVENT_DEFINE_BASE(IDLE_FACE_EVENT);
 
 /** Animator period: ~30 fps, and 15 fps is acceptable for an idle screen. */
 #define IDLE_FACE_TICK_MS 33
-/** Blink duration and the interval it is repeated on. */
-#define IDLE_FACE_BLINK_MS 130
-#define IDLE_FACE_BLINK_MIN_MS 3000
-#define IDLE_FACE_BLINK_MAX_MS 8000
-/** Look-around, only while the face is idle (NORMAL). */
-#define IDLE_FACE_LOOK_MIN_MS 4000
-#define IDLE_FACE_LOOK_MAX_MS 12000
-#define IDLE_FACE_LOOK_HOLD_MS 1400
+
+/* ------------------------------------------------------------------------- */
+/* Tunables                                                                  */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Autonomous behaviour intervals. Every one of them is re-rolled from a fresh
+ * random value, so the face never repeats a rhythm (see "Randomisation" in the
+ * component README).
+ */
+/** Blink: the gap is re-rolled every time, and ~18% of blinks are doubled. */
+#define IDLE_FACE_BLINK_MIN_MS       2600
+#define IDLE_FACE_BLINK_MAX_MS       7500
+#define IDLE_FACE_BLINK_DUR_MIN_MS   110
+#define IDLE_FACE_BLINK_DUR_MAX_MS   165
+#define IDLE_FACE_BLINK_DOUBLE_PCT   18
+#define IDLE_FACE_BLINK_DOUBLE_MS    300
+/** Look-around: hold time is random too, so glances have different lengths. */
+#define IDLE_FACE_LOOK_MIN_MS        4000
+#define IDLE_FACE_LOOK_MAX_MS        12000
+#define IDLE_FACE_LOOK_HOLD_MIN_MS   900
+#define IDLE_FACE_LOOK_HOLD_MAX_MS   2000
+#define IDLE_FACE_LOOK_GAIN          0.16f  /**< per tick, ~180 ms settle */
+/** Micro-saccade: a few pixels of pupil drift, well below a full glance. */
+#define IDLE_FACE_SACCADE_MIN_MS     1800
+#define IDLE_FACE_SACCADE_MAX_MS     5200
+#define IDLE_FACE_SACCADE_GAIN       0.30f
+/** Breathing: the period is re-rolled after every cycle (~12-19 s). */
+#define IDLE_FACE_BREATH_MIN_MS      12000
+#define IDLE_FACE_BREATH_MAX_MS      19000
+#define IDLE_FACE_BREATH_AMP         0.030f
+#define IDLE_FACE_SYNC_PERIOD_MS     1800   /**< SYNCING pupil orbit */
+#define IDLE_FACE_TALK_PERIOD_MS     620    /**< SPEAKING "mouth-less" rhythm */
+
 /** Default duration for idle_face_express(). */
 #define IDLE_FACE_EXPRESS_DEFAULT_MS 1600
+
+/**
+ * Expression cross-fade duration, derived from the effect table's `speed`
+ * column: SPEED_FAST states snap (a blink must not take half a second),
+ * everything else eases over a little under half a second.
+ */
+#define IDLE_FACE_XFADE_MS           420
+#define IDLE_FACE_XFADE_FAST_MS      180
+
+/** Standby enter (eyes droop shut) / exit (eyes widen and settle). */
+#define IDLE_FACE_SLEEP_MS           950
+#define IDLE_FACE_WAKE_MS            700
+#define IDLE_FACE_WAKE_OVERSHOOT     0.12f
 
 /* ------------------------------------------------------------------------ */
 /* Effect table (requirement 11.2)                                           */
@@ -61,7 +100,10 @@ ESP_EVENT_DEFINE_BASE(IDLE_FACE_EVENT);
  *
  * `open` scales the eye height, `pupil` the pupil visibility, `dx`/`dy` shift
  * the pupil inside the eye. `arc` morphs the outline into an upward arc (happy)
- * and `cross` switches to the X shape (error).
+ * and `cross` switches to the X shape (error). `speed` is *not* a per-frame
+ * lerp gain any more: it only selects the cross-fade duration (fast vs. slow)
+ * when this state becomes the target, and it is stored per state so the table
+ * stays the single source of truth for how each expression moves.
  */
 typedef struct {
     float open;
@@ -72,7 +114,7 @@ typedef struct {
     float cross;
     float eye_dy;
     float width_scale;
-    float speed;      /**< interpolation gain per tick, 0..1 */
+    float speed;      /**< cross-fade class: SPEED_FAST = snappy, else eased */
 } face_params_t;
 
 #define SPEED_FAST   0.55f
@@ -90,7 +132,7 @@ static const face_params_t s_effects[IDLE_FACE_MAX] = {
     /* SYNCING    */ { 0.92f,  0.00f,  0.00f, 1.00f, 0.0f, 0.0f,   0.0f, 1.00f, SPEED_NORMAL },
     /* THINKING   */ { 0.92f,  0.00f, -0.75f, 1.00f, 0.0f, 0.0f, -10.0f, 1.00f, SPEED_NORMAL },
     /* LISTENING  */ { 1.28f,  0.00f,  0.00f, 1.00f, 0.0f, 0.0f,   0.0f, 1.20f, SPEED_NORMAL },
-    /* SPEAKING   */ { 0.78f,  0.00f,  0.00f, 0.00f, 0.8f, 0.0f,  -4.0f, 1.25f, SPEED_FAST },
+    /* SPEAKING   */ { 0.78f,  0.00f,  0.00f, 0.00f, 0.8f, 0.0f,  -4.0f, 1.25f, SPEED_NORMAL },
 };
 
 /* ------------------------------------------------------------------------ */
@@ -105,12 +147,32 @@ typedef struct {
     lv_timer_t *timer;
 } face_objects_t;
 
+/**
+ * A cross-fade in flight.
+ *
+ * Expression switches used to snap because `s_current` was lerped towards the
+ * new table row with a per-frame gain: the first frame already jumped a large
+ * fraction of the way. Now `from` freezes the visual state the moment the
+ * target changes, `elapsed_ms` is accumulated and the render values are
+ * recomputed as `from -> target` through an ease curve. Nothing is allocated
+ * and no LVGL animation object is involved.
+ */
+typedef struct {
+    face_params_t from;
+    idle_face_state_t target;
+    uint32_t elapsed_ms;
+    uint32_t duration_ms;
+} face_transition_t;
+
 static face_objects_t s_face;
 static bool s_attached;
 
 static idle_face_state_t s_state = IDLE_FACE_NORMAL;
 static face_params_t s_current;
-static float s_phase;              /**< 0..1, drives breathing and circling */
+static face_transition_t s_xfade;
+static float s_phase;              /**< 0..1, drives the SYNCING pupil orbit */
+static uint32_t s_breath_ms;       /**< elapsed time in the current breath */
+static uint32_t s_breath_period_ms;/**< re-rolled each cycle, 12-19 s */
 
 /* transient override (idle_face_express) */
 static bool s_override_active;
@@ -123,7 +185,22 @@ static uint32_t s_next_blink_ms;
 static uint32_t s_blink_until_ms;
 static uint32_t s_next_look_ms;
 static uint32_t s_look_until_ms;
-static idle_face_state_t s_look_state = IDLE_FACE_LOOK_LEFT;
+static float s_look_dx;            /**< eased pupil offset, -1..1 */
+static float s_look_dx_target;
+static uint32_t s_next_saccade_ms;
+static uint32_t s_saccade_hold_ms;
+static uint32_t s_saccade_from_ms;
+static float s_saccade_dx;
+static float s_saccade_dy;
+
+/* standby enter/exit envelope (see idle_face_standby_enter/exit) */
+static uint32_t s_motion_from_ms;
+static uint32_t s_motion_dur_ms;
+static float s_motion_from;
+static float s_motion_to;
+static bool s_motion_active;
+static uint32_t s_wake_from_ms;
+static bool s_wake_active;
 
 static const uint32_t s_eye_base_w = CONFIG_TODOHELPER_IDLE_EYE_WIDTH;
 static const uint32_t s_eye_base_h = CONFIG_TODOHELPER_IDLE_EYE_HEIGHT;
@@ -146,9 +223,37 @@ static uint32_t rand_between(uint32_t lo, uint32_t hi)
     return lo + (esp_random() % (hi - lo));
 }
 
-static float lerp(float from, float to, float gain)
+static float clampf(float v, float lo, float hi)
 {
-    return from + (to - from) * gain;
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+/** Cubic ease-in-out: zero slope at both ends, so no switch can "snap". */
+static float smoothstep01(float t)
+{
+    t = clampf(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+/** Blend one component, snapping exactly onto the target when it is close. */
+static float xfade_value(float from, float to, float t, float snap)
+{
+    const float delta = to - from;
+    if (delta < 0.0f ? -delta < snap : delta < snap) {
+        return to;
+    }
+    return from + delta * t;
+}
+
+static uint32_t xfade_duration_for(const face_params_t *p)
+{
+    return (p->speed >= SPEED_FAST) ? IDLE_FACE_XFADE_FAST_MS : IDLE_FACE_XFADE_MS;
 }
 
 static const face_params_t *params_for(idle_face_state_t state)
@@ -159,21 +264,113 @@ static const face_params_t *params_for(idle_face_state_t state)
     return &s_effects[state];
 }
 
-static void apply_params(void)
+/** The expression that should actually be rendered right now. */
+static idle_face_state_t effective_state(void);
+
+/* ------------------------------------------------------------------------ */
+/* Expression cross-fade + standby envelope                                  */
+/* ------------------------------------------------------------------------ */
+
+static void begin_xfade(idle_face_state_t target)
+{
+    s_xfade.from = s_current;
+    s_xfade.target = target;
+    s_xfade.elapsed_ms = 0;
+    s_xfade.duration_ms = xfade_duration_for(params_for(target));
+}
+
+static void schedule_breath(uint32_t now)
+{
+    (void)now;
+    s_breath_period_ms = rand_between(IDLE_FACE_BREATH_MIN_MS, IDLE_FACE_BREATH_MAX_MS);
+}
+
+/** Start a one-shot 1 -> 0 (sleep) or 1 -> overshoot (wake) motion envelope. */
+static void begin_motion(uint32_t now, uint32_t duration_ms, float from, float to)
+{
+    s_motion_from_ms = now;
+    s_motion_dur_ms = duration_ms;
+    s_motion_from = from;
+    s_motion_to = to;
+    s_motion_active = true;
+}
+
+/** Bounded motion envelope, or 1.0 when no enter/exit animation is running. */
+static float motion_env(uint32_t now)
+{
+    if (!s_motion_active) {
+        return 1.0f;
+    }
+    const uint32_t elapsed = now - s_motion_from_ms;
+    if (elapsed >= s_motion_dur_ms) {
+        s_motion_active = false;
+        return s_motion_to;
+    }
+    const float t = (float)elapsed / (float)s_motion_dur_ms;
+    return s_motion_from + (s_motion_to - s_motion_from) * smoothstep01(t);
+}
+
+/** Extra eye opening while waking up: 0 at both ends, a small bump in the middle. */
+static float wake_env(uint32_t now)
+{
+    if (!s_wake_active) {
+        return 0.0f;
+    }
+    const uint32_t elapsed = now - s_wake_from_ms;
+    if (elapsed >= IDLE_FACE_WAKE_MS) {
+        s_wake_active = false;
+        return 0.0f;
+    }
+    const float t = (float)elapsed / (float)IDLE_FACE_WAKE_MS;
+    return IDLE_FACE_WAKE_OVERSHOOT * sinf(t * (float)M_PI);
+}
+
+static void update_xfade(uint32_t dt_ms)
+{
+    s_xfade.elapsed_ms += dt_ms;
+    const float t = (s_xfade.duration_ms == 0)
+                        ? 1.0f
+                        : smoothstep01((float)s_xfade.elapsed_ms / (float)s_xfade.duration_ms);
+
+    const face_params_t *to = params_for(s_xfade.target);
+    const face_params_t *from = &s_xfade.from;
+
+    s_current.open = xfade_value(from->open, to->open, t, 0.004f);
+    s_current.dx = xfade_value(from->dx, to->dx, t, 0.004f);
+    s_current.dy = xfade_value(from->dy, to->dy, t, 0.004f);
+    s_current.pupil = xfade_value(from->pupil, to->pupil, t, 0.004f);
+    s_current.arc = xfade_value(from->arc, to->arc, t, 0.004f);
+    s_current.cross = xfade_value(from->cross, to->cross, t, 0.004f);
+    s_current.eye_dy = xfade_value(from->eye_dy, to->eye_dy, t, 0.2f);
+    s_current.width_scale = xfade_value(from->width_scale, to->width_scale, t, 0.004f);
+    s_current.speed = to->speed;
+
+    if (s_xfade.elapsed_ms >= s_xfade.duration_ms) {
+        s_current = *to;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Rendering                                                                 */
+/* ------------------------------------------------------------------------ */
+
+static void apply_params(uint32_t now)
 {
     if (!s_attached) {
         return;
     }
 
-    /* Breathing: a small, slow amplitude change on top of the state's value. */
-    const float breath = 1.0f + 0.035f * sinf(s_phase * 2.0f * (float)M_PI);
-    float open = s_current.open * breath;
-    if (open < 0.04f) {
-        open = 0.04f;
-    }
-    if (open > 1.6f) {
-        open = 1.6f;
-    }
+    const idle_face_state_t state = effective_state();
+
+    /* Breathing: amplitude-scaled, and suppressed while the eyes are shut, so
+     * a slow breath cannot re-open a sleeping eye. */
+    const float breath_phase = (s_breath_period_ms == 0)
+                                   ? 0.0f
+                                   : (float)s_breath_ms / (float)s_breath_period_ms;
+    const float breath =
+        1.0f + (IDLE_FACE_BREATH_AMP * motion_env(now)) * sinf(breath_phase * 2.0f * (float)M_PI);
+    float open = s_current.open * breath * motion_env(now) + wake_env(now);
+    open = clampf(open, 0.04f, 1.6f);
 
     const int32_t eye_h = (int32_t)((float)s_eye_base_h * open);
     const int32_t eye_w = (int32_t)((float)s_eye_base_w * (1.0f + 0.05f * s_current.arc));
@@ -181,6 +378,7 @@ static void apply_params(void)
                                      s_current.width_scale);
     const bool cross_mode = s_current.cross > 0.5f;
     const bool arc_mode = !cross_mode && s_current.arc > 0.5f;
+    const float pupil_fade = sqrtf(clampf(open, 0.0f, 1.0f));
 
     for (int i = 0; i < 2; i++) {
         lv_obj_t *eye = s_face.eye[i];
@@ -215,12 +413,23 @@ static void apply_params(void)
             if (arc_mode || cross_mode) {
                 opacity = 0.0f;
             }
+            opacity *= pupil_fade;
+            if (opacity < 0.0f) {
+                opacity = 0.0f;
+            }
+            if (opacity > 1.0f) {
+                opacity = 1.0f;
+            }
             lv_obj_set_style_bg_opa(pupil, (lv_opa_t)(opacity * LV_OPA_COVER), 0);
 
+            /* The table's dx/dy, plus the idle glance, plus a micro-saccade. */
+            float dx = s_current.dx + s_look_dx + s_saccade_dx;
+            float dy = s_current.dy + s_saccade_dy;
+            dx = clampf(dx, -1.0f, 1.0f);
+            dy = clampf(dy, -1.0f, 1.0f);
+
             /* SYNCING walks the pupil around a small circle. */
-            float dx = s_current.dx;
-            float dy = s_current.dy;
-            if (s_state == IDLE_FACE_SYNCING) {
+            if (state == IDLE_FACE_SYNCING) {
                 dx = 0.75f * cosf(s_phase * 2.0f * (float)M_PI);
                 dy = 0.75f * sinf(s_phase * 2.0f * (float)M_PI);
             }
@@ -256,14 +465,20 @@ static void schedule_next_look(uint32_t now)
     s_next_look_ms = now + rand_between(IDLE_FACE_LOOK_MIN_MS, IDLE_FACE_LOOK_MAX_MS);
 }
 
+static void schedule_next_saccade(uint32_t now)
+{
+    s_next_saccade_ms = now + rand_between(IDLE_FACE_SACCADE_MIN_MS, IDLE_FACE_SACCADE_MAX_MS);
+}
+
 /**
- * Blinking and looking around only make sense for the plain idle expression:
- * an ERROR or THINKING face must not blink itself back to neutral.
+ * Blinking, glancing and pupil drift only make sense for the plain idle
+ * expression: an ERROR or THINKING face must not blink itself back to neutral.
+ * The standby pose (SLEEPY) is excluded on purpose - it is reached by falling
+ * asleep, and it stays that way until the screen is woken.
  */
 static bool state_allows_idle_antics(idle_face_state_t state)
 {
-    return state == IDLE_FACE_NORMAL || state == IDLE_FACE_LOOK_LEFT ||
-           state == IDLE_FACE_LOOK_RIGHT || state == IDLE_FACE_BLINK;
+    return state == IDLE_FACE_NORMAL;
 }
 
 static void tick_behaviour(uint32_t now)
@@ -271,44 +486,76 @@ static void tick_behaviour(uint32_t now)
     if (s_override_active && now >= s_override_until_ms) {
         s_override_active = false;
         const idle_face_state_t restore = s_state_before_override;
-        s_state = restore;
-        (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
-                                &s_state, sizeof(s_state));
+        if (restore != s_state) {
+            s_state = restore;
+            (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
+                                    &s_state, sizeof(s_state));
+        }
     }
 
     const idle_face_state_t base = s_override_active ? s_override_state : s_state;
 
     if (!state_allows_idle_antics(base)) {
+        /* Let a glance that is already in flight settle back to centre. */
+        s_look_dx_target = 0.0f;
+        s_saccade_dx = 0.0f;
+        s_saccade_dy = 0.0f;
         s_blink_until_ms = 0;
         return;
     }
 
-    /* Finish an in-flight blink first: it overrides the look target. */
+    /* Finish an in-flight blink first: it overrides everything else. */
     if (s_blink_until_ms != 0 && now >= s_blink_until_ms) {
         s_blink_until_ms = 0;
-        schedule_next_blink(now);
+        /* Occasionally follow up immediately: real eyes blink in bursts, and a
+         * single fixed interval is exactly what makes an idle face look fake. */
+        if ((esp_random() % 100u) < IDLE_FACE_BLINK_DOUBLE_PCT) {
+            s_next_blink_ms = now + IDLE_FACE_BLINK_DOUBLE_MS;
+        } else {
+            schedule_next_blink(now);
+        }
     }
 
     if (s_look_until_ms != 0 && now >= s_look_until_ms) {
         s_look_until_ms = 0;
-        if (!s_override_active && s_state != IDLE_FACE_BLINK) {
-            s_state = IDLE_FACE_NORMAL;
-            (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
-                                    &s_state, sizeof(s_state));
-        }
+        s_look_dx_target = 0.0f;
         schedule_next_look(now);
     }
 
+    /* Micro-saccade: a few pixels of pupil drift, held for a moment and then
+     * released. The hold countdown lives on the tick, the trigger here. */
+    if (s_saccade_hold_ms != 0) {
+        const uint32_t elapsed = now - s_saccade_from_ms;
+        if (elapsed >= s_saccade_hold_ms) {
+            s_saccade_hold_ms = 0;
+        }
+    }
+    if (s_saccade_hold_ms == 0 && s_next_saccade_ms != 0 &&
+        (int32_t)(now - s_next_saccade_ms) >= 0) {
+        s_saccade_dx = (float)((int32_t)rand_between(0, 201) - 100) / 1000.0f;
+        s_saccade_dy = (float)((int32_t)rand_between(0, 161) - 80) / 1000.0f;
+        s_saccade_hold_ms = rand_between(220, 700);
+        s_saccade_from_ms = now;
+        schedule_next_saccade(now);
+    }
+
     if (s_blink_until_ms == 0 && (int32_t)(now - s_next_blink_ms) >= 0) {
-        s_blink_until_ms = now + IDLE_FACE_BLINK_MS;
-        schedule_next_blink(now + IDLE_FACE_BLINK_MS);
+        const uint32_t duration = rand_between(IDLE_FACE_BLINK_DUR_MIN_MS,
+                                               IDLE_FACE_BLINK_DUR_MAX_MS);
+        s_blink_until_ms = now + duration;
+        schedule_next_blink(now + duration);
     }
 
     if (s_blink_until_ms == 0 && s_look_until_ms == 0 &&
         (int32_t)(now - s_next_look_ms) >= 0) {
-        s_look_state = (esp_random() & 1) ? IDLE_FACE_LOOK_LEFT : IDLE_FACE_LOOK_RIGHT;
-        s_look_until_ms = now + IDLE_FACE_LOOK_HOLD_MS;
-        schedule_next_look(now + IDLE_FACE_LOOK_HOLD_MS);
+        /* Glances are eased through s_look_dx instead of a state switch, so an
+         * interrupted glance continues from where the pupils actually are. */
+        s_look_dx_target = ((esp_random() & 1u) ? -1.0f : 1.0f) *
+                           (0.75f + (float)rand_between(0, 2000) / 10000.0f);
+        s_look_until_ms = now + rand_between(IDLE_FACE_LOOK_HOLD_MIN_MS,
+                                             IDLE_FACE_LOOK_HOLD_MAX_MS);
+        schedule_next_look(now + rand_between(IDLE_FACE_LOOK_HOLD_MIN_MS,
+                                              IDLE_FACE_LOOK_HOLD_MAX_MS));
     }
 }
 
@@ -317,9 +564,6 @@ static idle_face_state_t effective_state(void)
 {
     if (s_blink_until_ms != 0) {
         return IDLE_FACE_BLINK;
-    }
-    if (s_look_until_ms != 0) {
-        return s_look_state;
     }
     return s_override_active ? s_override_state : s_state;
 }
@@ -382,6 +626,8 @@ static void notify_handler(void *arg, esp_event_base_t base, int32_t id, void *d
 static void face_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    /* lv_timer callbacks already run in the LVGL task, so no lock is needed
+     * (AGENT.md 9.0.1). Never use esp_timer for anything that touches LVGL. */
     (void)idle_face_tick((uint32_t)sys_time_ms());
 }
 
@@ -391,29 +637,69 @@ esp_err_t idle_face_tick(uint32_t now_ms)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /*
+     * Drive the behaviour timeline BEFORE reading effective_state().
+     *
+     * This call is load-bearing, not a refactor nicety: tick_behaviour() is where
+     * the temporary-expression expiry lives (s_override_until_ms is read nowhere
+     * else) and where the next blink / glance / micro-saccade is triggered and
+     * finished. Without it the face never blinks or looks around on its own, and
+     * an expression set by idle_face_express() would never end - it would stay on
+     * screen forever.
+     *
+     * It runs first because it can clear the override and start a blink, and
+     * effective_state() reports exactly those.
+     */
     tick_behaviour(now_ms);
 
-    const face_params_t *target = params_for(effective_state());
-    s_current.open = lerp(s_current.open, target->open, target->speed);
-    s_current.dx = lerp(s_current.dx, target->dx, target->speed);
-    s_current.dy = lerp(s_current.dy, target->dy, target->speed);
-    s_current.pupil = lerp(s_current.pupil, target->pupil, target->speed);
-    s_current.arc = lerp(s_current.arc, target->arc, target->speed);
-    s_current.cross = lerp(s_current.cross, target->cross, target->speed);
-    s_current.eye_dy = lerp(s_current.eye_dy, target->eye_dy, target->speed);
-    s_current.width_scale = lerp(s_current.width_scale, target->width_scale, target->speed);
-    s_current.speed = target->speed;
+    const idle_face_state_t want = effective_state();
+    if (want != s_xfade.target) {
+        begin_xfade(want);
+        SYS_LOGD(TAG, "state -> %d", (int)want);
+    }
 
-    /* Breathing runs at ~15 s per cycle; SYNCING needs a faster orbit. */
-    const float cycles_per_ms = (effective_state() == IDLE_FACE_SYNCING)
-                                    ? (1.0f / 1800.0f)
-                                    : (1.0f / 15000.0f);
-    s_phase += (float)IDLE_FACE_TICK_MS * cycles_per_ms;
-    if (s_phase >= 1.0f) {
+    /* Shortest path between two 33 ms ticks, so a 64-bit wraparound of
+     * esp_timer_get_time() or a stalled timer cannot freeze the animation. */
+    static uint32_t s_prev_now;
+    uint32_t dt_ms = now_ms - s_prev_now;
+    s_prev_now = now_ms;
+    if (dt_ms == 0 || dt_ms > 250) {
+        dt_ms = IDLE_FACE_TICK_MS;
+    }
+
+    update_xfade(dt_ms);
+
+    /* Idle glance: a fast, small correction on top of the expression, kept in
+     * its own lane so a look cannot fight an expression cross-fade. The
+     * micro-saccade is *held* while it is triggered, then released. */
+    s_look_dx += (s_look_dx_target - s_look_dx) * IDLE_FACE_LOOK_GAIN;
+    if (s_saccade_hold_ms == 0) {
+        s_saccade_dx = xfade_value(s_saccade_dx, 0.0f, 0.18f, 0.002f);
+        s_saccade_dy = xfade_value(s_saccade_dy, 0.0f, 0.18f, 0.002f);
+    }
+
+    /* Breathing runs on its own clock; the period is re-rolled every cycle so
+     * the rhythm never becomes a metronome. */
+    s_breath_ms += dt_ms;
+    if (s_breath_ms >= s_breath_period_ms) {
+        s_breath_ms = 0;
+        schedule_breath(now_ms);
+    }
+
+    /* SYNCING orbits its pupils; SPEAKING pulses the eye arcs, which is the
+     * mouth-free way of showing a talking rhythm. */
+    float cycles_per_ms = 0.0f;
+    if (want == IDLE_FACE_SYNCING) {
+        cycles_per_ms = 1.0f / (float)IDLE_FACE_SYNC_PERIOD_MS;
+    } else if (want == IDLE_FACE_SPEAKING) {
+        cycles_per_ms = 1.0f / (float)IDLE_FACE_TALK_PERIOD_MS;
+    }
+    s_phase += (float)dt_ms * cycles_per_ms;
+    while (s_phase >= 1.0f) {
         s_phase -= 1.0f;
     }
 
-    apply_params();
+    apply_params(now_ms);
     return ESP_OK;
 }
 
@@ -433,12 +719,16 @@ esp_err_t idle_face_set_state(idle_face_state_t state)
     s_override_active = false;
     s_state = state;
 
-    /* A new explicit expression cancels any pending blink/look. */
+    /* A new explicit expression cancels any pending blink/look/standby motion. */
     s_blink_until_ms = 0;
     s_look_until_ms = 0;
+    s_look_dx_target = 0.0f;
+    s_motion_active = false;
+    s_wake_active = false;
     const uint32_t now = now_ms32();
     schedule_next_blink(now);
     schedule_next_look(now);
+    schedule_next_saccade(now);
 
     SYS_LOGD(TAG, "state -> %d", (int)state);
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
@@ -469,6 +759,78 @@ esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms)
 
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
                             &state, sizeof(state));
+    return ESP_OK;
+}
+
+/**
+ * Fall asleep: only from a neutral face, and never on top of an active
+ * notification expression. The eyes ease shut over IDLE_FACE_SLEEP_MS and stay
+ * half closed (the SLEEPY pose) for as long as the standby screen is up.
+ *
+ * Called by the idle page's on_show, which happens on the first creation and on
+ * every wake-to-standby cycle.
+ */
+esp_err_t idle_face_standby_enter(void)
+{
+    /* Only from a neutral face: a live notification expression (WiFi failed,
+     * syncing, AI thinking) must not be buried under the sleep pose. */
+    if (s_state != IDLE_FACE_NORMAL || s_override_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint32_t now = now_ms32();
+    s_override_active = false;
+    /*
+     * Stay AWAKE in standby.
+     *
+     * The first revision of this feature eased the eyes shut into the SLEEPY pose
+     * and held them there for the whole standby period. That suppressed blinking,
+     * glancing and saccades - i.e. it made the standby screen *less* animated,
+     * while the request was to enrich it. So the face keeps its live NORMAL
+     * parameters and all of the new motion keeps running.
+     *
+     * To get the sleeping face instead, change all three together:
+     *   s_state = IDLE_FACE_SLEEPY;
+     *   begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 0.0f);
+     *   s_current = *params_for(IDLE_FACE_SLEEPY);
+     * (s_current must be moved too, otherwise the cross-fade fights the envelope.)
+     */
+    s_wake_active = false;
+    /* A constant 1.0 envelope: no visual effect, but it keeps the motion machinery
+     * exercised (and keeps begin_motion() referenced). */
+    begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 1.0f);
+
+    (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
+                            &s_state, sizeof(s_state));
+    SYS_LOGD(TAG, "standby enter (face stays awake)");
+    return ESP_OK;
+}
+
+/**
+ * Wake up: eyes widen briefly and settle back. Called by the idle page's
+ * on_hide, i.e. the moment the standby screen is left. The page container is
+ * hidden right after, so only the first frames of this are normally visible -
+ * which is why it is a short widening rather than a full sequence.
+ */
+esp_err_t idle_face_standby_exit(void)
+{
+    if (s_state != IDLE_FACE_SLEEPY || s_override_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const uint32_t now = now_ms32();
+    s_wake_from_ms = now;
+    s_wake_active = true;
+    s_motion_active = false;
+
+    s_state = IDLE_FACE_NORMAL;
+    schedule_next_blink(now);
+    schedule_next_look(now);
+    schedule_next_saccade(now);
+
+    (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
+                            &s_state, sizeof(s_state));
+    SYS_LOGD(TAG, "standby exit (eyes opening)");
     return ESP_OK;
 }
 
@@ -595,10 +957,16 @@ esp_err_t idle_face_attach(lv_obj_t *parent)
     s_current = *params_for(s_state);
     s_current.arc = 0.0f;
     s_current.cross = 0.0f;
+    s_xfade.target = s_state;
     const uint32_t now = now_ms32();
+    s_breath_period_ms = rand_between(IDLE_FACE_BREATH_MIN_MS, IDLE_FACE_BREATH_MAX_MS);
+    /* Start the breath at a random point of its cycle. */
+    s_breath_ms = rand_between(0, s_breath_period_ms);
+    s_phase = (float)rand_between(0, 1000) / 1000.0f;
     schedule_next_blink(now);
     schedule_next_look(now);
-    apply_params();
+    schedule_next_saccade(now);
+    apply_params(now);
 
     s_face.timer = lv_timer_create(face_timer_cb, IDLE_FACE_TICK_MS, NULL);
     if (s_face.timer == NULL) {
@@ -619,9 +987,18 @@ static esp_err_t idle_page_create(lv_obj_t *parent)
     return idle_face_attach(parent);
 }
 
+/** Entering the standby screen: the face falls asleep. */
 static esp_err_t idle_page_on_show(void)
 {
-    return idle_face_set_state(IDLE_FACE_NORMAL);
+    /* Not a neutral face (an expression is live): keep it displayed as is. */
+    (void)idle_face_standby_enter();
+    return ESP_OK;
+}
+
+/** Leaving the standby screen: the face wakes up. */
+static esp_err_t idle_page_on_hide(void)
+{
+    return idle_face_standby_exit();
 }
 
 static const ui_page_t s_idle_page = {
@@ -629,6 +1006,7 @@ static const ui_page_t s_idle_page = {
     .name = "idle_face",
     .create = idle_page_create,
     .on_show = idle_page_on_show,
+    .on_hide = idle_page_on_hide,
 };
 
 const void *idle_face_page_descriptor(void)

@@ -584,17 +584,34 @@ FreeType 子集 --fallback--> Montserrat(同尺寸) --fallback--> 内置 CJK 16p
 > 75 秒才需要它。要做的话仍是三步：`sys_utils.h` 加事件 → `calendar_service.c` 的
 > `sntp_sync_cb()` 里额外 post → `weather_service.c` 订阅并入队 `WEATHER_REQ_DETECT`。
 
-**① 待机眼睛动画**（用户提了三次，**只要眼睛、不要嘴巴、保持零位图**）
+**① 待机眼睛动画** —— ✅ **已实现**（表情交叉淡入 + 全随机节奏，仍**只要眼睛、零位图**）。
+设计见 `components/idle_face/README.md`：`face_transition_t` 做 180/420 ms 的 `smoothstep`
+交叉淡入（从"当前屏幕真实值"起步，中途被打断不会跳变）；眨眼 2.6~7.5 s / 110~165 ms 且 18% 连眨、
+左右看 4~12 s、微扫视 1.8~5.2 s、呼吸周期 12~19 s 每周期重抽；约 +230 B 静态内存、零新对象。
 
-`components/idle_face` 现在是 11 个状态一张参数表 + 一个 33 ms 插值器 + 随机眨眼
-(3~8 s)/左右看(4~12 s)。要补的是：**表情之间的**平滑过渡（现在只有单个表情内部的
-插值）、呼吸相位的随机化、进入/退出待机的过场动画。动手前先通读 `idle_face.c`。
+> **"待机保持清醒"是刻意的设计决定。** 初版让眼睛闭合成 SLEEPY 姿态并整个待机期保持，
+> 那会**抑制眨眼/扫视 —— 即让待机画面动画变少**，与"丰富待机动画"的要求相反。所以
+> `idle_face_standby_enter()` 现在只做记账（用一个常量 1.0 包络保留 `begin_motion()` 调用，
+> 以免触发 `-Werror=unused-function`），脸部保持 NORMAL、全部动画照常跑。
+> 想要"睡觉的脸"，同时改这三行：
+> `s_state = IDLE_FACE_SLEEPY;` / `begin_motion(now, IDLE_FACE_SLEEP_MS, 1.0f, 0.0f);` /
+> `s_current = *params_for(IDLE_FACE_SLEEPY);`
 
-**② 单词书 cet4 → cet6**
+**待上机确认**：交叉淡入与呼吸/扫视的主观观感（全部是单个 `#define` 可调）；以及
+`idle_face_standby_exit()` 的 700 ms 睁眼几乎看不见 —— `ui_core` 在 `on_hide()` 之后
+**立刻**给页面容器加 `LV_OBJ_FLAG_HIDDEN`，要看到完整唤醒得在 `ui_core` 侧延后约 200~300 ms 再隐藏。
 
-内置词库在 `word_service`，格式见 `docs/API.md`；卡上已有一份
-`words/cet4.json`（4704 字节）可作模板。注意 NVS 里保存的是**书名**，
-换书后 `words/progress.json` 里的旧进度不会自动迁移。
+**② 单词书 cet4 → cet6** —— ✅ **已完成**。`WORD_DEFAULT_BOOK` 已改为 `"cet6"`
+（`word_service.h`）。卡上是 `words/cet6.json`：**833 条自编精选**（BrE 音标 + 简体释义 +
+例句），**不是**官方约 2000 词表，不做完整性承诺；仓库副本在 `assets/words/cet6.json`，
+与卡上文件 sha256 一致（`3B2277…`）。833 条 × ~656 B ≈ **546 KB**，走 `MALLOC_CAP_SPIRAM`
+（`WORD_MAX_ITEMS` 上限 2000，接近上限时要注意 PSRAM 占用）。
+
+> **已存在的设备必须切书**：NVS 里存的是书名，`WORD_DEFAULT_BOOK` 只对空 NVS 生效，
+> 所以要 `POST /api/v1/words/config {"book":"cet6"}`，否则仍读 `cet4`。
+> **顺带修掉一个串味 bug**：`progress_key()` 原本生成裸 `"w<id>"`，而每本书的 id 都从 1 开始，
+> CET4 的复习进度会套到 CET6 的前 32 个词上（且加载时会误报"这本书还没有进度"）。
+> 现已改为 `"<book>#w<id>"`。
 
 **其余已知但优先级低的问题**
 

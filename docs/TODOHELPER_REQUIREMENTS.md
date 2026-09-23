@@ -201,6 +201,9 @@
 - 类似表情动画；
 - 状态包括：普通、眨眼、左右看、开心、困倦、错误、同步中、思考、聆听、**说话**（P2）；
   > 状态的权威定义见 §7.9 的 `idle_face_state_t`（11 个值），触发条件与表现见 §11.2 状态机表，三处必须保持一致。
+- **表情之间要平滑过渡**（交叉淡入，不跳变）；眨眼/左右看/呼吸的节奏要随机化，不能有固定周期；
+- 进入待机和唤醒时都要有短过场动画（闭眼入睡 / 睁眼醒来）；
+- **只画眼睛，不要嘴巴**；**全程程序化绘制，零位图、不依赖 SD 卡素材**（用户明确要求）；
 - 无触摸 30 秒进入待机；
 - 触摸或系统事件唤醒；
 - 待机时降低亮度，但 WiFi / Todo 同步继续；
@@ -634,12 +637,12 @@ esp_err_t ui_unlock(void);
 
 ```c
 typedef enum {
-    IDLE_FACE_NORMAL,      // 普通：轻微呼吸
-    IDLE_FACE_BLINK,       // 眨眼
-    IDLE_FACE_LOOK_LEFT,   // 向左看
-    IDLE_FACE_LOOK_RIGHT,  // 向右看
+    IDLE_FACE_NORMAL,      // 普通：随机呼吸（周期 12~19 s 每次重抽）
+    IDLE_FACE_BLINK,       // 眨眼：间隔 2.6~7.5 s、时长 110~165 ms，约 18% 连眨
+    IDLE_FACE_LOOK_LEFT,   // 向左看（瞳孔偏移，不再切状态；枚举保留给 API/触发表）
+    IDLE_FACE_LOOK_RIGHT,  // 向右看（同上）
     IDLE_FACE_HAPPY,       // 开心（Todo 完成、WiFi 成功）
-    IDLE_FACE_SLEEPY,      // 困倦（夜间、长时间无操作）
+    IDLE_FACE_SLEEPY,      // 困倦（夜间、长时间无操作）；待机时**不**使用——待机保持 NORMAL 继续动画
     IDLE_FACE_ERROR,       // 错误（WiFi / 同步失败）
     IDLE_FACE_SYNCING,     // 同步中
     IDLE_FACE_THINKING,    // 思考（网络请求中）
@@ -650,6 +653,8 @@ typedef enum {
 
 esp_err_t idle_face_init(lv_obj_t *parent);
 esp_err_t idle_face_set_state(idle_face_state_t state);
+esp_err_t idle_face_standby_enter(void);   // 待机页 on_show：钩子（待机保持清醒，不闭眼）
+esp_err_t idle_face_standby_exit(void);    // 待机页 on_hide：预留钩子（当前无副作用）
 esp_err_t idle_face_tick(uint32_t now_ms);
 esp_err_t idle_face_set_brightness(uint8_t percent);
 ```
@@ -1151,20 +1156,22 @@ esp_err_t sys_config_erase(const char *key);
 
 | 状态（枚举值） | 触发 | 表现 | 优先级 |
 |---|---|---|---|
-| NORMAL | 默认 | 两只椭圆眼睛，轻微呼吸 | P0 |
-| BLINK | 随机 3~8 秒 | 眼睛闭合再打开 | P0 |
-| LOOK_LEFT | 随机 | 瞳孔左移 | P1 |
-| LOOK_RIGHT | 随机 | 瞳孔右移 | P1 |
+| NORMAL | 默认 | 两只椭圆眼睛，随机呼吸（周期 12~19 s 重抽） | P0 |
+| BLINK | 随机 2.6~7.5 s | 眼睛闭合再打开（110~165 ms，约 18% 连眨） | P0 |
+| LOOK_LEFT | 随机 | 瞳孔左移（用偏移量缓动，不切状态） | P1 |
+| LOOK_RIGHT | 随机 | 瞳孔右移（同上） | P1 |
 | HAPPY | Todo 完成、WiFi 成功 | 眼睛弯成弧线 | P1 |
 | SLEEPY | 夜间、长时间无操作 | 半闭眼 | P1 |
 | ERROR | WiFi 失败、同步失败 | X 眼或下垂眼 | P1 |
-| SYNCING | 同步中 | 眼睛转圈或思考 | P1 |
-| THINKING | 网络请求 | 一只眼看向上方 | P1 |
+| SYNCING | 同步中 | 瞳孔绕小圆转圈（1.8 s 一圈） | P1 |
+| THINKING | 网络请求 | 双眼看向上方 | P1 |
 | LISTENING | 语音唤醒、AI 聆听 | 眼睛放大 | P2 |
-| SPEAKING | AI 播报回复 | 眼睛随语音节奏眨动、嘴角弧线（HAPPY 变体） | P2 |
+| SPEAKING | AI 播报回复 | 眼睛随语音节奏起伏（上弧脉动，**无嘴巴**） | P2 |
+| （过场，无独立枚举） | 进入/离开待机 | 950 ms 闭眼入睡 / 700 ms 睁眼醒来，均为有界包络 | P1 |
 
 > 枚举定义见 §7.9（`IDLE_FACE_*`），需求描述见 FR6。**三者必须同步修改。**
 > 状态切换只更新已创建对象的属性（见 §11.3），并在切换时通过 `TODOHELPER_EVENT` 广播，供状态栏与 WebSocket 订阅。
+> **表情之间必须交叉淡入**（180 ms 快档 / 420 ms 普通档，`smoothstep` 起止），不允许瞬间跳变。
 
 ### 11.3 LVGL 实现建议
 

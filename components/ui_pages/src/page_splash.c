@@ -6,10 +6,32 @@
 
 /**
  * @file page_splash.c
- * @brief Boot banner. Shown while the optional service modules come up.
+ * @brief Boot banner: the product name plus the live boot log.
+ *
+ * The panel doubles as a serial monitor while the device starts: sys_utils keeps
+ * a ring of the most recent log lines (sys_log_recent_get()) and this page renders
+ * them in a list that tails the newest one, so the boot log can be read without
+ * attaching a serial console. The console output itself is untouched.
+ *
+ * Timing belongs to main/app_main.c: it shows this page before the optional
+ * services come up and hands over to the home page once they are done. This page
+ * therefore has exactly one job - keep the view up to date - and stops its timer
+ * in on_hide() so nothing runs while another page is visible.
+ *
+ * Threading. create()/on_show()/on_hide() all run under the LVGL lock taken by
+ * ui_page_switch(), and splash_tick() runs inside the LVGL task, so every static
+ * below is only ever touched with the adapter lock held and needs no atomics
+ * (AGENT.md 9.0.1).
  */
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "esp_heap_caps.h"
+
 #include "pages_internal.h"
+#include "sys_utils.h"
 
 static const char *TAG = "page_splash";
 
@@ -17,7 +39,198 @@ static const char *TAG = "page_splash";
 #define CONFIG_APP_PROJECT_VER "0.1.0"
 #endif
 
+/** How often the log view is rebuilt while new lines arrive. */
+#define SPLASH_TICK_MS 100
+
+/** Hidden pixels below the viewport that still count as "at the newest line". */
+#define SPLASH_TAIL_SLACK 4
+
+/** Render buffer: one row per retained line ("L " + text + newline + NUL). */
+#define SPLASH_TEXT_LEN (SYS_LOG_RECENT_CAPACITY * (SYS_LOG_RECENT_LINE_LEN + 3) + 1)
+
 static lv_obj_t *s_status_label;
+static lv_obj_t *s_log_box;
+static lv_obj_t *s_log_label;
+/**
+ * Render buffer, PSRAM when possible: it is more than 5 KB and internal RAM is
+ * the scarcest resource on this board (AGENT.md 9.0). The label borrows it
+ * through lv_label_set_text_static(), so a refresh allocates nothing.
+ */
+static char *s_text;
+
+/** Refresh timer; NULL while the page is hidden or when no timer was available. */
+static lv_timer_t *s_timer;
+/** sys_log_recent_seq() the label currently shows. */
+static uint32_t s_rendered_seq;
+
+/* ------------------------------------------------------------------------- */
+/* Log rendering                                                             */
+/* ------------------------------------------------------------------------- */
+
+static char level_letter(sys_log_level_t level)
+{
+    switch (level) {
+    case SYS_LOG_ERROR:
+        return 'E';
+    case SYS_LOG_WARN:
+        return 'W';
+    case SYS_LOG_DEBUG:
+        return 'D';
+    case SYS_LOG_INFO:
+    default:
+        return 'I';
+    }
+}
+
+/** Bounded append of @p src; returns the new offset and keeps @p dst terminated. */
+static size_t text_put(char *dst, size_t cap, size_t used, const char *src)
+{
+    while (*src != '\0' && (used + 1u) < cap) {
+        dst[used++] = *src++;
+    }
+    dst[used] = '\0';
+    return used;
+}
+
+/** Bounded append of one character; returns the new offset. */
+static size_t text_put_char(char *dst, size_t cap, size_t used, char c)
+{
+    if ((used + 1u) < cap) {
+        dst[used++] = c;
+        dst[used] = '\0';
+    }
+    return used;
+}
+
+static void splash_update_status(const sys_log_recent_info_t *newest)
+{
+    if (s_status_label == NULL) {
+        return;
+    }
+    if (newest == NULL) {
+        lv_label_set_text(s_status_label, "正在等待第一条日志…");
+        return;
+    }
+
+    lv_label_set_text_fmt(s_status_label, "启动日志 %u 条 · 最新 %u.%us", (unsigned)newest->seq,
+                          (unsigned)(newest->uptime_ms / 1000u),
+                          (unsigned)((newest->uptime_ms % 1000u) / 100u));
+}
+
+/**
+ * Rebuild the log label from the ring buffer and tail the newest line.
+ *
+ * Runs with the LVGL lock held (on_show() or the lv_timer), which is what makes
+ * rewriting @c s_text in place safe: LVGL only reads it while drawing, and this
+ * same task does the drawing.
+ */
+static void splash_refresh_log(void)
+{
+    if (s_log_label == NULL || s_log_box == NULL || s_text == NULL) {
+        return;
+    }
+
+    const uint32_t seq = sys_log_recent_seq();
+    if (seq == s_rendered_seq) {
+        return;
+    }
+
+    /* Remember whether the view was tailing before the text grows: afterwards the
+     * newest line is below the fold again and would always look "not at the end". */
+    const bool was_at_end = lv_obj_get_scroll_bottom(s_log_box) <= SPLASH_TAIL_SLACK;
+    const size_t count = sys_log_recent_count();
+
+    size_t used = 0;
+    size_t lines = 0;
+    bool complete = true;
+    sys_log_recent_info_t newest = { 0 };
+    bool have_newest = false;
+
+    /* Oldest retained line first, newest last - the order a serial monitor prints
+     * them in, and it puts the newest line at the bottom of the view. */
+    for (size_t age = count; age > 0u; age--) {
+        char line[SYS_LOG_RECENT_LINE_LEN];
+        sys_log_recent_info_t info;
+
+        if (!sys_log_recent_get(age - 1u, line, sizeof(line), &info)) {
+            /* Claimed by a writer that has not published yet (microseconds), or the
+             * slot was reused: show what we have and rebuild on the next tick. */
+            complete = false;
+            continue;
+        }
+
+        used = text_put_char(s_text, SPLASH_TEXT_LEN, used, level_letter(info.level));
+        used = text_put_char(s_text, SPLASH_TEXT_LEN, used, ' ');
+        used = text_put(s_text, SPLASH_TEXT_LEN, used, line);
+        used = text_put_char(s_text, SPLASH_TEXT_LEN, used, '\n');
+        lines++;
+
+        if (age == 1u) {
+            newest = info;
+            have_newest = true;
+        }
+    }
+
+    if (lines == 0u) {
+        return; /* nothing published yet: keep the placeholder and retry */
+    }
+
+    lv_label_set_text_static(s_log_label, s_text);
+    /* The label measures its new text during the next layout pass (LVGL defers it
+     * to LV_EVENT_UPDATE_LAYOUT_COMPLETED), so the scroll range below is only
+     * correct after one is forced. */
+    lv_obj_update_layout(s_log_box);
+
+    /* Tail -f: follow the newest line unless the user scrolled up to read
+     * something older. Their position wins until they scroll back down. */
+    if (was_at_end) {
+        lv_obj_scroll_to_y(s_log_box, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+
+    /* Only a complete pass may claim this sequence number, so a line missed above
+     * is picked up by the next tick. */
+    if (complete) {
+        s_rendered_seq = seq;
+    }
+
+    splash_update_status(have_newest ? &newest : NULL);
+}
+
+static void splash_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    splash_refresh_log();
+}
+
+/** Start refreshing. Called from on_show(), with the LVGL lock held. */
+static void splash_timer_start(void)
+{
+    if (s_timer != NULL || s_text == NULL) {
+        return;
+    }
+
+    s_timer = lv_timer_create(splash_tick, SPLASH_TICK_MS, NULL);
+    if (s_timer == NULL) {
+        SYS_LOGW(TAG, "no timer available, the boot log will not update");
+    }
+}
+
+/** Stop refreshing. Called from on_hide(), with the LVGL lock held. */
+static void splash_timer_stop(void)
+{
+    if (s_timer == NULL) {
+        return;
+    }
+
+    /* Deleting an LVGL timer from outside the LVGL task is safe as long as the
+     * adapter lock is held (th_bsp_idle_stop() does the same). */
+    lv_timer_delete(s_timer);
+    s_timer = NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Page                                                                      */
+/* ------------------------------------------------------------------------- */
 
 static esp_err_t splash_create(lv_obj_t *parent)
 {
@@ -31,38 +244,82 @@ static esp_err_t splash_create(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(box, 10, 0);
+    lv_obj_set_style_pad_row(box, 8, 0);
     lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(box);
     lv_label_set_text(title, "ToDoHelper");
-    lv_obj_set_style_text_font(title, ui_font(UI_FONT_HUGE), 0);
+    lv_obj_set_style_text_font(title, ui_font(UI_FONT_TITLE), 0);
     lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
 
     lv_obj_t *subtitle = lv_label_create(box);
-    lv_label_set_text(subtitle, "桌面待办助手");
-    lv_obj_set_style_text_font(subtitle, ui_font(UI_FONT_TITLE), 0);
+    lv_label_set_text_fmt(subtitle, "桌面待办助手 · 启动日志 · 固件 %s", CONFIG_APP_PROJECT_VER);
+    lv_obj_set_style_text_font(subtitle, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(subtitle, UI_COLOR_PRIMARY, 0);
 
+    /* The log takes whatever height is left; the small font keeps ~14 lines
+     * visible at once on the 800x480 panel. */
+    s_log_box = lv_obj_create(box);
+    if (s_log_box == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_remove_style_all(s_log_box);
+    lv_obj_set_width(s_log_box, LV_PCT(100));
+    lv_obj_set_flex_grow(s_log_box, 1);
+    lv_obj_set_style_bg_color(s_log_box, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(s_log_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_log_box, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_log_box, UI_CARD_PAD, 0);
+    lv_obj_set_style_border_width(s_log_box, 0, 0);
+    lv_obj_set_scroll_dir(s_log_box, LV_DIR_VER);
+    lv_obj_add_flag(s_log_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_log_label = lv_label_create(s_log_box);
+    if (s_log_label == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_label_set_long_mode(s_log_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_width(s_log_label, LV_PCT(100));
+    lv_obj_set_style_text_font(s_log_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_log_label, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_log_label, "正在读取启动日志…");
+
     s_status_label = lv_label_create(box);
+    if (s_status_label == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     lv_label_set_text(s_status_label, "正在初始化…");
-    lv_obj_set_style_text_font(s_status_label, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_font(s_status_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_status_label, UI_COLOR_TEXT_MUTED, 0);
 
-    lv_obj_t *version = lv_label_create(box);
-    lv_label_set_text_fmt(version, "固件 %s", CONFIG_APP_PROJECT_VER);
-    lv_obj_set_style_text_font(version, ui_font(UI_FONT_SMALL), 0);
-    lv_obj_set_style_text_color(version, UI_COLOR_TEXT_MUTED, 0);
+    s_text = heap_caps_malloc(SPLASH_TEXT_LEN, MALLOC_CAP_SPIRAM);
+    if (s_text == NULL) {
+        s_text = heap_caps_malloc(SPLASH_TEXT_LEN, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s_text == NULL) {
+        /* The history itself is still captured; only this view is missing. */
+        SYS_LOGW(TAG, "%u bytes for the log view unavailable, screen log disabled",
+                 (unsigned)SPLASH_TEXT_LEN);
+        lv_label_set_text(s_log_label, "内存不足，无法显示启动日志");
+    } else {
+        s_text[0] = '\0';
+    }
 
-    SYS_LOGD(TAG, "splash built");
+    SYS_LOGD(TAG, "splash built (%u lines of history)", (unsigned)SYS_LOG_RECENT_CAPACITY);
     return ESP_OK;
 }
 
 static esp_err_t splash_on_show(void)
 {
-    if (s_status_label != NULL) {
-        lv_label_set_text(s_status_label, "正在初始化…");
-    }
+    splash_refresh_log();
+    splash_timer_start();
+    return ESP_OK;
+}
+
+static esp_err_t splash_on_hide(void)
+{
+    /* Do not keep reading the log ring while another page is visible. */
+    splash_timer_stop();
     return ESP_OK;
 }
 
@@ -71,4 +328,5 @@ const ui_page_t page_splash = {
     .name = "splash",
     .create = splash_create,
     .on_show = splash_on_show,
+    .on_hide = splash_on_hide,
 };

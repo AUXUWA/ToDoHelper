@@ -74,8 +74,12 @@ typedef struct {
     uint32_t unknown_total;
 } word_stats_t;
 
-/** Default book name (without extension). */
-#define WORD_DEFAULT_BOOK "cet4"
+/** Default book name (without extension).
+ *
+ * CET-6 per user request. The real book is a JSON file on the SD card at
+ * <app_dir>/words/cet6.json; the compiled-in 32-word starter is only the fallback
+ * used when that file cannot be read. */
+#define WORD_DEFAULT_BOOK "cet6"
 /** Default number of words offered per day. */
 #define WORD_DEFAULT_DAILY_COUNT 10
 

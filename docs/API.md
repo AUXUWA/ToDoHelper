@@ -929,6 +929,8 @@ curl.exe -i http://todohelper.local/ws/events              # 501
 | `esp_err_t idle_face_set_state(idle_face_state_t state);` | 切换表情，任意任务可调 |
 | `idle_face_state_t idle_face_get_state(void);` | 当前表情 |
 | `esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms);` | 临时显示某表情 `duration_ms` 后回到原表情 |
+| `esp_err_t idle_face_standby_enter(void);` | 待机页 `on_show` 调用的钩子。**当前是记账式的：不做闭眼入睡**，待机期间脸部保持 `NORMAL`、交叉淡入/眨眼/扫视/呼吸全部照常跑（见 `AGENT.md` 9.7 为何如此）；非中性脸时返回 `ESP_ERR_INVALID_STATE` 且不打断表情 |
+| `esp_err_t idle_face_standby_exit(void);` | 待机页 `on_hide` 调用的预留钩子。因为待机不再进入 `SLEEPY`，当前恒返回 `ESP_ERR_INVALID_STATE`；且 `ui_core` 在 `on_hide()` 之后立即隐藏页面容器，所以即使启用也只有最初几帧可见 |
 | `esp_err_t idle_face_tick(uint32_t now_ms);` | 推进动画（内部 33 ms 定时器调用；暴露给自建循环的宿主） |
 | `esp_err_t idle_face_set_brightness(uint8_t percent);` | 调暗/恢复；**何时调由 `ui_core` 决定**，本组件只转发 |
 | `bool idle_face_is_attached(void);` | 眼睛是否已建好 |
@@ -938,7 +940,17 @@ curl.exe -i http://todohelper.local/ws/events              # 501
 `IDLE_FACE_NORMAL`(0)、`BLINK`、`LOOK_LEFT`、`LOOK_RIGHT`、`HAPPY`、`SLEEPY`、`ERROR`、`SYNCING`、
 `THINKING`、`LISTENING`(P2)、`SPEAKING`(P2)。
 
+**动画行为**（纯程序化，无位图/SD 依赖）：
+
+- **表情之间是交叉淡入**：目标状态变化时把当前视觉值冻结为起点，用 `smoothstep` 在
+  180 ms（`SPEED_FAST`，眨眼）或 420 ms（其余）内走到目标参数并吸附，**不会跳变**；
+- **随机化**：眨眼 2.6–7.5 s / 110–165 ms 且 18% 连眨、左右看 4–12 s、微扫视 1.8–5.2 s、
+  呼吸周期 12–19 s（每周期重抽）；
+- **待机过场**：进入待机时眼睛缓缓闭上并保持半闭（`SLEEPY`），唤醒时睁眼一次再回 `NORMAL`；
+- 过场与切换都只改已有对象的属性，**不分配内存**；动画器是 `lv_timer`，回调天然在 LVGL 任务里，无需加锁。
+
 > 状态定义在三处必须同步：本头文件、`idle_face.c` 的效果表、需求文档 FR6 / §11.2。
+> 详细设计见 `components/idle_face/README.md`。
 
 #### 事件
 
@@ -946,21 +958,23 @@ curl.exe -i http://todohelper.local/ws/events              # 501
 |---|---|
 | `IDLE_FACE_EVENT_STATE_CHANGED`(0) | `idle_face_state_t` |
 
-⚠️ 本组件**没有**订阅任何系统事件（代码里搜不到 `ui_event_subscribe` / `WIFI_MGR_EVENT` / `TODO_EVENT`）：
-表情切换靠外部显式调用 `idle_face_set_state()` / `idle_face_express()`。
-当前仓库里唯一的调用方是 `ai_service`（P2，未接入），因此实际运行时只出现 `NORMAL` / `BLINK`。
+表情来源有两条：L0 `sys_notify()` 通知经 `s_triggers[]` 触发表映射（`wifi_connected`→HAPPY、
+`wifi_failed`→ERROR、`net_offline`→SLEEPY、`net_online`/`todo_done`/`sync_done`/`widget_done`→HAPPY、
+`sync_started`→SYNCING），以及 `ai_service` 直接调 `idle_face_express()`
+（聆听 4 s、思考/说话 20 s、出错 2.5 s）。
 
 #### 最小测试步骤
 
 按 §0 构建烧录后，串口期望：
 
 ```
-I (xxx) TH:idle_face: ready (11 states)
+I (xxx) TH:idle_face: ready (11 states, 8 triggers)
 I (xxx) TH:idle_face: idle face attached (WxH eyes, gap G)      # 待机页首次创建时
 ```
 
-- 30 s 无触摸 → 自动切到待机页：全黑背景 + 白色线条双眼（`NORMAL` 轻微呼吸、随机 3–8 s 眨眼）。
-- 触摸任意位置 → 回到待机前页面、亮度恢复。
+- 30 s 无触摸 → 自动切到待机页：全黑背景 + 白色线条双眼，眼睛在约 1 s 内**闭合成半闭睡眼**
+  并保持（不再眨眼），亮度降到 NVS `idle_bright`（默认 20%）；
+- 触摸任意位置 → 眼睛**睁一下**再恢复，回到待机前页面、亮度恢复。
 
 ---
 

@@ -2,261 +2,1385 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ToDoHelper · 待办同步</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>ToDoHelper · 待办助手</title>
+<!--
+  ToDoHelper 上位机页面（由 sync_server 通过 EMBED_FILES 打进固件，GET / 与 /index.html 提供）。
+
+  完全离线自包含：没有任何外部 CDN / 字体 / 图片 / 脚本，只有对本机的请求。
+  使用到的设备接口（全部来自 docs/API.md §2.1 的已注册路由，响应统一信封 {code,msg,data}）：
+
+    GET    /api/v1/todos              全量列表（data.items / count / server_ts）
+    POST   /api/v1/todos              新增 {title,desc,due_ts,priority} → 201 + 该项
+    PUT    /api/v1/todos/{id}         编辑（整体替换 title/desc/due_ts/done/priority）→ 该项
+    PATCH  /api/v1/todos/{id}/done    勾选/取消 {"done":bool} → 该项
+    DELETE /api/v1/todos/{id}         删除
+    POST   /api/v1/sync               整表标记已同步
+    GET    /api/v1/events             SSE 推送（todo_changed / todo_done / sync_* / net_* / wifi_*）
+    GET    /api/v1/wifi/status        WiFi 状态 {state,connected,ssid,ip,rssi,mac,hostname}
+    POST   /api/v1/wifi/scan          发起异步扫描（立即返回 {"scanning":true}）
+    GET    /api/v1/wifi/scan          上次扫描的缓存结果 {count,items:[{ssid,rssi,channel,authmode,open}]}
+    POST   /api/v1/wifi/connect       {ssid,password} 发起连接（异步，凭据会写入 NVS）
+    POST   /api/v1/wifi/disconnect    断开并停止自动重连
+    POST   /api/v1/wifi/config        {ssid,password[,auto_connect]} 只保存凭据，不连接
+    POST   /api/v1/wifi/forget        清除 NVS 里保存的 SSID / 密码（不会主动断开）
+    路由定义见 components/wifi_manager/src/wifi_manager_http.c（7 条，均已注册）
+    GET    /api/v1/device/info        芯片、固件、IP、主机名、MAC、WiFi、存储、鉴权开关
+    GET    /api/v1/device/status      运行时长、堆、PSRAM、RSSI、SSE 客户端数、时钟是否已同步
+    Header X-Auth-Token               设备开启鉴权后所有请求（含 GET）都需要它
+
+  设备端只有 5 个 socket，SSE 长期占用 1 个，所以这里所有普通请求都串行排队（见 api()）。
+  设备屏幕只读：新增 / 编辑 / 勾选 / 删除只在本页进行。
+-->
 <style>
-  :root {
-    --bg: #0b0f14; --surface: #161c24; --surface-alt: #1f2733;
-    --primary: #3da9fc; --success: #2ecc71; --warning: #f1c40f;
-    --danger: #e74c3c; --text: #f2f5f8; --muted: #9aa7b4;
+  :root{
+    --bg:#0b0f14;--surface:#161c24;--surface-alt:#1f2733;--line:#28323f;
+    --primary:#3da9fc;--success:#2ecc71;--warning:#f1c40f;--danger:#e74c3c;
+    --text:#f2f5f8;--muted:#9aa7b4;--on-primary:#06121c;
+    --radius:14px;--touch:44px;
   }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font-family:"Microsoft YaHei","PingFang SC","Noto Sans SC",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    font-size:15px;line-height:1.55;
   }
-  header {
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-    padding: 16px 24px; background: var(--surface);
-    border-bottom: 1px solid var(--surface-alt);
+  h1,h2,h3{margin:0}
+  p{margin:0 0 8px}
+  code{font-family:ui-monospace,Consolas,"Courier New",monospace;background:var(--surface-alt);padding:1px 5px;border-radius:5px;font-size:12px}
+  .muted{color:var(--muted)}
+  .small{font-size:13px}
+  .wrap{max-width:960px;margin:0 auto;padding:0 16px}
+  .stack{display:flex;flex-direction:column;gap:12px;padding-top:16px;padding-bottom:28px}
+
+  /* ---------- 顶栏 ---------- */
+  .topbar{position:sticky;top:0;z-index:6;background:rgba(22,28,36,.97);border-bottom:1px solid var(--line)}
+  .topbar .wrap{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+  .brand{display:flex;align-items:center;gap:10px;min-width:0}
+  .mark{width:34px;height:34px;flex:0 0 auto;border-radius:10px;background:var(--primary);color:var(--on-primary);
+        display:flex;align-items:center;justify-content:center;font-weight:800;font-size:18px}
+  .brand h1{font-size:17px;letter-spacing:.4px}
+  .brand .sub{font-size:12px;color:var(--muted)}
+  .pills{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:5px 10px;border-radius:999px;
+        background:var(--surface-alt);color:var(--muted);border:1px solid transparent;white-space:nowrap}
+  .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:0 0 auto}
+  .pill.ok{color:var(--success)}   .pill.ok .dot{background:var(--success)}
+  .pill.warn{color:var(--warning)} .pill.warn .dot{background:var(--warning)}
+  .pill.err{color:var(--danger)}   .pill.err .dot{background:var(--danger)}
+
+  /* ---------- 横幅 / 卡片 ---------- */
+  .banner{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:var(--radius);
+          background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--muted)}
+  .banner.offline{border-left-color:var(--danger)}
+  .banner.auth{border-left-color:var(--warning)}
+  .banner.error{border-left-color:var(--danger)}
+  .banner .txt{flex:1;min-width:0}
+  .banner strong{display:block;font-size:14px}
+  .banner p{margin:2px 0 0;font-size:13px;color:var(--muted);word-break:break-word}
+  .banner .btn{flex:0 0 auto}
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+  .card-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+  .card-head h2{font-size:15px}
+  .card-head .spacer{flex:1}
+  .card-head .stamp{font-size:12px;color:var(--muted)}
+
+  .kv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px}
+  .kv{background:var(--surface-alt);border-radius:10px;padding:8px 10px;min-width:0}
+  .kv .k{display:block;font-size:11px;color:var(--muted);letter-spacing:.3px}
+  .kv .v{font-size:14px;word-break:break-all}
+  .kv .v.ok{color:var(--success)}
+  .kv .v.warn{color:var(--warning)}
+  .kv .v.err{color:var(--danger)}
+
+  /* ---------- 表单控件 ---------- */
+  .field{display:block;margin-bottom:10px}
+  .field>span{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+  input[type=text],input[type=password],input[type=datetime-local],textarea,select{
+    width:100%;min-height:var(--touch);padding:10px 12px;border-radius:10px;
+    border:1px solid var(--line);background:var(--surface-alt);color:var(--text);font:inherit;
   }
-  h1 { font-size: 20px; margin: 0; }
-  .grow { flex: 1; }
-  .pill {
-    font-size: 12px; padding: 4px 10px; border-radius: 999px;
-    background: var(--surface-alt); color: var(--muted);
+  textarea{min-height:64px;resize:vertical}
+  input::placeholder,textarea::placeholder{color:#6b7885}
+  input:focus-visible,textarea:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible{
+    outline:2px solid var(--primary);outline-offset:1px
   }
-  .pill.ok { color: var(--success); }
-  .pill.warn { color: var(--warning); }
-  .pill.err { color: var(--danger); }
-  main { padding: 24px; max-width: 900px; margin: 0 auto; }
-  form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
-  input[type=text] {
-    flex: 1; min-width: 200px; padding: 12px 14px; border-radius: 10px;
-    border: 1px solid var(--surface-alt); background: var(--surface);
-    color: var(--text); font-size: 15px;
+  .btn{min-height:var(--touch);padding:0 16px;border:1px solid transparent;border-radius:10px;
+       background:var(--surface-alt);color:var(--text);font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}
+  .btn.primary{background:var(--primary);color:var(--on-primary)}
+  .btn.small{min-height:36px;padding:0 12px;font-size:13px;font-weight:500}
+  .btn.danger{border-color:var(--danger);color:var(--danger);background:transparent}
+  .btn.danger.armed{background:var(--danger);color:#fff}
+  .btn:disabled{opacity:.55;cursor:default}
+  .row-actions{display:flex;gap:8px;flex-wrap:wrap}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .inline-check{display:flex;align-items:center;gap:10px;min-height:var(--touch)}
+  .inline-check input{width:20px;height:20px;accent-color:var(--success)}
+
+  /* ---------- 新增 / 工具条 ---------- */
+  .add-row{display:flex;gap:8px;flex-wrap:wrap}
+  .add-row input[type=text]{flex:1;min-width:180px}
+  details.more{margin-top:10px}
+  details.more>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:6px 0;list-style:none}
+  details.more>summary::-webkit-details-marker{display:none}
+  details.more>summary::before{content:"＋ "}
+  details.more[open]>summary::before{content:"－ "}
+  details.more .fields{padding-top:6px}
+  #settings>summary{list-style:none;cursor:pointer}
+  #settings>summary::-webkit-details-marker{display:none}
+  #settings>summary::marker{content:""}
+
+  .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .seg{display:flex;background:var(--surface-alt);border-radius:10px;padding:3px;gap:2px}
+  .seg button{border:0;background:transparent;color:var(--muted);font:inherit;font-size:13px;
+              padding:6px 12px;border-radius:8px;cursor:pointer;min-height:34px}
+  .seg button.active{background:var(--primary);color:var(--on-primary);font-weight:600}
+  .search{flex:1;min-width:150px}
+  .counts{font-size:12px;color:var(--muted);margin-bottom:8px}
+
+  /* ---------- 待办列表 ---------- */
+  ul.list{list-style:none;margin:0;padding:0}
+  .row{display:flex;gap:12px;align-items:flex-start;padding:12px;margin-bottom:8px;
+       background:var(--surface);border:1px solid var(--line);border-radius:var(--radius)}
+  .row.done{opacity:.72}
+  .row .check{width:22px;height:22px;flex:0 0 auto;margin:2px 0 0;accent-color:var(--success);cursor:pointer}
+  .row .body{flex:1;min-width:0}
+  .row .title{font-size:15px;word-break:break-word}
+  .row.done .title{text-decoration:line-through;color:var(--muted)}
+  .row .desc{font-size:13px;color:var(--muted);white-space:pre-wrap;word-break:break-word;margin-top:4px}
+  .row .actions{display:flex;gap:6px;flex:0 0 auto}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .chip{font-size:11.5px;padding:2px 8px;border-radius:999px;background:var(--surface-alt);color:var(--muted);white-space:nowrap}
+  .chip.pri-1{background:rgba(241,196,15,.14);color:var(--warning)}
+  .chip.pri-2{background:rgba(231,76,60,.16);color:var(--danger)}
+  .chip.sync-ok{color:var(--success)}
+  .chip.sync-pending{background:rgba(241,196,15,.14);color:var(--warning)}
+  .chip.sync-failed{background:rgba(231,76,60,.16);color:var(--danger)}
+  .chip.due-over{background:rgba(231,76,60,.16);color:var(--danger)}
+  .chip.due-soon{background:rgba(241,196,15,.14);color:var(--warning)}
+  .empty{padding:28px 18px;text-align:center;border:1px dashed var(--line);border-radius:var(--radius);color:var(--muted)}
+  .empty .big{font-size:15px;color:var(--text);margin-bottom:6px}
+  .empty .btn{margin-top:12px}
+
+  /* ---------- 弹层 ---------- */
+  .overlay{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+           padding:16px;background:rgba(3,6,10,.72)}
+  .sheet{width:100%;max-width:520px;max-height:90vh;overflow:auto;background:var(--surface);
+         border:1px solid var(--line);border-radius:16px;padding:18px}
+  .sheet h2{font-size:16px;margin-bottom:12px}
+  .sheet .id{font-size:12px;color:var(--muted);font-weight:400}
+
+  /* ---------- WiFi 配置 ---------- */
+  .pass-wrap{display:flex;gap:8px;align-items:stretch}
+  .pass-wrap input{flex:1;min-width:0}
+  .pass-wrap .btn{flex:0 0 auto;min-width:64px}
+  .ap-list{list-style:none;margin:0;padding:0;max-height:330px;overflow:auto}
+  .ap{display:flex;align-items:center;gap:10px;padding:9px 10px;margin-bottom:6px;
+      background:var(--surface-alt);border:1px solid transparent;border-radius:10px}
+  .ap.on{border-color:var(--primary)}
+  .ap .ap-body{flex:1;min-width:0}
+  .ap .ap-name{font-size:14px;word-break:break-all}
+  .ap .ap-meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:3px}
+  .cnt{font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .bars{display:inline-flex;align-items:flex-end;gap:2px;height:14px;flex:0 0 auto}
+  .bars i{width:4px;background:var(--line);border-radius:1px}
+  .bars i:nth-child(1){height:5px} .bars i:nth-child(2){height:8px}
+  .bars i:nth-child(3){height:11px} .bars i:nth-child(4){height:14px}
+  .bars i.on{background:var(--success)}
+  .bars.warn i.on{background:var(--warning)}
+  .bars.err i.on{background:var(--danger)}
+  .sec{font-size:11.5px;padding:2px 8px;border-radius:999px;background:rgba(154,167,180,.14);color:var(--muted);white-space:nowrap}
+  .sec.open{background:rgba(241,196,15,.16);color:var(--warning)}
+  .sec.ent{background:rgba(231,76,60,.16);color:var(--danger)}
+  .scan-note{font-size:12px;color:var(--muted);margin-bottom:8px}
+  .op-line{font-size:13px;padding:8px 10px;margin-top:10px;border-radius:10px;background:var(--surface-alt);
+           border-left:3px solid var(--muted);word-break:break-word}
+  .op-line.busy{border-left-color:var(--primary)}
+  .op-line.ok{border-left-color:var(--success)}
+  .op-line.warn{border-left-color:var(--warning)}
+  .op-line.err{border-left-color:var(--danger)}
+  .wifi-sub{font-size:13px;margin:12px 0 6px}
+  .wifi-warn{border-left:4px solid var(--warning)}
+
+  #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:30;max-width:88vw;
+         padding:11px 18px;border-radius:12px;background:var(--surface-alt);border:1px solid var(--line);
+         font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}
+  #toast.show{opacity:1}
+  #toast.ok{border-color:var(--success)}
+  #toast.err{border-color:var(--danger)}
+  #toast.warn{border-color:var(--warning)}
+
+  footer{color:var(--muted);font-size:12px;padding:0 16px 28px;max-width:960px;margin:0 auto}
+
+  @media (max-width:600px){
+    .wrap{padding:0 12px}
+    .pills{width:100%;margin-left:0}
+    .row{flex-wrap:wrap}
+    .row .actions{width:100%;justify-content:flex-end}
+    .grid2{grid-template-columns:1fr}
   }
-  input[type=text]:focus { outline: 1px solid var(--primary); }
-  button {
-    min-height: 44px; padding: 0 18px; border: 0; border-radius: 10px;
-    background: var(--primary); color: #06121c; font-size: 15px;
-    font-weight: 600; cursor: pointer;
-  }
-  button.ghost { background: var(--surface-alt); color: var(--text); }
-  button:disabled { opacity: .5; cursor: default; }
-  ul { list-style: none; padding: 0; margin: 0; }
-  li {
-    display: flex; align-items: center; gap: 14px; padding: 12px 16px;
-    background: var(--surface); border-radius: 12px; margin-bottom: 8px;
-  }
-  li.done .title { text-decoration: line-through; color: var(--muted); }
-  li .title { flex: 1; word-break: break-word; }
-  li .meta { font-size: 12px; color: var(--muted); }
-  input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--success); }
-  .empty { color: var(--muted); padding: 32px; text-align: center; }
-  #toast {
-    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
-    background: var(--surface-alt); padding: 12px 20px; border-radius: 12px;
-    opacity: 0; transition: opacity .2s; pointer-events: none;
-  }
-  #toast.show { opacity: 1; }
-  .hint { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
 </style>
 </head>
 <body>
-<header>
-  <h1>ToDoHelper</h1>
-  <span class="pill" id="device">设备信息加载中…</span>
-  <span class="grow"></span>
-  <span class="pill" id="link">连接中…</span>
+
+<header class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">✓</span>
+      <div>
+        <h1>ToDoHelper</h1>
+        <div class="sub">局域网待办助手 · 上位机</div>
+      </div>
+    </div>
+    <div class="pills">
+      <span class="pill" id="pill-link"><i class="dot"></i><span>连接中…</span></span>
+      <span class="pill" id="pill-sse"><i class="dot"></i><span>推送：连接中…</span></span>
+    </div>
+  </div>
 </header>
 
-<main>
-  <p class="hint">
-    在电脑上新增/勾选待办后，设备端会自动刷新；设备端勾选后这里也会通过事件推送更新。
-  </p>
+<div class="wrap">
+  <div class="stack">
 
-  <form id="add-form">
-    <input type="text" id="title" placeholder="新增待办，例如：买牛奶" maxlength="127" required>
-    <button type="submit">添加</button>
-    <button type="button" class="ghost" id="sync">标记已同步</button>
-    <button type="button" class="ghost" id="reload">刷新</button>
-  </form>
+    <!-- 错误 / 离线 / 鉴权横幅：只在真出问题时出现 -->
+    <div class="banner offline" id="banner" role="alert" aria-live="polite" hidden>
+      <div class="txt">
+        <strong id="banner-title">设备不可达</strong>
+        <p id="banner-detail"></p>
+      </div>
+      <button class="btn small" type="button" id="banner-retry">立即重试</button>
+    </div>
 
-  <ul id="list"></ul>
-  <div class="empty" id="empty" hidden>还没有待办，先添加一条吧。</div>
-</main>
+    <!-- 设备状态面板 -->
+    <section class="card" aria-labelledby="dev-title">
+      <div class="card-head">
+        <h2 id="dev-title">设备状态</h2>
+        <span class="spacer"></span>
+        <span class="stamp" id="dev-stamp">尚未读取</span>
+        <button class="btn small" type="button" id="dev-refresh">刷新</button>
+      </div>
+      <div class="kv-grid" id="device-rows"></div>
+    </section>
 
-<div id="toast"></div>
+    <!-- 新增 -->
+    <form class="card" id="add-form" autocomplete="off">
+      <div class="add-row">
+        <input type="text" id="add-title" maxlength="127" placeholder="新增待办，例如：给妈妈打电话" aria-label="待办标题" required>
+        <button class="btn primary" type="submit" id="add-btn">添加</button>
+      </div>
+      <details class="more" id="add-more">
+        <summary>可选：备注 / 截止时间 / 优先级</summary>
+        <div class="fields">
+          <label class="field"><span>备注（最多 255 字）</span>
+            <textarea id="add-desc" rows="2" maxlength="255" placeholder="补充说明（可选）"></textarea></label>
+          <div class="grid2">
+            <label class="field"><span>截止时间</span><input type="datetime-local" id="add-due"></label>
+            <label class="field"><span>优先级</span>
+              <select id="add-pri">
+                <option value="0">普通</option>
+                <option value="1">重要</option>
+                <option value="2">紧急</option>
+              </select></label>
+          </div>
+        </div>
+      </details>
+    </form>
+
+    <!-- 列表 -->
+    <section aria-label="待办列表">
+      <div class="toolbar">
+        <div class="seg" id="filters" role="group" aria-label="筛选">
+          <button type="button" class="active" data-filter="all">全部</button>
+          <button type="button" data-filter="open">未完成</button>
+          <button type="button" data-filter="done">已完成</button>
+        </div>
+        <input class="search" type="text" id="search" placeholder="搜索标题或备注…" aria-label="搜索待办">
+        <button class="btn small" type="button" id="sync-all" title="POST /api/v1/sync：把设备上全部待办标记为已同步">标记已同步</button>
+        <button class="btn small" type="button" id="reload">刷新</button>
+      </div>
+      <div class="counts" id="counts"></div>
+      <ul class="list" id="list"></ul>
+      <div class="empty" id="empty" hidden>
+        <div class="big" id="empty-title">正在读取设备上的待办…</div>
+        <div id="empty-detail"></div>
+        <button class="btn primary" type="button" id="empty-action" hidden>添加待办</button>
+      </div>
+    </section>
+
+    <!-- 连接设置 -->
+    <details class="card" id="settings">
+      <summary class="card-head" style="cursor:pointer;list-style:none;margin:0">
+        <h2>连接设置 / 身份令牌</h2>
+        <span class="spacer"></span>
+        <span class="stamp" id="auth-state">鉴权状态未知</span>
+      </summary>
+      <div class="fields" style="padding-top:10px">
+        <p class="small muted">
+          设备开启鉴权后，所有请求（含读取）都要带请求头 <code>X-Auth-Token</code>。令牌只保存在本机浏览器的
+          localStorage 里，不会发往设备以外的任何地方。<br>
+          注意：开启/关闭鉴权由 <code>POST /api/v1/device/auth</code> 完成，而该接口本身要求携带<strong>当前已生效的</strong>令牌，
+          所以本页只能填写令牌、无法代替设备开启或关闭鉴权。
+        </p>
+        <label class="field"><span>访问令牌（X-Auth-Token）</span>
+          <input type="password" id="token-input" autocomplete="new-password" placeholder="留空 = 设备未开启鉴权"></label>
+        <div class="row-actions">
+          <button class="btn primary" type="button" id="token-save">保存令牌并重连</button>
+          <button class="btn" type="button" id="token-clear">清除令牌</button>
+        </div>
+      </div>
+    </details>
+
+  </div>
+</div>
+
+<footer>
+  本页由设备内嵌提供（<code>GET /</code>），不依赖任何外部网络资源。待办数据保存在设备上，设备屏幕只读 —— 新增、编辑、勾选、删除都在本页完成。
+  <noscript>当前浏览器禁用了 JavaScript，页面无法工作。</noscript>
+</footer>
+
+<!-- 编辑弹层 -->
+<div class="overlay" id="editor" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="ed-heading">
+    <h2 id="ed-heading">编辑待办 <span class="id" id="ed-id"></span></h2>
+    <form id="edit-form" autocomplete="off">
+      <label class="field"><span>标题（必填，最多 127 字）</span>
+        <input type="text" id="ed-text" maxlength="127" required></label>
+      <label class="field"><span>备注</span>
+        <textarea id="ed-desc" rows="3" maxlength="255"></textarea></label>
+      <div class="grid2">
+        <label class="field"><span>截止时间</span><input type="datetime-local" id="ed-due"></label>
+        <label class="field"><span>优先级</span>
+          <select id="ed-pri">
+            <option value="0">普通</option>
+            <option value="1">重要</option>
+            <option value="2">紧急</option>
+          </select></label>
+      </div>
+      <label class="inline-check"><input type="checkbox" id="ed-done"><span>已完成</span></label>
+      <p class="small muted">保存会用 <code>PUT /api/v1/todos/{id}</code> 整体替换设备上的这一项（标题 / 备注 / 截止 / 完成 / 优先级）。</p>
+      <div class="row-actions">
+        <button class="btn primary" type="submit" id="ed-save">保存</button>
+        <button class="btn" type="button" id="ed-cancel">取消</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script>
 "use strict";
 
-const $ = (id) => document.getElementById(id);
-let authToken = localStorage.getItem("todohelper_token") || "";
+/* ========================================================================
+   0. 常量与小工具
+   ======================================================================== */
 
-function toast(message) {
-  const el = $("toast");
-  el.textContent = message;
-  el.classList.add("show");
-  clearTimeout(toast._timer);
-  toast._timer = setTimeout(() => el.classList.remove("show"), 2200);
+var TOKEN_KEY = "todohelper_token";
+/* 设备未校时前，todo_manager 的 updated_at 写的是“开机秒数”。
+   任何小于 2001-09-09 的时间戳都当开机时长处理，避免显示 1970 或荒谬日期。 */
+var UNSYNCED_TS = 1000000000;
+var POLL_MS = 15000;
+var MAX_BACKOFF = 30000;
+var PRIORITY_TEXT = ["普通", "重要", "紧急"];
+var SYNC_TEXT = { ok: "已同步", pending: "待同步", failed: "同步失败", none: "未跟踪" };
+var WIFI_TEXT = { connected: "已连接", connecting: "连接中", disconnected: "未连接", failed: "连接失败", unknown: "未知" };
+/* 设备会通过 SSE 推送的 L0 通知名（见各组件 sys_notify 调用）。 */
+var PUSH_TODO = { todo_changed: 1, todo_done: 1, sync_started: 1, sync_done: 1 };
+var PUSH_NET = { net_online: 1, net_offline: 1, wifi_connected: 1, wifi_failed: 1 };
+var PUSH_ALL = ["todo_changed", "todo_done", "sync_started", "sync_done",
+                "net_online", "net_offline", "wifi_connected", "wifi_failed",
+                "weather_changed", "word_reviewed"];
+
+function $(id) { return document.getElementById(id); }
+function el(tag, cls, text) {
+  var node = document.createElement(tag);
+  if (cls) { node.className = cls; }
+  if (text !== undefined && text !== null) { node.textContent = text; }
+  return node;
+}
+function setText(node, text) { node.textContent = text; }
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+/* ========================================================================
+   1. 状态
+   ======================================================================== */
+
+var token = readToken();
+var items = [];            /* 设备返回的原始待办数组 */
+var loaded = false;        /* 是否成功读到过一次列表 */
+var filter = "all";
+var keyword = "";
+var deviceInfo = null;
+var deviceStatus = null;
+var editingId = 0;
+var lastListAt = 0;
+var lastDevAt = 0;
+
+function readToken() {
+  try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+}
+function storeToken(value) {
+  try {
+    if (value) { window.localStorage.setItem(TOKEN_KEY, value); }
+    else { window.localStorage.removeItem(TOKEN_KEY); }
+  } catch (e) { /* 隐私模式：本次会话内仍可用 */ }
 }
 
-async function api(path, options = {}) {
-  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
-  if (authToken) headers["X-Auth-Token"] = authToken;
+/* ========================================================================
+   2. 提示 / 横幅 / 状态点
+   ======================================================================== */
 
-  const response = await fetch(path, Object.assign({}, options, { headers }));
-  let body = null;
-  try { body = await response.json(); } catch (e) { /* 501/204 may have no body */ }
-
-  if (response.status === 401) {
-    throw new Error("未授权：请在设置里填写 token（本页会保存在浏览器本地）");
-  }
-  // 501 means "path exists but the feature is not built yet" (requirement 8.1):
-  // surface it clearly instead of pretending it worked.
-  if (response.status === 501) {
-    const hint = body && body.data && body.data.hint ? body.data.hint : "该接口尚未实现";
-    throw new Error("501 " + hint);
-  }
-  if (!response.ok || (body && body.code !== 0)) {
-    throw new Error((body && body.msg) || ("HTTP " + response.status));
-  }
-  return body ? body.data : null;
+var toastTimer = 0;
+function toast(message, kind) {
+  var box = $("toast");
+  box.textContent = message;
+  box.className = "show" + (kind ? " " + kind : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { box.className = ""; }, 2800);
 }
 
-function fmtTime(ts) {
-  if (!ts) return "";
-  const d = new Date(ts * 1000);
-  if (isNaN(d.getTime())) return "";
-  return d.toLocaleString("zh-CN", { hour12: false });
+var bannerKind = "";
+function showBanner(kind, title, detail, withRetry) {
+  bannerKind = kind;
+  var box = $("banner");
+  box.className = "banner " + kind;
+  setText($("banner-title"), title);
+  setText($("banner-detail"), detail || "");
+  $("banner-retry").hidden = !withRetry;
+  box.hidden = false;
+}
+function hideBanner() {
+  bannerKind = "";
+  $("banner").hidden = true;
+}
+function setPill(id, state, text) {
+  var node = $(id);
+  node.className = "pill " + (state || "");
+  setText(node.lastElementChild, text);
 }
 
-function render(items) {
-  const list = $("list");
-  list.innerHTML = "";
-  $("empty").hidden = items.length > 0;
+/* ========================================================================
+   3. API 层：串行队列 + 统一信封解析 + 诚实的错误分类
+   ======================================================================== */
 
-  for (const item of items) {
-    const li = document.createElement("li");
-    if (item.done) li.classList.add("done");
+var queue = Promise.resolve();
 
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = !!item.done;
-    box.addEventListener("change", async () => {
-      try {
-        await api(`/api/v1/todos/${item.id}/done`, {
-          method: "PATCH",
-          body: JSON.stringify({ done: box.checked }),
-        });
-        toast(box.checked ? "已标记完成" : "已取消完成");
-      } catch (e) {
-        box.checked = !box.checked;
-        toast("失败：" + e.message);
-      }
+/* 设备只开 5 个 socket（SSE 常占 1 个），普通请求一律排队，避免把自己挤掉。 */
+function api(path, options) {
+  var run = function () { return request(path, options || {}); };
+  var result = queue.then(run, run);
+  queue = result.then(function () {}, function () {});
+  return result;
+}
+
+function apiError(message, kind, status) {
+  var err = new Error(message);
+  err.kind = kind;
+  err.status = status || 0;
+  return err;
+}
+
+async function request(path, options) {
+  var ms = options.timeoutMs || 10000;
+  var controller = (typeof AbortController === "function") ? new AbortController() : null;
+  var timedOut = false;
+  var timer = 0;
+  if (controller) {
+    timer = setTimeout(function () { timedOut = true; controller.abort(); }, ms);
+  }
+
+  var headers = { "Accept": "application/json" };
+  if (options.body !== undefined && options.body !== null) { headers["Content-Type"] = "application/json"; }
+  if (token) { headers["X-Auth-Token"] = token; }
+
+  try {
+    var response = await fetch(path, {
+      method: options.method || "GET",
+      headers: headers,
+      body: options.body,
+      signal: controller ? controller.signal : undefined,
+      cache: "no-store",
+      credentials: "omit"
     });
 
-    const title = document.createElement("span");
-    title.className = "title";
-    title.textContent = item.title;
+    var text = "";
+    try {
+      /* 超时定时器一直留到 body 读完，避免半截响应把串行队列卡死。 */
+      text = await response.text();
+    } catch (e) {
+      if (timedOut) { throw apiError("设备在 " + Math.round(ms / 1000) + " 秒内没有响应", "timeout"); }
+      throw apiError("读取设备响应失败（HTTP " + response.status + "）", "http", response.status);
+    }
 
-    const meta = document.createElement("span");
-    meta.className = "meta";
-    const syncText = { ok: "已同步", pending: "待同步", failed: "同步失败", none: "" }[item.sync_state] || "";
-    meta.textContent = [item.updated_at ? fmtTime(item.updated_at) : "", syncText]
-      .filter(Boolean).join(" · ");
+    var body = null;
+    if (text) { try { body = JSON.parse(text); } catch (e) { body = null; } }
+    var msg = (body && body.msg) ? body.msg : "";
 
-    const del = document.createElement("button");
-    del.className = "ghost";
-    del.textContent = "删除";
-    del.addEventListener("click", async () => {
-      try {
-        await api(`/api/v1/todos/${item.id}`, { method: "DELETE" });
-        toast("已删除");
-      } catch (e) {
-        toast("失败：" + e.message);
-      }
-    });
-
-    li.append(box, title, meta, del);
-    list.append(li);
-  }
-}
-
-async function load() {
-  try {
-    const data = await api("/api/v1/todos");
-    render(data.items || []);
-    setLink(true);
+    if (response.status === 401) {
+      throw apiError(msg || "设备已开启鉴权：请求缺少有效的 X-Auth-Token", "auth", 401);
+    }
+    if (response.status === 501) {
+      var hint = (body && body.data && body.data.hint) ? body.data.hint : "";
+      throw apiError("设备尚未实现该功能" + (hint ? "（" + hint + "）" : ""), "notimpl", 501);
+    }
+    if (!response.ok) {
+      throw apiError(msg || ("HTTP " + response.status), "http", response.status);
+    }
+    if (body === null) {
+      throw apiError("设备返回的内容不是合法 JSON 信封", "parse", response.status);
+    }
+    if (typeof body.code === "number" && body.code !== 0) {
+      throw apiError(msg || ("code " + body.code), "http", response.status);
+    }
+    return body.data;
   } catch (e) {
-    toast("加载失败：" + e.message);
-    setLink(false);
+    if (e && e.kind) { throw e; }                     /* 已分类的错误直接上报 */
+    if (timedOut || (e && e.name === "AbortError")) {
+      throw apiError("设备在 " + Math.round(ms / 1000) + " 秒内没有响应", "timeout");
+    }
+    throw apiError("无法连接设备（确认电脑与设备在同一局域网、设备已上电）", "offline");
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-async function loadDevice() {
-  try {
-    const info = await api("/api/v1/device/info");
-    $("device").textContent =
-      `${info.model} · ${info.version} · ${info.ip || "无 IP"} · ${info.sd_available ? "SD 卡" : "内置存储"}`;
-  } catch (e) {
-    $("device").textContent = "设备信息不可用";
+/* ========================================================================
+   4. 在线 / 离线状态机（含自动重试倒计时）
+   ======================================================================== */
+
+var net = { offline: false, delay: 3000, timer: 0, deadline: 0, reason: "" };
+
+function goOnline() {
+  var wasOffline = net.offline;
+  net.offline = false;
+  net.delay = 3000;
+  net.reason = "";
+  clearTimeout(net.timer);
+  net.timer = 0;
+  setPill("pill-link", "ok", "已连接");
+  /* 请求成功说明设备可达：离线/失败横幅可以撤掉；鉴权横幅要等令牌真的生效才撤。 */
+  if (wasOffline || bannerKind === "offline" || bannerKind === "error") { hideBanner(); }
+}
+
+function goOffline(reason) {
+  var first = !net.offline;
+  if (first) { net.delay = 3000; }
+  net.offline = true;
+  net.reason = reason || "设备不可达";
+  clearTimeout(net.timer);
+  net.deadline = Date.now() + net.delay;
+  showBanner("offline", "设备不可达", offlineDetail(), true);
+  setPill("pill-link", "err", "设备离线");
+  var wait = net.delay;
+  net.delay = Math.min(net.delay * 2, MAX_BACKOFF);
+  net.timer = setTimeout(function () { loadAll(); loadDevice(); }, wait);
+}
+
+function offlineDetail() {
+  var left = Math.max(0, Math.ceil((net.deadline - Date.now()) / 1000));
+  return net.reason + "　将在 " + left + " 秒后自动重试（也可以点右侧按钮立刻重试）。";
+}
+
+/* 设备其实连得上，只是这次请求被拒/出错：状态点要说清楚，不能一直停在“连接中”。 */
+function reachableWithProblem(err) {
+  setPill("pill-link", "warn", err.kind === "auth" ? "已连接 · 需要令牌" : "已连接 · 请求出错");
+}
+
+/* 一处集中处理“操作失败该怎么办”，避免静默失败。 */
+function reportError(err, action) {
+  var message = action + "失败：" + err.message;
+  if (err.kind === "auth") {
+    reachableWithProblem(err);
+    showBanner("auth", "需要身份令牌", err.message + "　展开下面的“连接设置”，填入设备令牌后会自动恢复。", false);
+    openSettings();
+  } else if (err.kind === "offline" || err.kind === "timeout") {
+    goOffline(err.message);
+  } else if (err.kind === "notimpl") {
+    reachableWithProblem(err);
+    showBanner("error", "设备没有这个功能", message, false);
+  } else {
+    reachableWithProblem(err);
+    showBanner("error", "请求失败", message + "　可稍后重试；持续失败时请看设备串口日志。", true);
+  }
+  toast(message, "err");
+}
+
+/* ========================================================================
+   5. 时间 / 容量格式化
+   ======================================================================== */
+
+function fmtBytes(bytes) {
+  var n = Number(bytes);
+  if (!isFinite(n) || n <= 0) { return "未知"; }
+  var units = ["B", "KB", "MB", "GB"];
+  var i = 0;
+  while (n >= 1024 && i < units.length - 1) { n = n / 1024; i++; }
+  var text = (i === 0) ? String(n) : n.toFixed(n >= 100 ? 0 : 1);
+  return text + " " + units[i];
+}
+
+function fmtDuration(seconds) {
+  var s = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (s < 60) { return s + " 秒"; }
+  var m = Math.floor(s / 60);
+  if (m < 60) { return m + " 分钟"; }
+  var h = Math.floor(m / 60);
+  if (h < 24) { return h + " 小时 " + (m % 60) + " 分"; }
+  return Math.floor(h / 24) + " 天 " + (h % 24) + " 小时";
+}
+
+function fmtClock(ts) {
+  var d = new Date(ts * 1000);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+}
+function fmtDateTime(ts) {
+  var d = new Date(ts * 1000);
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
+         " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+/* 设备时间戳：真 Unix 秒 → “N 分钟前/日期”；开机秒（未校时）→ “开机 N”；0 → 空 */
+function fmtRelative(ts) {
+  var n = Number(ts) || 0;
+  if (n <= 0) { return ""; }
+  if (n < UNSYNCED_TS) { return "开机 " + fmtDuration(n); }
+  var diff = Math.floor(Date.now() / 1000) - n;
+  if (diff < 60) { return "刚刚"; }
+  if (diff < 3600) { return Math.floor(diff / 60) + " 分钟前"; }
+  if (diff < 86400) { return Math.floor(diff / 3600) + " 小时前"; }
+  if (diff < 7 * 86400) { return Math.floor(diff / 86400) + " 天前"; }
+  return fmtDateTime(n);
+}
+function inputToTs(value) {
+  if (!value) { return 0; }
+  var ms = new Date(value).getTime();
+  return isFinite(ms) ? Math.floor(ms / 1000) : 0;
+}
+function tsToInput(ts) {
+  var n = Number(ts) || 0;
+  if (n <= 0 || n < UNSYNCED_TS) { return ""; }
+  var d = new Date(n * 1000);
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
+         "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+/* ========================================================================
+   6. 设备状态面板
+   ======================================================================== */
+
+function loadDevice() {
+  return api("/api/v1/device/info", { timeoutMs: 8000 }).then(function (info) {
+    deviceInfo = info;
+    return api("/api/v1/device/status", { timeoutMs: 8000 }).catch(function () { return null; });
+  }).then(function (status) {
+    deviceStatus = status || null;
+    lastDevAt = Date.now();
+    renderDevice();
+    renderAuthState();
+  }).catch(function (err) {
+    deviceInfo = null;
+    deviceStatus = null;
+    renderDevice(err);
+  });
+}
+
+function renderDevice(err) {
+  var grid = $("device-rows");
+  grid.textContent = "";
+  setText($("dev-stamp"), err ? "读取失败" : (lastDevAt ? "更新于 " + fmtClock(lastDevAt / 1000) : "尚未读取"));
+
+  if (!deviceInfo) {
+    grid.append(el("p", "muted small", err ? ("设备信息不可用：" + err.message) : "正在读取设备信息…"));
+    return;
+  }
+
+  var info = deviceInfo;
+  var status = deviceStatus;
+  var add = function (label, value, cls) {
+    var cell = el("div", "kv");
+    cell.append(el("span", "k", label), el("span", "v" + (cls ? " " + cls : ""), value));
+    grid.append(cell);
+  };
+
+  add("设备", info.model || "未知");
+  add("固件", (info.app_name ? info.app_name + " " : "") + (info.version || "未知"));
+  add("ESP-IDF", info.idf || "未知");
+  add("IP 地址", (info.ip && info.ip !== "0.0.0.0") ? info.ip : "未连接",
+      (info.ip && info.ip !== "0.0.0.0") ? "ok" : "warn");
+  add("主机名", (info.hostname ? info.hostname + ".local" : "未知"));
+  add("MAC", info.mac || "未知");
+
+  var wifi = WIFI_TEXT[info.wifi_state] || info.wifi_state || "未知";
+  if (status && status.wifi_connected && typeof status.wifi_rssi === "number" && status.wifi_rssi !== 0) {
+    wifi += "（" + status.wifi_rssi + " dBm）";
+  }
+  add("WiFi", wifi, info.wifi_state === "connected" ? "ok" : "warn");
+
+  var storage = !info.storage_available ? "无可用存储（重启会丢失）"
+              : (info.sd_available ? "SD 卡" : "内置 LittleFS");
+  if (info.storage_root) { storage += " " + info.storage_root; }
+  add("存储介质", storage, info.storage_available ? "" : "err");
+  /* 设备只暴露剩余空间（/api/v1/device/info 没有总容量字段），所以这里不显示百分比。 */
+  add("剩余空间", info.storage_available ? fmtBytes(info.storage_free_bytes) : "—",
+      (!info.storage_available || !info.storage_free_bytes) ? "warn" : "");
+  add("存储可用", info.storage_available ? "是" : "否", info.storage_available ? "ok" : "err");
+
+  if (status) {
+    add("内存", "堆 " + fmtBytes(status.free_heap) + " / PSRAM " + fmtBytes(status.free_psram));
+    add("运行时长", fmtDuration(status.uptime_s));
+    add("设备时间", status.time_synced ? "已同步（NTP）" : "未同步（到期提醒可能不准）",
+        status.time_synced ? "ok" : "warn");
+    add("推送客户端", (status.sse_clients || 0) + " / 4");
+    if (status.url) { add("访问地址", status.url); }
+  } else {
+    add("运行时长", "未取到（/api/v1/device/status）", "warn");
+  }
+  add("鉴权", info.auth_enabled ? "已开启" : "未开启", info.auth_enabled ? "warn" : "ok");
+}
+
+function renderAuthState() {
+  var enabled = deviceInfo && deviceInfo.auth_enabled;
+  var node = $("auth-state");
+  if (!deviceInfo) { setText(node, "鉴权状态未知"); node.className = "stamp"; return; }
+  if (enabled && !token) {
+    setText(node, "设备已开启鉴权 · 尚未填写令牌");
+    node.className = "stamp";
+    node.style.color = "var(--warning)";
+  } else if (enabled) {
+    setText(node, "设备已开启鉴权 · 已填写令牌");
+    node.className = "stamp";
+    node.style.color = "var(--success)";
+  } else {
+    setText(node, "设备未开启鉴权");
+    node.className = "stamp";
+    node.style.color = "";
   }
 }
 
-function setLink(ok) {
-  const el = $("link");
-  el.textContent = ok ? "已连接" : "连接中断";
-  el.className = "pill " + (ok ? "ok" : "err");
+function openSettings() {
+  var box = $("settings");
+  if (box) { box.open = true; }
 }
 
-$("add-form").addEventListener("submit", async (event) => {
+/* ========================================================================
+   7. 列表加载与渲染
+   ======================================================================== */
+
+function loadAll() {
+  return api("/api/v1/todos").then(function (data) {
+    items = (data && Array.isArray(data.items)) ? data.items : [];
+    loaded = true;
+    lastListAt = Date.now();
+    goOnline();
+    renderList();
+  }).catch(function (err) {
+    renderList();
+    if (err.kind === "offline" || err.kind === "timeout") {
+      goOffline(err.message);
+    } else {
+      reachableWithProblem(err);
+      showBanner(err.kind === "auth" ? "auth" : "error",
+                 err.kind === "auth" ? "需要身份令牌" : "无法读取待办列表",
+                 err.message + (err.kind === "auth" ? "　展开“连接设置”填写令牌。" : "　点“刷新”重试。"),
+                 err.kind !== "auth");
+      if (err.kind === "auth") { openSettings(); }
+      toast("读取待办失败：" + err.message, "err");
+    }
+  });
+}
+
+function visibleItems() {
+  var key = keyword.trim().toLowerCase();
+  return items.filter(function (item) {
+    if (filter === "open" && item.done) { return false; }
+    if (filter === "done" && !item.done) { return false; }
+    if (key) {
+      var hay = ((item.title || "") + " " + (item.desc || "")).toLowerCase();
+      if (hay.indexOf(key) < 0) { return false; }
+    }
+    return true;
+  });
+}
+
+function upsertItem(item) {
+  if (!item || !item.id) { return; }
+  var found = false;
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].id === item.id) { items[i] = item; found = true; break; }
+  }
+  if (!found) { items.push(item); }
+  loaded = true;
+  renderList();
+}
+
+function syncChip(state) {
+  var name = state || "none";
+  return el("span", "chip sync-" + name, SYNC_TEXT[name] || name);
+}
+
+function dueChip(item) {
+  var due = Number(item.due_ts) || 0;
+  if (due <= 0) { return null; }
+  if (item.done) { return el("span", "chip", "到期 " + fmtDateTime(due)); }
+
+  /* 用“本地今天 23:59:59”和“明天 23:59:59”判断今天/明天，避免 24 小时口径说谎。 */
+  var endOfToday = new Date();
+  endOfToday.setHours(23, 59, 59, 999);
+  var today = Math.floor(endOfToday.getTime() / 1000);
+  var tomorrow = today + 86400;
+
+  if (due <= Math.floor(Date.now() / 1000)) { return el("span", "chip due-over", "已逾期 · " + fmtDateTime(due)); }
+  if (due <= today) { return el("span", "chip due-soon", "今天到期 · " + fmtClock(due)); }
+  if (due <= tomorrow) { return el("span", "chip due-soon", "明天到期 · " + fmtClock(due)); }
+  if (due <= today + 7 * 86400) {
+    return el("span", "chip due-soon", (Math.floor((due - today) / 86400) + 1) + " 天后 · " + fmtDateTime(due));
+  }
+  return el("span", "chip", "到期 " + fmtDateTime(due));
+}
+
+function renderRow(item) {
+  var row = el("li", "row" + (item.done ? " done" : ""));
+
+  var box = el("input", "check");
+  box.type = "checkbox";
+  box.checked = !!item.done;
+  box.setAttribute("aria-label", (item.done ? "把“" + item.title + "”标记为未完成" : "把“" + item.title + "”标记为已完成"));
+  box.addEventListener("change", function () { toggleDone(item, box); });
+
+  var body = el("div", "body");
+  body.append(el("div", "title", item.title || "(无标题)"));
+
+  var chips = el("div", "chips");
+  if (item.priority) {
+    chips.append(el("span", "chip pri-" + item.priority, PRIORITY_TEXT[item.priority] || ("优先级 " + item.priority)));
+  }
+  var due = dueChip(item);
+  if (due) { chips.append(due); }
+  chips.append(syncChip(item.sync_state));
+  if (item.done) { chips.append(el("span", "chip", "已完成")); }
+  var updated = fmtRelative(item.updated_at);
+  if (updated) { chips.append(el("span", "chip", "更新 " + updated)); }
+  chips.append(el("span", "chip", "#" + item.id));
+  body.append(chips);
+
+  if (item.desc) { body.append(el("div", "desc", item.desc)); }
+
+  var actions = el("div", "actions");
+  var edit = el("button", "btn small", "编辑");
+  edit.type = "button";
+  edit.addEventListener("click", function () { openEditor(item); });
+  var del = el("button", "btn small danger", "删除");
+  del.type = "button";
+  del.addEventListener("click", function () { armDelete(item, del); });
+  actions.append(edit, del);
+
+  row.append(box, body, actions);
+  return row;
+}
+
+function renderList() {
+  var list = $("list");
+  var rows = visibleItems();
+  list.textContent = "";
+
+  var doneCount = 0, pendingCount = 0;
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].done) { doneCount++; }
+    if (items[i].sync_state && items[i].sync_state !== "ok") { pendingCount++; }
+  }
+  setText($("counts"), items.length
+    ? ("共 " + items.length + " 项 · 未完成 " + (items.length - doneCount) + " · 已完成 " + doneCount +
+       (pendingCount ? " · 待同步 " + pendingCount : "") +
+       (lastListAt ? " · 更新于 " + fmtClock(lastListAt / 1000) : ""))
+    : "");
+
+  for (var r = 0; r < rows.length; r++) { list.append(renderRow(rows[r])); }
+
+  var empty = $("empty");
+  if (rows.length) {
+    empty.hidden = true;
+    return;
+  }
+  empty.hidden = false;
+  var action = $("empty-action");
+  if (!loaded) {
+    setText($("empty-title"), "正在读取设备上的待办…");
+    setText($("empty-detail"), "请稍候，设备正在返回列表。");
+    action.hidden = true;
+  } else if (!items.length) {
+    setText($("empty-title"), "还没有待办事项");
+    setText($("empty-detail"), "在上面的输入框里写下第一条吧。设备屏幕是只读的，新增 / 编辑 / 勾选 / 删除都在本页完成。");
+    action.hidden = false;
+    action.textContent = "添加第一条待办";
+    action.dataset.act = "add";
+  } else {
+    setText($("empty-title"), "没有符合当前条件的待办");
+    setText($("empty-detail"), "换个筛选条件，或清空搜索关键词。");
+    action.hidden = false;
+    action.textContent = "清除筛选与搜索";
+    action.dataset.act = "clear";
+  }
+}
+
+/* ========================================================================
+   8. 增删改
+   ======================================================================== */
+
+function toggleDone(item, box) {
+  var target = box.checked;
+  box.disabled = true;
+  return api("/api/v1/todos/" + item.id + "/done", {
+    method: "PATCH",
+    body: JSON.stringify({ done: target })
+  }).then(function (updated) {
+    /* 设备已在响应里带上最新一项，也顺手把勾选标记为已同步。 */
+    if (updated) { upsertItem(updated); }
+    toast(target ? "已完成 #" + item.id : "已恢复为未完成", "ok");
+  }).catch(function (err) {
+    box.checked = !target;   /* 回滚，绝不假装成功 */
+    reportError(err, target ? "标记完成" : "取消完成");
+  }).then(function () {
+    box.disabled = false;
+  });
+}
+
+/* 两步删除：第一次点变“确认删除”，4 秒内再点才真的删。 */
+function armDelete(item, btn) {
+  if (btn.dataset.armed === "1") { doDelete(item, btn); return; }
+  btn.dataset.armed = "1";
+  btn.classList.add("armed");
+  btn.textContent = "确认删除";
+  setTimeout(function () {
+    if (!btn.isConnected) { return; }
+    btn.dataset.armed = "";
+    btn.classList.remove("armed");
+    btn.textContent = "删除";
+  }, 4000);
+}
+
+function doDelete(item, btn) {
+  btn.disabled = true;
+  btn.textContent = "删除中…";
+  return api("/api/v1/todos/" + item.id, { method: "DELETE" }).then(function () {
+    var kept = [];
+    for (var i = 0; i < items.length; i++) { if (items[i].id !== item.id) { kept.push(items[i]); } }
+    items = kept;
+    renderList();
+    toast("已删除 #" + item.id, "ok");
+  }).catch(function (err) {
+    btn.disabled = false;
+    btn.dataset.armed = "";
+    btn.classList.remove("armed");
+    btn.textContent = "删除";
+    reportError(err, "删除");
+  });
+}
+
+$("add-form").addEventListener("submit", function (event) {
   event.preventDefault();
-  const input = $("title");
-  const value = input.value.trim();
-  if (!value) return;
-  try {
-    await api("/api/v1/todos", { method: "POST", body: JSON.stringify({ title: value }) });
+  var input = $("add-title");
+  var title = input.value.trim();
+  if (!title) { input.focus(); return; }
+
+  var btn = $("add-btn");
+  btn.disabled = true;
+  btn.textContent = "添加中…";
+
+  api("/api/v1/todos", {
+    method: "POST",
+    body: JSON.stringify({
+      title: title,
+      desc: $("add-desc").value.trim(),
+      due_ts: inputToTs($("add-due").value),
+      priority: Number($("add-pri").value) || 0
+    })
+  }).then(function (created) {
+    goOnline();
     input.value = "";
-    toast("已添加");
-  } catch (e) {
-    toast("失败：" + e.message);
+    $("add-desc").value = "";
+    $("add-due").value = "";
+    $("add-pri").value = "0";
+    $("add-more").open = false;
+    upsertItem(created);              /* 201 的 data 就是新建的这一项 */
+    toast("已添加 #" + ((created && created.id) || ""), "ok");
+    input.focus();
+  }).catch(function (err) {
+    reportError(err, "添加");
+  }).then(function () {
+    btn.disabled = false;
+    btn.textContent = "添加";
+  });
+});
+
+$("sync-all").addEventListener("click", function (event) {
+  var btn = event.currentTarget;
+  btn.disabled = true;
+  api("/api/v1/sync", { method: "POST" }).then(function (data) {
+    var total = (data && typeof data.total === "number") ? data.total : items.length;
+    toast("已把 " + total + " 项标记为已同步", "ok");
+    return loadAll();
+  }).catch(function (err) {
+    reportError(err, "标记同步");
+  }).then(function () {
+    btn.disabled = false;
+  });
+});
+
+$("reload").addEventListener("click", function () { loadAll(); loadDevice(); });
+$("dev-refresh").addEventListener("click", function () { loadDevice(); });
+$("banner-retry").addEventListener("click", function () {
+  hideBanner();
+  net.delay = 3000;
+  loadAll();
+  loadDevice();
+  if (!sseLive()) { sseStart(); }
+});
+
+/* ========================================================================
+   9. 编辑弹层
+   ======================================================================== */
+
+function openEditor(item) {
+  editingId = item.id;
+  setText($("ed-id"), "#" + item.id);
+  $("ed-text").value = item.title || "";
+  $("ed-desc").value = item.desc || "";
+  $("ed-due").value = tsToInput(item.due_ts);
+  $("ed-pri").value = String(item.priority || 0);
+  $("ed-done").checked = !!item.done;
+  $("editor").hidden = false;
+  $("ed-text").focus();
+}
+function closeEditor() {
+  $("editor").hidden = true;
+  editingId = 0;
+}
+
+$("edit-form").addEventListener("submit", function (event) {
+  event.preventDefault();
+  if (!editingId) { return; }
+  var title = $("ed-text").value.trim();
+  if (!title) { $("ed-text").focus(); return; }
+
+  var btn = $("ed-save");
+  btn.disabled = true;
+  btn.textContent = "保存中…";
+
+  /* PUT 是整体替换（todo_manager 的 todo_update 会覆盖 title/desc/due_ts/done/priority），
+     所以必须把五个字段全部提交，漏掉的字段会被清空。 */
+  api("/api/v1/todos/" + editingId, {
+    method: "PUT",
+    body: JSON.stringify({
+      title: title,
+      desc: $("ed-desc").value.trim(),
+      due_ts: inputToTs($("ed-due").value),
+      done: $("ed-done").checked,
+      priority: Number($("ed-pri").value) || 0
+    })
+  }).then(function (updated) {
+    if (updated) { upsertItem(updated); }
+    toast("已保存 #" + editingId, "ok");
+    closeEditor();
+  }).catch(function (err) {
+    reportError(err, "保存");
+  }).then(function () {
+    btn.disabled = false;
+    btn.textContent = "保存";
+  });
+});
+
+$("ed-cancel").addEventListener("click", closeEditor);
+$("editor").addEventListener("click", function (event) {
+  if (event.target === $("editor")) { closeEditor(); }
+});
+document.addEventListener("keydown", function (event) {
+  if (event.key === "Escape" && !$("editor").hidden) { closeEditor(); }
+});
+
+/* ========================================================================
+   10. 工具条交互
+   ======================================================================== */
+
+$("filters").addEventListener("click", function (event) {
+  var btn = event.target.closest("button[data-filter]");
+  if (!btn) { return; }
+  filter = btn.dataset.filter;
+  var all = $("filters").querySelectorAll("button");
+  for (var i = 0; i < all.length; i++) { all[i].classList.toggle("active", all[i] === btn); }
+  renderList();
+});
+
+$("search").addEventListener("input", function (event) {
+  keyword = event.target.value;
+  renderList();
+});
+
+$("empty-action").addEventListener("click", function (event) {
+  var act = event.currentTarget.dataset.act;
+  if (act === "add") {
+    $("add-title").focus();
+    $("add-title").scrollIntoView({ block: "center", behavior: "smooth" });
+  } else {
+    filter = "all";
+    keyword = "";
+    $("search").value = "";
+    var all = $("filters").querySelectorAll("button");
+    for (var i = 0; i < all.length; i++) { all[i].classList.toggle("active", all[i].dataset.filter === "all"); }
+    renderList();
   }
 });
 
-$("reload").addEventListener("click", load);
-$("sync").addEventListener("click", async () => {
-  try {
-    await api("/api/v1/sync", { method: "POST" });
-    toast("已标记为同步");
-  } catch (e) {
-    toast("失败：" + e.message);
-  }
+/* ========================================================================
+   11. 连接设置（X-Auth-Token）
+   ======================================================================== */
+
+$("token-input").value = token;
+$("token-save").addEventListener("click", function () {
+  token = $("token-input").value.trim();
+  storeToken(token);
+  hideBanner();
+  toast(token ? "已保存令牌，正在重连" : "已清除令牌", "ok");
+  loadDevice();
+  loadAll();
+  sseStart();
+});
+$("token-clear").addEventListener("click", function () {
+  token = "";
+  storeToken("");
+  $("token-input").value = "";
+  hideBanner();
+  toast("已清除本地令牌", "ok");
+  loadDevice();
+  loadAll();
+  sseStart();
 });
 
-// Server-sent events keep the page live; polls are the fallback when SSE is
-// unavailable (requirement 8.7: the web page must degrade to polling).
-function connectEvents() {
-  try {
-    const source = new EventSource("/api/v1/events");
-    source.addEventListener("todo_changed", () => load());
-    source.addEventListener("open", () => setLink(true));
-    source.addEventListener("error", () => {
-      setLink(false);
-      source.close();
-      setTimeout(connectEvents, 5000);
-    });
-  } catch (e) {
-    setInterval(load, 5000);
+/* ========================================================================
+   12. SSE：实时推送（EventSource 或带 token 的 fetch 流）+ 轮询兜底
+   ======================================================================== */
+
+var sse = { live: false, fails: 0, backoff: 3000, timer: 0, source: null, controller: null, poll: 0 };
+var refreshTimer = 0;
+var deviceTimer = 0;
+
+function sseLive() { return sse.live; }
+function ssePill(state, text) { setPill("pill-sse", state, "推送：" + text); }
+
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(function () { loadAll(); }, 350);
+}
+function scheduleDeviceRefresh() {
+  clearTimeout(deviceTimer);
+  deviceTimer = setTimeout(function () { loadDevice(); }, 600);
+}
+
+function sseStop() {
+  clearTimeout(sse.timer);
+  sse.timer = 0;
+  if (sse.source) { try { sse.source.close(); } catch (e) {} sse.source = null; }
+  if (sse.controller) { try { sse.controller.abort(); } catch (e) {} sse.controller = null; }
+  sse.live = false;
+}
+
+function ssePollStart() {
+  if (!sse.poll) {
+    sse.poll = setInterval(function () { if (!document.hidden) { loadAll(); } }, POLL_MS);
+  }
+}
+function ssePollStop() {
+  if (sse.poll) { clearInterval(sse.poll); sse.poll = 0; }
+}
+
+/* 推送断开：降级到轮询，并按退避重连（设备端 SSE 上限 4 个客户端）。 */
+function sseDown(reason) {
+  sse.live = false;
+  sse.fails += 1;
+  var wait = sse.backoff;
+  sse.backoff = Math.min(sse.backoff * 2, MAX_BACKOFF);
+  ssePill("err", "已断开，" + (POLL_MS / 1000) + "s 轮询中");
+  ssePollStart();
+  if (sse.fails === 2) { toast("实时推送断开，已降级为轮询：" + reason, "warn"); }
+  clearTimeout(sse.timer);
+  sse.timer = setTimeout(sseStart, wait);
+}
+
+function sseUp() {
+  var wasDown = sse.fails > 0;
+  sse.live = true;
+  sse.fails = 0;
+  sse.backoff = 3000;
+  clearTimeout(sse.timer);
+  sse.timer = 0;
+  ssePollStop();
+  ssePill("ok", "实时推送中");
+  /* 断线期间可能漏掉事件，这里补一次全量，并确认设备仍在。 */
+  loadAll();
+  if (wasDown) { toast("实时推送已恢复", "ok"); }
+}
+
+function sseStart() {
+  sseStop();
+  ssePill("warn", "连接中…");
+  /* EventSource 不能自定义请求头，所以一旦填了 token（设备可能开了鉴权）就走 fetch 流。
+     这里判断全局绑定而不是 window.xxx，两者都可能缺失时的行为才一致。 */
+  if (!token && typeof EventSource === "function") { sseViaEventSource(); return; }
+  if (typeof TextDecoder === "function" && typeof fetch === "function" &&
+      typeof ReadableStream === "function") { sseViaFetch(); return; }
+  if (typeof EventSource === "function") { sseViaEventSource(); return; }
+  sseDown("当前浏览器不支持实时推送");
+}
+
+function sseViaEventSource() {
+  var source;
+  try { source = new EventSource("/api/v1/events"); }
+  catch (e) { sseDown("无法建立推送连接"); return; }
+  sse.source = source;
+  source.onopen = function () { if (sse.source === source) { sseUp(); } };
+  source.onerror = function () {
+    if (sse.source !== source) { return; }
+    sseStop();
+    sseDown("推送连接中断");
+  };
+  for (var i = 0; i < PUSH_ALL.length; i++) {
+    (function (name) {
+      source.addEventListener(name, function () { sseHandle(name); });
+    })(PUSH_ALL[i]);
   }
 }
 
-load();
+function sseViaFetch() {
+  var controller = (typeof AbortController === "function") ? new AbortController() : null;
+  sse.controller = controller;
+  var headers = { "Accept": "text/event-stream" };
+  if (token) { headers["X-Auth-Token"] = token; }
+
+  fetch("/api/v1/events", {
+    headers: headers,
+    cache: "no-store",
+    credentials: "omit",
+    signal: controller ? controller.signal : undefined
+  }).then(function (response) {
+    if (sse.controller !== controller) { return null; }
+    if (response.status === 503) {
+      sse.controller = null;
+      sseDown("设备推送客户端已满（最多 4 个）");
+      return null;
+    }
+    if (response.status === 401) {
+      sse.controller = null;
+      sse.live = false;
+      ssePill("err", "需要令牌");
+      ssePollStart();
+      showBanner("auth", "实时推送被拒绝", "设备开启了鉴权，而当前令牌无效。在“连接设置”里填写正确令牌。", false);
+      openSettings();
+      clearTimeout(sse.timer);
+      sse.timer = setTimeout(sseStart, MAX_BACKOFF);
+      return null;
+    }
+    if (!response.ok || !response.body || typeof response.body.getReader !== "function") {
+      sse.controller = null;
+      sseDown("推送通道不可用（HTTP " + response.status + "）");
+      return null;
+    }
+
+    sseUp();
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder("utf-8");
+    var buffer = "";
+
+    var pump = function () {
+      return reader.read().then(function (chunk) {
+        if (sse.controller !== controller) { return null; }
+        if (chunk.done) { return null; }
+        buffer += decoder.decode(chunk.value, { stream: true });
+        var index;
+        while ((index = buffer.indexOf("\n\n")) >= 0) {
+          sseFrame(buffer.slice(0, index));
+          buffer = buffer.slice(index + 2);
+        }
+        if (buffer.length > 32768) { buffer = ""; }   /* 防御畸形流 */
+        return pump();
+      });
+    };
+
+    return pump().then(function () {
+      if (sse.controller !== controller) { return; }
+      sse.controller = null;
+      try { reader.cancel(); } catch (e) {}
+      sseDown("推送连接已结束");
+    });
+  }).catch(function (e) {
+    if (sse.controller !== controller) { return; }   /* 已被主动停止 */
+    sse.controller = null;
+    sseDown("推送连接失败");
+  });
+}
+
+function sseFrame(frame) {
+  var name = "";
+  var data = [];
+  var lines = frame.split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].replace(/\r$/, "");
+    if (!line || line.charAt(0) === ":") { continue; }   /* ": keepalive" 注释 */
+    var colon = line.indexOf(":");
+    var field = (colon < 0) ? line : line.slice(0, colon);
+    var value = (colon < 0) ? "" : line.slice(colon + 1).replace(/^ /, "");
+    if (field === "event") { name = value; }
+    else if (field === "data") { data.push(value); }
+  }
+  if (name) { sseHandle(name, data.join("\n")); }
+}
+
+function sseHandle(name) {
+  if (PUSH_TODO[name]) { scheduleRefresh(); return; }
+  if (PUSH_NET[name]) { scheduleDeviceRefresh(); return; }
+}
+
+/* ========================================================================
+   13. 启动
+   ======================================================================== */
+
+setInterval(function () {
+  if (!net.offline) { return; }
+  setText($("banner-detail"), offlineDetail());
+}, 1000);
+
+setInterval(function () {
+  if (document.hidden) { return; }
+  loadDevice();
+}, 30000);
+
+/* 相对时间会“变旧”，每分钟重画一次（编辑弹层打开时不动列表）。 */
+setInterval(function () {
+  if (document.hidden || !loaded || editingId) { return; }
+  renderList();
+}, 60000);
+
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) { return; }
+  loadAll();
+  loadDevice();
+  if (!sse.live) { sseStart(); }
+});
+
+/* 关标签页时主动释放设备上宝贵的 SSE 名额（设备最多 4 个客户端）。 */
+window.addEventListener("pagehide", function () { sseStop(); ssePollStop(); });
+window.addEventListener("pageshow", function (event) {
+  if (event.persisted) { loadAll(); loadDevice(); sseStart(); }
+});
+window.addEventListener("online", function () { loadAll(); loadDevice(); });
+
+/* 首屏：先渲染“正在读取…”，再取数据，最后连推送。 */
+renderList();
+loadAll();
 loadDevice();
-connectEvents();
-setInterval(loadDevice, 30000);
+sseStart();
 </script>
 </body>
 </html>
