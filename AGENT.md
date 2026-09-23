@@ -462,7 +462,32 @@ FreeType 子集 --fallback--> Montserrat(同尺寸) --fallback--> 内置 CJK 16p
 
 这样符号、少见的汉字都能显示，且**全局生效**，不用在键盘上写特例。
 
-### 9.0.5 启动期 `abort()`：newlib 惰性锁初始化竞态（**未修，下次优先**）
+### 9.0.5 启动期 `abort()`：crypto 锁惰性初始化竞态（**未修，阻塞性问题**）
+
+> **新增实测（第二轮）**：把 panic dump 的 `Stack memory:` 区当作栈来解析（逐个地址单独调
+> `addr2line -f -C`，**不要用 `-pfiaC` 然后两行一取 —— 遇到内联时每个地址会输出多行，
+> 配对会错位**），得到真实帧：
+>
+> ```
+> 2f0029b0  lock_acquire_generic  @ esp_libc/src/locks.c:158
+> 2f00c91a  __assert_func         @ esp_libc/src/assert.c:34
+> 2f02d15c  ??                    @ esp_security/src/esp_crypto_lock.c:39   ← 关键
+> ```
+>
+> `esp_crypto_lock` 是**硬件加密引擎的锁**（SHA/AES/MPI；mbedTLS 与 WiFi WPA2 握手都用）。
+> `esp_crypto_lock_init()` 是"检查后初始化"且无保护，两个使用方同时首次调用即双重初始化。
+>
+> **这解释了全部观察**：时序依赖（故间歇）、**与 SD 卡相关**（插卡让启动时序偏移约 100 ms，
+> 正好撞进竞态窗口）、崩点固定在 `calendar_service` 之后（那正是 WiFi 接上、握手做加密的时刻）。
+> 所以**大概率是 IDF 层面的竞态，不是本工程的业务代码**。
+>
+> **已排除**：与 `main/app_main.c` 里"切 HOME 在 run_modules(true) 之前还是之后"无关 ——
+> 恢复原时序后连续 3 次冷启动仍然 3/3 崩溃（`abort=1, app_ready=0`）。
+>
+> **当前状态与临时办法**：插卡时设备**崩溃重启循环**，拔卡可正常启动（词库退回内置 32 词、
+> 字体退回片内）。修复方向：(1) 查 IDF 是否有相关 Kconfig 可绕开硬件 crypto 锁；
+> (2) 让启动期的加密使用方串行化（例如 WiFi 连接完成前不要有任何 mbedTLS 动作）；
+> (3) 升级/打补丁管理组件。**动手前先确认 IDF 版本是否已知此问题。**
 
 现象：烧录后**第一次**启动，走到 `module 'calendar_service' ready`（约 3.0 s）后 `abort()` 并
 `Rebooting...`；复位后第二次启动**完全干净**（所有模块 ready 到 `voice_service`）。
