@@ -32,6 +32,7 @@
 #include "sys_utils.h"
 #include "th_bsp.h"
 #include "todo_manager.h"
+#include "ui_assets.h"
 #include "ui_core.h"
 #include "ui_pages.h"
 #include "ui_theme.h"
@@ -147,6 +148,11 @@ void app_main(void)
     /* Storage is optional by design: no SD card means the internal LittleFS,
      * and if that fails too the app still runs without persistence. */
     ESP_ERROR_CHECK(storage_manager_init());
+
+    /* Packed icons (weather symbols). Missing assets only degrade the UI. */
+    if (ui_assets_init() != ESP_OK) {
+        SYS_LOGW(TAG, "UI assets unavailable, pages will use text fallbacks");
+    }
 
     ESP_ERROR_CHECK(ui_core_init());
     ESP_ERROR_CHECK(ui_pages_init());

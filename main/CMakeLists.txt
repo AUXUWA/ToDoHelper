@@ -1,5 +1,5 @@
-# UI assets packed into the `assets` partition (see partitions.csv).
-set(TODOHELPER_ASSETS_DIR "${CMAKE_CURRENT_LIST_DIR}/../assets/ui")
+# UI assets now live in components/ui_assets (it owns the partition packing and
+# the generated mmap header), so main/ only orchestrates.
 
 idf_component_register(
     SRCS "app_main.c"
@@ -8,6 +8,7 @@ idf_component_register(
         sys_utils
         storage_manager
         bsp
+        ui_assets
         http_router
         ui_core
         ui_pages
@@ -19,14 +20,3 @@ idf_component_register(
         sync_server
         idle_face
 )
-
-if(NOT EXISTS "${TODOHELPER_ASSETS_DIR}")
-    message(FATAL_ERROR "UI assets directory not found: ${TODOHELPER_ASSETS_DIR}")
-endif()
-
-spiffs_create_partition_assets(assets "${TODOHELPER_ASSETS_DIR}" FLASH_IN_PROJECT
-    MMAP_FILE_SUPPORT_FORMAT ".png"
-    IMPORT_INC_PATH "${CMAKE_CURRENT_SOURCE_DIR}"
-)
-
-add_dependencies(${COMPONENT_LIB} assets_assets_bin)

@@ -23,18 +23,24 @@ extern "C" {
 /* Implemented pages. */
 extern const ui_page_t page_splash;
 extern const ui_page_t page_home;
-
-/* Pages still under construction. They render a common placeholder so that
- * navigation is complete from day one; replace the descriptor with a real one
- * in ui_pages.c as each feature lands. */
 extern const ui_page_t page_wifi;
 extern const ui_page_t page_todo;
 extern const ui_page_t page_todo_detail;
 extern const ui_page_t page_weather;
 extern const ui_page_t page_calendar;
 extern const ui_page_t page_word;
-extern const ui_page_t page_ai_chat;
 extern const ui_page_t page_settings;
+
+/**
+ * @brief Select which todo the detail page should show.
+ *
+ * The page table has no user-data channel, so the id is handed over through
+ * this setter right before ui_nav_push(UI_PAGE_TODO_DETAIL).
+ */
+void page_todo_detail_set_id(uint32_t id);
+
+/* Pages still under construction. */
+extern const ui_page_t page_ai_chat;
 
 /* UI_PAGE_IDLE_FACE is registered by the idle_face component itself
  * (idle_face_init() -> ui_page_register), so it is deliberately absent here. */

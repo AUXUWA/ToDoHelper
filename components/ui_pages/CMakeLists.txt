@@ -4,8 +4,25 @@ idf_component_register(
         "src/page_common.c"
         "src/page_splash.c"
         "src/page_home.c"
+        "src/page_wifi.c"
+        "src/page_todo.c"
+        "src/page_weather.c"
+        "src/page_calendar.c"
+        "src/page_word.c"
+        "src/page_settings.c"
         "src/page_placeholders.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
-    REQUIRES ui_core sys_utils lvgl
+    REQUIRES
+        ui_core
+        ui_assets
+        sys_utils
+        storage_manager
+        wifi_manager
+        todo_manager
+        calendar_service
+        weather_service
+        word_service
+        sync_server
+        lvgl
 )

@@ -1,0 +1,6 @@
+version: "0.1.0"
+description: ToDoHelper UI assets packed into the assets partition
+
+dependencies:
+  idf: ">=6.1.0"
+  esp_mmap_assets: "^2.0.0"
