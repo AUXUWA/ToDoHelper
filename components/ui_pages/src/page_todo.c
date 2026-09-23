@@ -33,7 +33,7 @@
 static const char *TAG = "page_todo";
 
 /** Shown in place of the removed editing controls. */
-#define TODO_READONLY_HINT "设备端只读 | 请在电脑网页端编辑"
+#define TODO_READONLY_HINT "此页可勾选完成 / 删除 | 新增请到电脑网页端"
 
 static lv_obj_t *s_list;
 static lv_obj_t *s_stats;
@@ -55,6 +55,47 @@ static void row_open_cb(lv_event_t *e)
 /* ------------------------------------------------------------------------ */
 
 /** One muted line telling the user where a todo can actually be changed. */
+/*
+ * Marking done and deleting stay on the device: both are single taps, and a tap is
+ * the one input this panel is good at. *Creating and editing* stay on the web page
+ * - they need Chinese text entry and this board has no IME, which is the whole
+ * reason the add overlay was removed (see README).
+ *
+ * Both callbacks are safe to run even though the resulting
+ * TODO_EVENT_LIST_CHANGED refreshes this very list: the event is posted, not
+ * delivered inline, so the rows are only rebuilt after the callback returns and
+ * LVGL is never asked to delete the object that is currently handling an event.
+ */
+static void row_toggle_cb(lv_event_t *e)
+{
+    lv_obj_t *checkbox = lv_event_get_target(e);
+    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const bool done = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
+
+    esp_err_t err = todo_set_done(id, done);
+    if (err != ESP_OK) {
+        /* Put the box back rather than leaving the UI showing a state the store
+         * does not have. */
+        if (done) {
+            lv_obj_remove_state(checkbox, LV_STATE_CHECKED);
+        } else {
+            lv_obj_add_state(checkbox, LV_STATE_CHECKED);
+        }
+        ui_toast("操作失败：%s", esp_err_to_name(err));
+    }
+}
+
+static void row_delete_cb(lv_event_t *e)
+{
+    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    esp_err_t err = todo_delete(id);
+    if (err == ESP_OK) {
+        ui_toast("已删除");
+    } else {
+        ui_toast("删除失败：%s", esp_err_to_name(err));
+    }
+}
+
 static void readonly_hint_create(lv_obj_t *parent)
 {
     lv_obj_t *hint = lv_label_create(parent);
@@ -109,13 +150,13 @@ static void render_list(void)
                               LV_FLEX_ALIGN_CENTER);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-        /* The checkbox is a *done indicator*, not a control: without
-         * LV_OBJ_FLAG_CLICKABLE it cannot be toggled by touch, so tapping it
-         * falls through to the row and only opens the detail page. */
+        /* The checkbox *is* a control: marking a todo done is one tap. */
         lv_obj_t *checkbox = lv_checkbox_create(row);
         lv_checkbox_set_text(checkbox, "");
         lv_obj_set_size(checkbox, 34, 34);
-        lv_obj_remove_flag(checkbox, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(checkbox, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(checkbox, row_toggle_cb, LV_EVENT_VALUE_CHANGED,
+                            (void *)(uintptr_t)item->id);
         if (item->done) {
             lv_obj_add_state(checkbox, LV_STATE_CHECKED);
         }
@@ -141,6 +182,18 @@ static void render_list(void)
                                                    : UI_COLOR_WARNING,
                                         0);
         }
+
+        /* One-tap delete. Kept small and last so it is never hit while reaching
+         * for the row. */
+        lv_obj_t *del = lv_button_create(row);
+        lv_obj_set_size(del, 52, 34);
+        lv_obj_set_style_bg_color(del, UI_COLOR_DANGER, 0);
+        lv_obj_t *del_label = lv_label_create(del);
+        lv_label_set_text(del_label, "删除");
+        lv_obj_set_style_text_font(del_label, ui_font(UI_FONT_SMALL), 0);
+        lv_obj_center(del_label);
+        lv_obj_add_event_cb(del, row_delete_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)item->id);
 
         /* Tapping the row (or its title) opens the read-only detail page. */
         lv_obj_add_flag(title, LV_OBJ_FLAG_CLICKABLE);
