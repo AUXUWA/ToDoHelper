@@ -712,11 +712,34 @@ static void weather_task(void *arg)
 
     while (xQueueReceive(s_requests, &opcode, portMAX_DELAY) == pdTRUE) {
         if (opcode == WEATHER_REQ_DETECT) {
-            /* Priority 2 of the FR3 location list: only used when nothing was
-             * chosen manually, or when the caller explicitly asked for it. */
-            const esp_err_t geo_err = weather_detect_location();
-            if (geo_err != ESP_OK) {
-                SYS_LOGD(TAG, "IP geolocation unavailable (%s)", esp_err_to_name(geo_err));
+            /*
+             * Do not start a TLS request before the clock is valid.
+             *
+             * Certificate validation checks notBefore/notAfter, so while the system
+             * clock is still at 0 (SNTP has not synced yet) mbedtls always fails:
+             *
+             *   E esp-x509-crt-bundle: Failed to verify certificate
+             *   E esp-tls-mbedtls: mbedtls_ssl_handshake returned -0x3000
+             *   W TH:weather: IP geolocation request failed: ESP_ERR_HTTP_CONNECT
+             *
+             * (-0x3000 is MBEDTLS_ERR_X509_CERT_VERIFY_FAILED.) That is why the
+             * boot-time IP geolocation always failed and why
+             * POST /api/v1/weather/locate answered 503.
+             *
+             * Skipping here removes the guaranteed-failure request and the
+             * misleading error spam. The page's "重新定位" button and the periodic
+             * refresh still retry; an automatic short retry timer is the next step.
+             */
+            if (!sys_time_synced()) {
+                SYS_LOGW(TAG, "clock not synced yet - skipping IP geolocation "
+                              "(TLS certificate validation would fail)");
+            } else {
+                /* Priority 2 of the FR3 location list: only used when nothing was
+                 * chosen manually, or when the caller explicitly asked for it. */
+                const esp_err_t geo_err = weather_detect_location();
+                if (geo_err != ESP_OK) {
+                    SYS_LOGD(TAG, "IP geolocation unavailable (%s)", esp_err_to_name(geo_err));
+                }
             }
         }
 
@@ -884,7 +907,17 @@ esp_err_t weather_service_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    (void)sys_config_get_str_or(SYS_KEY_CITY, s_city, sizeof(s_city), "");
+    /*
+     * Default city: Nanchang, Jiangxi.
+     *
+     * IP geolocation is only priority 2 of the FR3 location list and it is not
+     * reliable here: behind a phone/laptop hotspot the public IP resolved to
+     * Kachin, Myanmar (25.53, 97.73) rather than the actual location. A fixed
+     * default with real coordinates means weather is correct on the very first
+     * boot with no network lookup at all, and "重新定位" is still there when the
+     * user actually moves.
+     */
+    (void)sys_config_get_str_or(SYS_KEY_CITY, s_city, sizeof(s_city), "南昌");
     /*
      * Read the coordinates back too.
      *
@@ -896,9 +929,13 @@ esp_err_t weather_service_init(void)
     char coord[24];
     if (sys_config_get_str(SYS_KEY_CITY_LAT, coord, sizeof(coord)) == ESP_OK) {
         s_data.lat = strtod(coord, NULL);
+    } else {
+        s_data.lat = 28.6820;   /* Nanchang */
     }
     if (sys_config_get_str(SYS_KEY_CITY_LON, coord, sizeof(coord)) == ESP_OK) {
         s_data.lon = strtod(coord, NULL);
+    } else {
+        s_data.lon = 115.8579;  /* Nanchang */
     }
     (void)sys_config_get_str_or(SYS_KEY_WEATHER_PROV, s_provider, sizeof(s_provider),
                                WEATHER_PROVIDER_DEFAULT);
