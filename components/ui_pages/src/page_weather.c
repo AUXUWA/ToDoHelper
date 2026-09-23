@@ -32,53 +32,8 @@ static lv_obj_t *s_cond_label;
 static lv_obj_t *s_detail_label;
 static lv_obj_t *s_icon;
 static lv_obj_t *s_icon_fallback;
-static lv_obj_t *s_input_overlay;
-static lv_obj_t *s_input_area;
-
 /** Defined below; the "重新定位" button refreshes the card once IP location lands. */
 static void refresh(void);
-
-/* ------------------------------------------------------------------------ */
-/* City input                                                                */
-/* ------------------------------------------------------------------------ */
-
-static void input_close(void)
-{
-    if (s_input_overlay != NULL) {
-        lv_obj_delete(s_input_overlay);
-        s_input_overlay = NULL;
-        s_input_area = NULL;
-    }
-}
-
-static void input_cancel_cb(lv_event_t *e)
-{
-    (void)e;
-    input_close();
-}
-
-static void input_submit_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_input_area == NULL) {
-        return;
-    }
-
-    const char *city = lv_textarea_get_text(s_input_area);
-    if (city == NULL || city[0] == '\0') {
-        ui_toast("请输入城市名");
-        return;
-    }
-
-    esp_err_t err = weather_set_city(city);
-    input_close();
-
-    if (err == ESP_OK) {
-        ui_toast("已设置为 %s，正在获取…", city);
-    } else {
-        ui_toast("设置失败：%s", esp_err_to_name(err));
-    }
-}
 
 /**
  * "重新定位": re-derive the city from the public IP.
@@ -86,11 +41,6 @@ static void input_submit_cb(lv_event_t *e)
  * The manual city entry is gone. The panel has no IME, so typing a Chinese city
  * name on it was never practical, and the public IP already tells us where we are
  * (FR3 location priority 2, now the only path - see weather_detect_location()).
- *
- * NOTE: everything after the `return` below is the former input-overlay builder
- * (textarea + on-screen keyboard). It is unreachable but kept for one commit so
- * that input_submit_cb()/input_cancel_cb()/input_close() stay referenced and the
- * -Werror=unused-function build stays green; delete both together next.
  */
 static void city_clicked_cb(lv_event_t *e)
 {
@@ -104,65 +54,6 @@ static void city_clicked_cb(lv_event_t *e)
     }
     refresh();
     ui_toast("已定位到 %s", weather_get_city());
-    return;
-
-    if (s_input_overlay != NULL) {
-        return;
-    }
-
-    s_input_overlay = lv_obj_create(lv_layer_top());
-    if (s_input_overlay == NULL) {
-        return;
-    }
-    lv_obj_remove_style_all(s_input_overlay);
-    lv_obj_set_size(s_input_overlay, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(s_input_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_input_overlay, LV_OPA_70, 0);
-    lv_obj_set_flex_flow(s_input_overlay, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(s_input_overlay, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_all(s_input_overlay, 8, 0);
-    lv_obj_set_style_pad_row(s_input_overlay, 8, 0);
-    lv_obj_remove_flag(s_input_overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *row = lv_obj_create(s_input_overlay);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(row, 8, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_input_area = lv_textarea_create(row);
-    lv_textarea_set_one_line(s_input_area, true);
-    lv_textarea_set_max_length(s_input_area, 63);
-    /* Latin input works on the on-screen keyboard; Chinese city names are
-     * easiest to set from the web page or the HTTP API. */
-    lv_textarea_set_placeholder_text(s_input_area, "城市拼音，如 Beijing");
-    lv_textarea_set_text(s_input_area, weather_get_city());
-    lv_obj_set_flex_grow(s_input_area, 1);
-    lv_obj_set_style_text_font(s_input_area, ui_font(UI_FONT_BODY), 0);
-
-    lv_obj_t *ok = lv_button_create(row);
-    lv_obj_set_height(ok, UI_TOUCH_MIN);
-    lv_obj_t *ok_label = lv_label_create(ok);
-    lv_label_set_text(ok_label, "确定");
-    lv_obj_center(ok_label);
-    lv_obj_add_event_cb(ok, input_submit_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *cancel = lv_button_create(row);
-    lv_obj_set_height(cancel, UI_TOUCH_MIN);
-    lv_obj_set_style_bg_color(cancel, UI_COLOR_SURFACE_ALT, 0);
-    lv_obj_t *cancel_label = lv_label_create(cancel);
-    lv_label_set_text(cancel_label, "取消");
-    lv_obj_center(cancel_label);
-    lv_obj_add_event_cb(cancel, input_cancel_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *keyboard = lv_keyboard_create(s_input_overlay);
-    lv_obj_set_width(keyboard, LV_PCT(100));
-    lv_obj_set_height(keyboard, 220);
-    lv_keyboard_set_textarea(keyboard, s_input_area);
-    lv_obj_set_style_text_font(keyboard, ui_font(UI_FONT_SMALL), 0);
 }
 
 /* ------------------------------------------------------------------------ */
