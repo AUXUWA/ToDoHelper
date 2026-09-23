@@ -327,6 +327,52 @@ static lv_obj_t *page_container_create(lv_obj_t *parent)
     return c;
 }
 
+/**
+ * Page switch animation.
+ *
+ * esp-brookesia's launcher feels responsive because apps slide in rather than
+ * appearing instantly; the same trick costs almost nothing here. Both properties
+ * are applied through *styles* rather than lv_obj_set_x(): page containers are
+ * flex children, so the next layout pass would immediately overwrite a plain
+ * position.
+ */
+#define UI_PAGE_ANIM_MS     200
+#define UI_PAGE_ANIM_OFFSET 56
+
+static void page_anim_translate_cb(void *obj, int32_t value)
+{
+    lv_obj_set_style_translate_x((lv_obj_t *)obj, value, 0);
+}
+
+static void page_anim_opa_cb(void *obj, int32_t value)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
+}
+
+static void page_animate_in(lv_obj_t *page)
+{
+    /* Re-entering a page quickly must not stack animations on it. */
+    lv_anim_delete(page, page_anim_translate_cb);
+    lv_anim_delete(page, page_anim_opa_cb);
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, page);
+    lv_anim_set_duration(&anim, UI_PAGE_ANIM_MS);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&anim, page_anim_translate_cb);
+    lv_anim_set_values(&anim, UI_PAGE_ANIM_OFFSET, 0);
+    lv_anim_start(&anim);
+
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, page);
+    lv_anim_set_duration(&anim, UI_PAGE_ANIM_MS);
+    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&anim, page_anim_opa_cb);
+    lv_anim_set_values(&anim, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_start(&anim);
+}
+
 static esp_err_t page_switch_locked(ui_page_id_t id)
 {
     if (id >= UI_PAGE_MAX) {
@@ -381,6 +427,11 @@ static esp_err_t page_switch_locked(ui_page_id_t id)
 
     lv_obj_remove_flag(slot->container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(slot->container);
+    /* Reset the visual state before animating in: a hidden object keeps whatever
+     * transform/opacity a previous animation left behind. */
+    lv_obj_set_style_translate_x(slot->container, 0, 0);
+    lv_obj_set_style_opa(slot->container, LV_OPA_COVER, 0);
+    page_animate_in(slot->container);
 
     s_current = id;
 

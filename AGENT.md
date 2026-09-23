@@ -262,8 +262,11 @@ grep "esp_async_color_convert.h" managed_components/espressif__esp_lvgl_adapter/
 
 ## 8. 验证基线（判定「编译成功」）
 
-> ⚠️ **注意：截至当前，本工程从未烧录到真机、从未上过屏。** 以下仅是**编译基线**，
-> 运行期行为全部未验证。第一次上机时请按 `docs/HANDOVER.md` §5 的清单逐项确认。
+> ✅ **已于真机（COM34，ESP32-S31-Korvo）完成首轮上机验证**：0 panic、0 task watchdog、
+> 12 个功能模块全部 `ready`、中文正常显示（用户确认无方框）、SD 卡目录与文件写入成功、
+> mDNS 发布 `todohelper.local`、HTTP 监听 80 端口共 37 条路由、音频 `mic=1 speaker=1`。
+> **尚未验证**：WiFi 实际关联（需凭据）、联网后的 HTTP 全链路、触摸/按键交互、
+> 待机超时与眼睛动画。详见 `docs/HANDOVER.md` §5。
 
 日志出现：
 
@@ -275,23 +278,97 @@ Project build complete.
 
 | 项 | 值 |
 |---|---|
-| app bin | `build/todohelper.bin`，`0x3fc2c0` 字节（约 4.17 MB，含 1.2 MB 内嵌中文字体） |
+| app bin | `build/todohelper.bin`，`0x3fcbf0` 字节（约 4.18 MB，含 1.2 MB 内嵌中文字体） |
 | app 分区余量 | `0x800000` 分区，剩 **50%** |
 | bootloader | `build/bootloader/bootloader.bin`，`0x5a80`，余 6% |
 | 编译警告 | 0（`-Werror` 全开） |
 | 资源分区 | `build/mmap_build/ui/assets/assets.bin`（8 个 PNG，约 8.9 KB） |
 | 组件数 | 16 个自有组件 + 1 个本地覆盖组件（`esp_cam_sensor`） |
 
+**内部 RAM 预算（真机实测——这是本工程最紧张的资源）**
+
+| 启动阶段 | 内部空闲 | 最大连续块 | PSRAM 空闲 |
+|---|---|---|---|
+| `startup` | 322 KB | 272 KB | 12406 KB |
+| `bsp (display+LVGL)` | 298 KB | 252 KB | 10112 KB |
+| `storage` | 208 KB | 164 KB | 10140 KB |
+| `ui_core` | 201 KB | 156 KB | 10100 KB |
+| `wifi_manager` | **143 KB** | 98 KB | 10002 KB |
+| `sync_server` | 125 KB | 76 KB | 9976 KB |
+| `ai_service` | 116 KB | 68 KB | 9976 KB |
+| `boot complete` | **118 KB** | **74 KB** | 9655 KB |
+
+> 每一行由 `sys_heap_log()` 在 `app_main` 里输出。**排障时看「最大连续块」而不是总空闲量**：
+> 首轮上机出现的全部 `ESP_ERR_NO_MEM` 都是内部 RAM 碎片化造成的——总空闲看着还有十几 KB，
+> 但最大连续块是 0，于是 WiFi / mDNS / I2S DMA / SDMMC DMA 全线失败。
+
 烧录成功判据：每个镜像后出现 `Hash of data verified.`，结尾 `Hard resetting via RTS pin...` + `Done`。
 
 烧录地址（`idf.py flash` 自动处理）：
 `0x2000` bootloader、`0x8000` 分区表、`0x10000` app、`0x810000` storage(littlefs)、`0xa10000` assets。
 
+### 8.1 抓串口日志（`idf.py monitor` 无法脚本化）
+
+`idf.py monitor` 会独占终端、不能重定向，自动化验证请用工程自带脚本：
+
+```powershell
+# 复位开发板并抓取 N 秒串口输出（RTS→EN 复位，DTR 保持低以正常启动）
+& 'C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe' tools\monitor_capture.py `
+    --port COM34 --seconds 30 --out build\boot.log
+```
+
 ---
 
 ## 9. 注意事项与坑
 
-### 9.1 两条**不可删**的 `sdkconfig.defaults` 配置
+### 9.0 真机首轮上机的五条实测结论（**最重要，先读这节**）
+
+本板内部 RAM 只有 **~310 KB**，而 PSRAM 有 **12.4 MB**。所有"内存不够"的问题都出在
+内部 RAM，而 IDF 报错只说 `ESP_ERR_NO_MEM` / `not enough mem`，非常容易误判。
+以下五条都是实测踩出来的：
+
+1. **LVGL 的局部绘制缓冲固定从内部 RAM 分配**（`esp_lvgl_adapter` 的
+   `display_manager.c:1095` 把 capability 硬编码成非 PSRAM）：
+   `hor_res × buffer_height × 2`。咖啡机 demo 的 `buffer_height=160` 就是 **256 KB**，
+   能占满 310 KB——它没出事只是因为它**从不启动 WiFi**。
+   → 本工程改用 `ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL`，复用面板自己的 PSRAM
+   帧缓冲当 LVGL 绘制缓冲，**内部占用降为 0**（面板本来就配了 `fb_count=3`，正好够）。
+2. **`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 是决定性的开关**。IDF 默认 16384，即所有
+   <16 KB 的分配优先走内部 RAM；而 `esp_wifi_init()` 会产生**大量**这种小分配，实测
+   它把内部空闲从 172 KB 压到 15 KB（最大连续块 **0**），同时让
+   `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 形同虚设。
+   → 本工程设为 **4096**：通用中小分配走 PSRAM，把内部 RAM 留给真正必须用它的东西
+   （`MALLOC_CAP_DMA` 描述符、任务栈、net80211 的大块）。
+3. **LVGL v9 的 FreeType 不支持内存字体**。适配器运行期会明确打印
+   `LVGL v9 FreeType does not support memory-based fonts, will use file path` 然后
+   `FreeType font initialization failed`，于是静默回退到 LVGL 内置 CJK 字库——那套字库
+   只有约 2500 字，所以出现"部分汉字正常、部分方框"的假象（`未/同/步/天气/日历` 正常，
+   `连/接/办/么/钟/存储/设置` 是方框）。**`EMBED_FILES` + 内存模式永远不可能成功。**
+   → 内嵌子集首次启动写入 `<storage>/todohelper/fonts/ui_cjk.ttf`，再用
+   `ESP_LV_ADAPTER_FT_FONT_FILE_CONFIG` 按**文件路径**加载。附带好处：换字体不用重烧。
+4. **渲染任务栈 ≥32 KB**。`LV_DRAW_SW_DRAW_UNIT_CNT=1` 意味着 LVGL 没有独立绘制线程，
+   FreeType 光栅化就跑在适配器的 LVGL 任务栈上，而 LVGL 自己的注释写着
+   "If FreeType or ThorVG is enabled, it is recommended to set it to 32KB or more"。
+   16 KB 时表现为**随机 panic**（Load access fault / Load address misaligned /
+   Stack protection fault 在不同核上交替出现）。注意
+   `ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL` **恰好把这个构建期检查去掉了**，
+   所以它不会提醒你。本工程用 32 KB 且 `stack_in_psram=true`。
+5. **FatFs 对"已存在的目录"返回 `FR_INVALID_NAME`，而 IDF VFS 映射成 `EINVAL`（不是
+   `EEXIST`）**（见 `vfs_fat.c` 的 `fresult_to_errno` 与 `ff.c` 的 `f_mkdir`）。
+   所以 `if (errno == EEXIST) return OK;` 会把已存在目录当成硬失败。
+   → 失败后用 `stat()` 确认是否已是目录，并重试一次。
+
+### 9.0.1 两个已经把设备搞挂过的自伤 bug（别再犯）
+
+- **任何 LVGL 调用都必须要么在 LVGL 任务里、要么持锁。** `ui_lock()/ui_unlock()` 包着
+  适配器的**递归**互斥锁，所以从 LVGL 任务内部再取一次是安全的。曾经 `app_main` 直接调
+  `ui_statusbar_refresh()` 没持锁，在渲染任务遍历对象链表时改标签 → main 任务死循环、
+  IDLE0 被饿死、每 5 秒刷一次 task watchdog。现在 `ui_statusbar_refresh()` **自己**加锁，
+  调用方不必关心。
+- **跨任务通知用 `sys_notify()` / 事件，不要跨任务直接摸 LVGL 对象。** 需要从非 LVGL
+  任务操作 UI 时用 `ui_run_async()`。
+
+### 9.1 三条**不可删**的 `sdkconfig.defaults` 配置
 
 1. **`CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y`（且 `LOG_MAXIMUM_EQUALS_DEFAULT=n`）**
    原因：esp32s31 + `CONFIG_SPIRAM_XIP_FROM_PSRAM` 下，当 `LOG_MAXIMUM_LEVEL == LOG_DEFAULT_LEVEL`
@@ -305,36 +382,90 @@ Project build complete.
    提高到 VERBOSE 后这些串留在普通 rodata，链接正常。**运行时输出不变**（`LOG_DEFAULT_LEVEL`
    仍是 INFO），额外好处是可以运行时用 `sys_log_set_level()` 把单个 TAG 提到 DEBUG。
 
-2. **FreeType 相关四项**（`LV_USE_FREETYPE` / `ESP_LVGL_ADAPTER_ENABLE_FREETYPE` /
-   `..._SMALL_RENDER_POOL` / `..._MINIMAL_BUILD` / `TODOHELPER_FONT_FREETYPE`）
-   `SMALL_RENDER_POOL` 把 FreeType 渲染池压到 4 KB 并去掉 LVGL 那个"32 KB FreeType 绘制栈"
-   的构建期检查；`MINIMAL_BUILD` 去掉用不到的字体驱动与压缩流支持。关掉它们会因为
-   绘制栈检查或栈不足而链接/运行失败。
+2. **`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`** —— 见 §9.0 第 2 条。改回默认 16384 会
+   让 WiFi 吃掉几乎全部内部 RAM，然后 mDNS/AI/I2S/SD 全部失败。
+
+3. **FreeType + 32 KB 渲染栈**（`LV_USE_FREETYPE` / `ESP_LVGL_ADAPTER_ENABLE_FREETYPE` /
+   `..._SMALL_RENDER_POOL` / `..._MINIMAL_BUILD` / `TODOHELPER_FONT_FREETYPE` /
+   `TH_BSP_DISPLAY_TASK_STACK = 32 KB`）
+   `SMALL_RENDER_POOL` 把 FreeType 渲染池压到 4 KB 并去掉 LVGL 的 32 KB 绘制栈
+   **构建期检查**；`MINIMAL_BUILD` 去掉用不到的字体驱动与压缩流支持。
+   **改成 16 KB 栈会随机 panic**（§9.0 第 4 条），而关掉 `SMALL_RENDER_POOL` 会因
+   绘制栈检查而链接失败——两项必须与 32 KB 栈配套。
 
 ### 9.2 素材与字体
 
 - **`assets/ui/` 必须是扁平目录**：`esp_mmap_assets` 的打包脚本用 `os.listdir()`
   只扫一层，且只打包 `MMAP_FILE_SUPPORT_FORMAT` 里列出的后缀。所以天气图标命名为
-  `w_sunny.png` 这种"前缀分类"形式。**字体（.ttf）不能放这里**，改用
-  `idf_component_register(EMBED_FILES ...)` 内嵌（见 `ui_core`）。
+  `w_sunny.png` 这种"前缀分类"形式。**字体（.ttf）不能放这里**，因为 `.ttf` 不在支持
+  后缀里。
 - 增删素材后镜像可能不刷新，执行一次 **`idf.py reconfigure`**。
-- 字体解析顺序（`ui_core/src/ui_fonts.c`）：`<storage>/todohelper/fonts/ui.ttf` →
-  内嵌 `ui_cjk.ttf` → LVGL 内置 Source Han Sans SC 16 → Montserrat。**任何情况下都有中文字形**。
+- 字体解析链（`ui_core/src/ui_fonts.c`）：
+  1. `<storage>/todohelper/fonts/ui_cjk.ttf`——**存在即用**（>1 KB 才认），
+     所以放一个自己的 TTF 进去就能换字体，无需重新烧录；
+  2. 不存在则把内嵌子集写进去再用（首次启动多花约 1~2 秒写 1.2 MB）；
+  3. 以上全部失败（例如没有存储）→ 回退 LVGL 内置 Source Han Sans SC 16 px，
+     **只有约 2500 字，罕见汉字会是方框**，日志会明确警告。
+- 重新生成子集：`tools/gen_cjk_font.py`（默认 GB2312 一级 3755 字，`--level2` 6763 字）。
 
 ### 9.3 硬件约束
 
 - **GPIO20~25 与 SPI NAND flash 脚位复用，同一块板只能装其中一个**：用 SD 卡就不能用 SPI
   NAND，反之亦然。这决定了字体/词库/素材放 SD 还是片内分区。
 - 屏幕与触摸**不**占用 GPIO20~25（RGB 并口 + I2C GPIO0/1），冲突对象只有 SPI NAND。
+- **SD 卡实测可用**：`SD16G`/SDHC、4-bit、40 MHz，挂载在 `/sdcard`，
+  应用目录 `/sdcard/todohelper/`（实测根目录只有 `System Volume Information` 和
+  `todohelper`，说明 VFS 会剥掉挂载点前缀，卡上不会多出一层 `sdcard/`）。
 - **无 RTC**：断电后时间不保持，`sys_time_ts()` 在 SNTP 成功前返回 **0**，
   UI 必须显示"时间未同步"（需求 FR4）。
 - **无 GPS / 无温度传感器**：天气全部来自网络 API，定位只能"手动城市 / IP 定位"。
 - **背光脚为 NC**：亮度用 `lv_layer_top()` 上的黑色遮罩做软件调光（已去掉 CLICKABLE，
   变暗后触摸仍可用）。
 
-### 9.4 其它
+### 9.5 SD 卡目录结构（`/sdcard/todohelper/`）
+
+存储根由 `storage_manager` 决定：优先 SD（`/sdcard`），失败则片内 LittleFS（`/littlefs`）。
+应用数据一律在 **`<root>/todohelper/`** 下（VFS 会剥掉挂载点前缀，所以卡上就是根目录下的
+一层 `todohelper/`，实测卡根只有 `System Volume Information` 和 `todohelper`，
+不会多出一层 `sdcard/`）。
+
+首次启动由 `storage_prepare_tree()` 自动创建，**不需要手动准备任何目录**：
+
+```text
+<卡根>/todohelper/
+├─ fonts/
+│   └─ ui_cjk.ttf        # 1.2 MB，首次启动从固件内嵌子集写出。
+│                        # ★ 放自己的 TTF 覆盖同名文件即可换字体（>1 KB 才被采用）
+├─ images/weather/       # 预留：SD 覆盖天气图标（当前图标在 assets 分区里）
+├─ anim/idle_face/       # 预留：位图版待机动画（当前纯程序化绘制，不需要）
+├─ words/
+│   ├─ cet4.json         # 内置 32 词示例，首次启动写出，可编辑替换
+│   └─ progress.json     # 复习进度
+├─ ai/
+│   ├─ rec_<uptime>.pcm  # 录音（16 kHz/16-bit/单声道/无头），Audacity 按 Raw 导入
+│   └─ history.json      # AI 对话历史（受 ai_service 的 save_history 控制）
+├─ tts/                  # 预留：TTS 缓存
+├─ cache/
+│   ├─ todos.json        # 待办（原子写：先写 .tmp 再 rename）
+│   └─ weather.json      # 天气缓存（断网降级用，带 stale 标记）
+├─ backup/               # 预留：todos_*.json 滚动备份
+└─ logs/                 # 预留
+```
+
+**要点**
+
+- 卡只要 FAT32 且能挂载即可，容量不敏感（实测 SD16G/SDHC、4-bit、40 MHz 可用）。
+- 换中文字体：把任意 `.ttf`（建议含常用汉字、体积越小越好）放到
+  `todohelper/fonts/ui_cjk.ttf`，重启即生效，**不需要重新编译烧录**。
+- 换词库：替换 `todohelper/words/cet4.json`（格式见 `docs/API.md` 的 word 章节）。
+- 拔卡也能跑：回退片内 LittleFS（`storage` 分区 2 MB）；再失败则"无持久化"运行，
+  状态栏会显示存储状态。
+
+### 9.6 其它
 
 - **不要修改** `..\common_components\esp32_s31_korvo`（工程外，被其它示例共用）。
+  需要覆盖 LVGL 适配器配置时，用"抢先 `esp_lv_adapter_init()`"的手法（BSP 只在适配器
+  未初始化时才自己初始化），见 `th_bsp.c` 里 `stack_in_psram` 的用法。
 - 改动 `managed_components/` 下任何文件，都要把 diff 追加进 `patches/` 并在本节登记。
 - `sdkconfig` 是生成物；改默认配置请改 `sdkconfig.defaults`（改完删 `sdkconfig` 再 build
   才会从默认值重新生成）。
@@ -351,6 +482,15 @@ Project build complete.
 | `fatal error: esp_async_fbcpy.h: No such file` | §7 补丁被覆盖，重新 `patch -p1` 并 `idf.py build` |
 | `sections.ld:1280 cannot move location counter backwards` | `sdkconfig.defaults` 的 `LOG_MAXIMUM_LEVEL_VERBOSE` 丢了，见 §9.1 |
 | `Failed to resolve component 'json'` | IDF v6.1 无内置 json；改成 `cjson` 并声明 `espressif/cjson` |
+| `ESP_ERR_NO_MEM` 但日志说 `free heap: 10 MB` | **内部 RAM 碎片化**，看"最大连续块"；见 §9.0 第 2 条 |
+| `wifi:alloc net80211 funcs fail` | 同上，`SPIRAM_MALLOC_ALWAYSINTERNAL` 太大 |
+| `mdns: failed to allocate task stack` | 打开 `MDNS_TASK_CREATE_FROM_SPIRAM` + `MDNS_MEMORY_ALLOC_SPIRAM` |
+| `i2s_alloc_dma_desc` / `allocate_dma_buf` 失败 | 内部 RAM 最大连续块不足；见 §9.0 第 1、2 条 |
+| **随机 panic**（Load access fault / misaligned / Stack protection） | LVGL 渲染栈太小，FreeType 需 ≥32 KB；见 §9.0 第 4 条 |
+| 部分汉字是方框、部分是好的 | 走了内置字库（只有约 2500 字）；FreeType/字体文件没加载成功，见 §9.0 第 3 条 |
+| `FreeType font initialization failed` | 用了内存模式；v9 只支持文件路径，见 §9.0 第 3 条 |
+| `mkdir ... failed (errno 22)` | FatFs 用 `FR_INVALID_NAME` 表示"已存在"；改用 `stat()` 判断 |
+| main 任务卡死 / `task_wdt: IDLE0` | 有 LVGL 调用没持锁；见 §9.0.1 |
 | 中文显示成方框 | 内嵌字体没生成/没重新构建；跑 `tools/gen_cjk_font.py` 后 `idf.py build` |
 | 天气图标不显示 | `assets/ui/` 里有子目录，或改了素材没 `idf.py reconfigure` |
 | `idf.py: command not found` | 未加载 IDF 环境，见 §4 |

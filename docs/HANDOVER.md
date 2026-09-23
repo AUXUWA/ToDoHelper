@@ -11,15 +11,33 @@
 ## 1. 一句话现状
 
 P0/P1/P2 的**代码**基本写完（16 个组件、约 15.5k 行 C，`idf.py build` 全绿，
-app 4.17 MB / 8 MB 分区余 50%），**但从未烧录到真机、从未上屏、从未发过一次真实 HTTP 请求**。
+app 4.18 MB / 8 MB 分区余 50%），**且已完成首轮真机验证**。
 
-因此：
+**已验证（真机 COM34，`idf.py build` 0 警告）**
 
-- **编译级正确性：有保障**（`-Werror` 全开、0 警告、从零 `sdkconfig` 可复现）。
-- **运行期正确性：零验证**。UI 布局、触摸、LVGL 运行期行为、WiFi 实际连接、
-  DeepSeek 真实调用、SD/LittleFS 挂载全部是纸面正确。
+| 项 | 结果 |
+|---|---|
+| 稳定性 | **0 panic、0 task watchdog**，`main_task: Returned from app_main()` 干净收尾 |
+| 12 个功能模块 | WiFi / Todo / 天气 / 日历 / 单词 / sync_server / idle_face / ai_service / voice_service **全部 `ready`** |
+| 中文字体 | FreeType **16/20/28/48 px 全部生效**，用户确认**无方框** |
+| SD 卡 | 挂载 `/sdcard`（SD16G/SDHC/4-bit/40 MHz），应用目录树创建成功，词库写入 `words/cet4.json` 成功 |
+| mDNS | `mDNS published as todohelper.local` |
+| HTTP | `listening on port 80, 37 route(s), auth=off` |
+| 音频 | `mic=1 speaker=1`（I2S DMA 成功） |
+| 内部 RAM | boot 结束余 **118 KB（最大连续块 74 KB）**、PSRAM 余 9655 KB |
+| app 体积 | `0x3fcbf0`，8 MB 分区余 **50%** |
 
-**接手第一件事就是上机**（§5 有清单），而不是继续加功能。
+**尚未验证**
+
+- WiFi 实际关联（需要 SSID/密码凭据）
+- 联网后的 HTTP 全链路：浏览器待办页双向同步、SSE 推送、`/ws/events` 501、天气 IP 定位、SNTP 校时、单词、AI 对话
+- **触摸与按键交互**（GT1151 已初始化，但从未点过）
+- **待机 30 s 超时 → 眼睛动画 → 触摸唤醒** 完整链路
+- DeepSeek 真实调用、ASR/TTS 端点
+
+> **接手者必读**：首轮上机踩的坑全部记在 `AGENT.md` §9.0（五条实测结论）与
+> §9.0.1（两个自伤 bug）。那两节是最容易重复踩的地方，尤其是
+> "内部 RAM 碎片化 ≠ 总空闲不足" 这一条。
 
 ---
 
@@ -142,70 +160,91 @@ app 4.17 MB / 8 MB 分区余 50%），**但从未烧录到真机、从未上屏�
 
 ---
 
-## 5. 首次上机验证清单（**最高优先级**）
+## 5. 上机验证清单
+
+### 5.1 首轮已验证 ✅
 
 ```powershell
 . C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
 cd D:\project\ESP-IDFv6.1\ToDoHelper
 idf.py build
-idf.py -p COM34 flash monitor
+idf.py -p COM34 flash
+# 抓串口（idf.py monitor 会独占终端、不能重定向）
+& 'C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe' tools\monitor_capture.py `
+    --port COM34 --seconds 30 --out build\boot.log
 ```
 
-按顺序看，**每一项都记录实际结果**（成功/失败 + 日志）：
-
-| # | 检查项 | 期望 |
+| # | 检查项 | 结果 |
 |---|---|---|
-| 1 | 启动日志 | `TH:sys_config: config ready`、`TH:sys_events: shared event loop ready`、`TH:bsp: ready: 800x480...` |
-| 2 | 屏幕 | 深色背景 + 顶部状态栏 + 启动页 → 首页 6 个卡片 |
-| 3 | 中文字形 | 首页"你好，今天要做什么？"等中文**不是方框**（FreeType 生效）。若是方框 → `TH:ui_fonts` 有明显告警 |
-| 4 | 存储 | `TH:storage: SD card mounted at /sdcard` 或 `internal LittleFS mounted at /littlefs`；状态栏显示 SD/内置 |
-| 5 | 触摸 | 点卡片能进对应页面、"返回"能回退；控件命中区域正常 |
-| 6 | 待机 | 30 s 无操作 → 全黑 + 白线眼睛 + 眨眼/左右看 + 变暗；触摸恢复亮度并回原页 |
-| 7 | 按键 | MODE 键切首页/待办；SET 键返回上一页；按键应能唤醒待机 |
-| 8 | WiFi | 扫描列表显示 SSID/RSSI/ch；输入密码连接 → 状态栏变绿显示 dBm |
-| 9 | mDNS + HTTP | 电脑 `curl.exe http://todohelper.local/api/v1/device/info` 返回 JSON |
-| 10 | 待办双向同步 | 浏览器打开 `http://todohelper.local/` 新增一条 → 设备待办页**自动出现**；设备勾选 → 网页勾上 |
-| 11 | 501/404 契约 | `curl.exe -i http://todohelper.local/ws/events` → **501**；`/api/v1/nope` → **404** |
-| 12 | 天气 | 首次启动无城市时应自动 IP 定位；`curl.exe http://todohelper.local/api/v1/weather` 有温度 |
-| 13 | 日历 | 状态栏时钟开始走；未同步时显示"时间未同步"而非 1970 |
-| 14 | 单词 | 卡片能翻面；点三档评分后队列前进、进度写入 `words/progress.json` |
-| 15 | 设置页 | 亮度滑杆真的改变屏幕暗度；"生成并开启 token"后写操作需要 `X-Auth-Token` |
-| 16 | AI | `POST /api/v1/ai/config` 配 Key 后 `POST /api/v1/ai/chat` 有回复；AI 对话页显示气泡 |
-| 17 | 内存 | `GET /api/v1/device/status` 看 `free_heap` / `free_psram`，跑 10 分钟后不应持续下降 |
-| 18 | 重启 | `POST /api/v1/device/reboot` 能重启；重启后 WiFi 免配置自动连上、待办仍在 |
+| 1 | 启动无 panic / 无看门狗 | ✅ 全绿 |
+| 2 | 屏幕点亮、状态栏 + 首页 6 个卡片 | ✅（用户确认） |
+| 3 | 中文不是方框 | ✅（用户确认，FreeType 生效） |
+| 4 | 存储挂载 | ✅ `/sdcard`，状态栏显示 `SD` |
+| 5 | 12 个模块 ready | ✅ 全部 ready |
+| 6 | mDNS + HTTP | ✅ `todohelper.local` / 80 端口 / 37 条路由 |
+| 7 | 内嵌字体落盘 | ✅ `fonts/ui_cjk.ttf`（1224120 字节） |
+| 8 | SD 写入 | ✅ 词库 `words/cet4.json` |
+| 9 | 音频硬件 | ✅ `mic=1 speaker=1` |
+| 10 | 内部 RAM 余量 | ✅ 118 KB / 最大连续块 74 KB |
 
-**最可能出问题的地方**（按我的风险判断排序）：
+### 5.2 待验证 ⬜
 
-1. **FreeType 字体渲染** —— 第一次开 FreeType，字号/行高/内存都需实测；
-   若崩溃或方框，先用 `CONFIG_TODOHELPER_FONT_FREETYPE=n` 退回内置 16px 字体（一行配置）。
-2. **`ui_settings` 的滑杆回调** —— 用 `lv_obj_set_user_data` + 共享 250 ms 定时器刷新读数，
+| # | 检查项 | 期望 | 阻塞原因 |
+|---|---|---|---|
+| 11 | 触摸 | 点卡片进页面、"返回"能回退 | GT1151 已初始化，但从未点过 |
+| 12 | 按键 | MODE 切首页/待办、SET 返回、能唤醒待机 | 4 个 ADC 按键已注册 |
+| 13 | 待机 | 30 s 无操作 → 全黑 + 白线眼睛 + 眨眼 + 变暗 | `idle timeout 30 s` 已生效 |
+| 14 | 页面切换动画 | 新页面 200 ms 淡入 + 向右滑入 | 本轮新增，未观察 |
+| 15 | WiFi 关联 | 扫描列表 → 输入密码 → 状态栏显示 dBm | **需要凭据** |
+| 16 | 浏览器待办页 | `http://todohelper.local/` 双向同步 | 需要 WiFi |
+| 17 | 501/404 契约 | `/ws/events` → **501**；`/api/v1/nope` → **404** | 需要 WiFi |
+| 18 | 天气 IP 定位 | 无城市时自动定位，`/api/v1/weather` 有温度 | 需要 WiFi |
+| 19 | 日历 SNTP | 状态栏时钟开始走 | 需要 WiFi |
+| 20 | 单词 | 翻卡 + 三档评分 + 进度写入 | 可离线验证 |
+| 21 | 设置页 | 亮度滑杆真的改变暗度；token 后写操作需鉴权 | 可离线验证 |
+| 22 | AI 对话 | 配 Key 后 `/api/v1/ai/chat` 有回复 | 需要凭据 |
+| 23 | 内存稳定性 | 跑 10 分钟 `free_heap` 不持续下降 | `/api/v1/device/status` |
+| 24 | 重启 | `POST /api/v1/device/reboot` 后 WiFi 免配、待办仍在 | 需要 WiFi |
+
+### 5.3 最可能出问题的地方
+
+首轮上机的头号风险（FreeType 字体、渲染栈、内部 RAM、SD mkdir）**已被证实并修复**，
+详见 `AGENT.md` §9.0。**现在剩下的风险按大小排序**：
+
+1. **AI 请求时的 TLS 缓冲** —— boot 结束内部 RAM 最大连续块 74 KB，而 mbedtls 的
+   SSL in/out 缓冲默认各 16 KB。若首次 `POST /api/v1/ai/chat` 报 `ESP_ERR_NO_MEM` 或
+   握手失败，就调小 `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN`/`OUT_CONTENT_LEN`，
+   或开 `CONFIG_MBEDTLS_DYNAMIC_BUFFER`。**这是目前最值得优先实测的一项。**
+2. **`ui_settings` 的滑杆读数** —— 用 `lv_obj_set_user_data` + 共享 250 ms 定时器刷新，
    逻辑上没问题但没跑过；若数值不刷新，改成每个滑杆自己的 `VALUE_CHANGED` 回调。
-3. **LVGL 布局** —— 页面用 flex/grid，800×480 下是否溢出/滚动是否可用完全是纸面推演。
-4. **`idle_face` 的 `lv_line` X 眼坐标** —— 用的是文件作用域静态点数组，眼形切换时
-   是否与椭圆对齐未验证。
-5. **录音任务** —— 48k 立体声读入 → 下混 → 3 倍抽取到 16k，边界与缓冲未实测；
-   若 mic 打不开，`voice_service_start_record()` 返回 `ESP_ERR_NOT_SUPPORTED`（这是预期的降级）。
-6. **`sdkconfig` 从默认值重建** —— 已验证两次可复现，但真机首次启动的 NVS 是空的，
-   `first_boot` 之类的首启流程未实现。
+3. **触摸命中区域** —— 页面是 flex 布局，控件位置靠推演，第一次点可能发现偏差。
+4. **`idle_face` 的 X 眼几何** —— 用文件作用域静态点数组，眼形切换时与椭圆是否对齐未验证。
+5. **录音重采样边界** —— 48k 立体声下混 + 3 倍抽取到 16k，缓冲边界未实测
+   （`mic=1` 只证明 I2S 通道开起来了）。
 
 ---
 
 ## 6. 已知风险与不确定点（诚实清单）
 
-- **运行期零验证**：见 §5。这是当前最大的风险，超过任何功能缺口。
-- **`ui_pages` 的滑杆读数**、**X 眼几何**、**录音抽取** 三处是"看着对但没跑过"的典型。
-- **天气 IP 定位端点**（ipapi.co）免费额度有限，且返回字段依赖第三方；已做成可配置且
+- **联网相关功能全部未验证**（WiFi 关联、HTTP 全链路、天气、SNTP、AI）——这是当前
+  最大的未知面，因为它们的代码路径从未真正执行过。
+- **触摸/按键/待机链路未验证** —— 屏幕能显示、能渲染，但输入侧一次都没试过。
+- **AI 首次调用的内部 RAM 是否够** —— 见 §5.3 第 1 条。TLS 会话要 16~32 KB 内部 RAM，
+  而最大连续块 74 KB，理论上够但没验证过；同理 `esp_http_client` 的缓冲。
+- **天气 IP 定位端点**（ipapi.co）免费额度有限，返回字段依赖第三方；已做成可配置且
   解析器兼容 `latitude/lat`、`longitude/lon/lng` 两种拼写。
 - **`voice_service` 的 ASR/TTS** 只定义了协议（ASR 收 raw PCM 回 `{"text":...}`；
   TTS 收 `{"text":...}` 回 `audio/pcm`），**没有对任何真实服务验证过**。
-- **没有看门狗喂狗策略**：`CONFIG_ESP_TASK_WDT_TIMEOUT_S=5`，若某个页面/服务阻塞超过 5 s
-  会被复位。已刻意避免在 LVGL 任务里做网络/阻塞 IO（天气/语音/AI 都在自己的任务里），
-  但**待机眼睛的 33 ms 定时器 + 大量 LVGL 对象**在慢路径下是否会超时未验证。
-- **`sys_log_set_level()` 只影响 `SYS_LOG*` 宏**：第三方组件（LVGL/IDF）的日志级别
-  由 `esp_log_level_set("*", ...)` 一并设置，但它们的 `ESP_LOGD` 编译期已被
-  `LOG_MAXIMUM_LEVEL_VERBOSE` 保留，因此运行时可以打开——**但会增加大量串口输出**。
+- **看门狗策略**：`CONFIG_ESP_TASK_WDT_TIMEOUT_S=5`。已刻意避免在 LVGL 任务里做网络/
+  阻塞 IO（天气/语音/AI 都在自己的任务里）。首轮上机出现过的唯一一次看门狗已定位为
+  "`app_main` 未持 LVGL 锁"并修复（`AGENT.md` §9.0.1）。
+- **`sys_log_set_level()` 会把 `wifi`/`phy`/`pp`/`net80211` 压到 ERROR** —— 这是刻意的
+  （每条 PHY 速率都打一行 W 级日志，十几行淹没应用日志）。要抓 WiFi 详细日志时，
+  临时把 `sys_log.c` 里 `quiet[]` 的对应 TAG 摘掉。
 - **app 分区余量 50%**：OTA 需要额外分区，届时要重新规划 `partitions.csv`
-  （当前 `factory` 8 MB + `storage` 2 MB + `assets` 5.9 MB = 15.9 MB 已用满 16 MB flash）。
+  （当前 `factory` 8 MB + `storage` 2 MB + `assets` 5.9 MB ≈ 15.9 MB 已用满 16 MB flash）。
+- **字体写入是首次启动的一次性成本**：约 1~2 秒写 1.2 MB 到 SD。若换更慢的卡可能更久；
+  日志会打印耗时。想避免就预先手动把 TTF 放到 `fonts/ui_cjk.ttf`。
 
 ---
 

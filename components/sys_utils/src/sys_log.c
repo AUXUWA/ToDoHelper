@@ -47,6 +47,11 @@ void sys_log_set_level(sys_log_level_t level)
     }
 }
 
+void sys_log_init(void)
+{
+    sys_log_set_level(s_level);
+}
+
 sys_log_level_t sys_log_get_level(void)
 {
     return s_level;

@@ -30,7 +30,19 @@ typedef enum {
 } sys_log_level_t;
 
 /**
+ * @brief Apply the compile-time log level and the noisy-tag policy.
+ *
+ * Call once, early in app_main. Without it only sys_log_write()'s own threshold
+ * is in effect and the noisy-tag demotion never happens, which is why the WiFi
+ * PHY banner lines kept showing up in the boot log.
+ */
+void sys_log_init(void);
+
+/**
  * @brief Set the global log level. Messages above this level are dropped.
+ *
+ * Also re-applies the noisy-tag policy, so raising the level for debugging does
+ * not re-enable the WiFi PHY banner spam.
  */
 void sys_log_set_level(sys_log_level_t level);
 

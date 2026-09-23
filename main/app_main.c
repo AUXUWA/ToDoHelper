@@ -144,6 +144,9 @@ static void log_reset_reason(void)
 
 void app_main(void)
 {
+    /* First, so every later line is filtered by our level/quiet-tag policy. */
+    sys_log_init();
+
     SYS_LOGI(TAG, "ToDoHelper starting");
 
     ESP_ERROR_CHECK(sys_config_init(NULL));
