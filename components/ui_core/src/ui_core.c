@@ -43,11 +43,13 @@ typedef struct {
 } ui_binding_t;
 
 /** Heap message used to move an event from the shared loop into the LVGL task. */
-typedef struct {
+typedef struct ui_async_event {
     int32_t event_id;
     ui_page_id_t page;
     ui_event_fn_t handler;
     size_t data_size;
+    /** Next pending event; the hand-off queue is a singly linked list. */
+    struct ui_async_event *next;
     uint8_t payload[];
 } ui_async_event_t;
 
@@ -99,7 +101,61 @@ static void ui_async_event_cb(void *arg)
     free(ev);
 }
 
-/** Runs in the LVGL task (the adapter holds the lock around lv_timer_handler). */
+/*
+ * Cross-task hand-off queue.
+ *
+ * ui_post_event() runs on the *publisher's* task (the shared event loop, a
+ * service worker), while the handlers must run in the LVGL task. It used to do
+ * that by taking the adapter lock and calling lv_async_call() directly, which
+ * coupled every publisher to the render task: a long LVGL callback (an NTP wait,
+ * an SD write) would block the event loop on ui_lock(-1) = portMAX_DELAY, and a
+ * busy event loop would in turn stall rendering.
+ *
+ * Now the publisher only appends to a singly linked list under a short spinlock
+ * and wakes the drainer. The list is LIFO so a flood of notifications cannot
+ * starve the newest one, and it is bounded so a stalled UI cannot exhaust the
+ * heap (dropping a notification is acceptable, blocking the publisher is not).
+ */
+#define UI_EVENT_QUEUE_MAX 64
+/** Depth of the pending queue; guarded by s_event_lock. */
+static ui_async_event_t *s_event_head;
+static size_t s_event_depth;
+static portMUX_TYPE s_event_lock = portMUX_INITIALIZER_UNLOCKED;
+/** LVGL timer that drains the queue inside the LVGL task. */
+static lv_timer_t *s_event_timer;
+/** Set by the publisher to ask the drainer for an immediate pass. */
+static volatile bool s_event_pending;
+
+/** Runs in the LVGL task. Moves one queued event into lv_async_call(). */
+static void ui_event_drain_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (!s_event_pending) {
+        return;
+    }
+    s_event_pending = false;
+
+    /* Hand the whole pending list to LVGL in one go, then let lv_async_call own
+     * the nodes: it frees them through ui_async_event_cb(). */
+    taskENTER_CRITICAL(&s_event_lock);
+    ui_async_event_t *list = s_event_head;
+    s_event_head = NULL;
+    s_event_depth = 0;
+    taskEXIT_CRITICAL(&s_event_lock);
+
+    while (list != NULL) {
+        ui_async_event_t *next = list->next;
+        list->next = NULL;
+        if (lv_async_call(ui_async_event_cb, list) != LV_RESULT_OK) {
+            /* UI shutting down or out of async slots: drop it. */
+            free(list);
+        }
+        list = next;
+    }
+}
+
+/** Runs on the publisher's task: no LVGL call, no blocking. */
 static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t handler,
                           size_t data_size, const void *data)
 {
@@ -120,16 +176,21 @@ static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t han
         memcpy(ev->payload, data, data_size);
     }
 
-    if (!ui_lock(-1)) {
+    taskENTER_CRITICAL(&s_event_lock);
+    if (s_event_depth >= UI_EVENT_QUEUE_MAX) {
+        taskEXIT_CRITICAL(&s_event_lock);
+        /* The UI is not draining (still booting, or wedged). Shedding the oldest
+         * notification keeps a burst from growing without bound. */
+        SYS_LOGW(TAG, "event queue full, dropping event %ld", (long)event_id);
         free(ev);
         return;
     }
-    if (lv_async_call(ui_async_event_cb, ev) != LV_RESULT_OK) {
-        /* UI already shutting down or out of async slots: dropping a
-         * notification is acceptable, blocking the publisher is not. */
-        free(ev);
-    }
-    ui_unlock();
+    ev->next = s_event_head;
+    s_event_head = ev;
+    s_event_depth++;
+    taskEXIT_CRITICAL(&s_event_lock);
+
+    s_event_pending = true;
 }
 
 /** Runs in the shared event loop task: must not touch LVGL directly. */
@@ -726,6 +787,14 @@ esp_err_t ui_core_init(void)
     }
 
     (void)lv_timer_create(clock_tick_cb, 1000, NULL);
+
+    /* Drains the cross-task event queue. 20 ms keeps a notification within about
+     * one frame of being published without waking the LVGL task when idle: the
+     * callback returns immediately unless s_event_pending is set. */
+    s_event_timer = lv_timer_create(ui_event_drain_cb, 20, NULL);
+    if (s_event_timer == NULL) {
+        SYS_LOGW(TAG, "event drain timer unavailable, UI notifications will stall");
+    }
 
     ui_unlock();
 
