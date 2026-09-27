@@ -82,25 +82,6 @@ void ui_unlock(void)
     th_bsp_unlock();
 }
 
-static void ui_async_event_cb(void *arg)
-{
-    ui_async_event_t *ev = (ui_async_event_t *)arg;
-    if (ev == NULL) {
-        return;
-    }
-
-    if (ev->handler != NULL) {
-        ev->handler(ev->event_id, ev->payload);
-    } else if (ev->page < UI_PAGE_MAX) {
-        const ui_slot_t *slot = &s_slots[ev->page];
-        if (slot->desc != NULL && slot->desc->on_event != NULL) {
-            slot->desc->on_event(ev->event_id, ev->payload);
-        }
-    }
-
-    free(ev);
-}
-
 /*
  * Cross-task hand-off queue.
  *
@@ -124,34 +105,64 @@ static portMUX_TYPE s_event_lock = portMUX_INITIALIZER_UNLOCKED;
 /** LVGL timer that drains the queue inside the LVGL task. */
 static lv_timer_t *s_event_timer;
 /** Set by the publisher to ask the drainer for an immediate pass. */
-static volatile bool s_event_pending;
+static volatile bool s_event_pending;   /* written under s_event_lock */
 
-/** Runs in the LVGL task. Moves one queued event into lv_async_call(). */
+/** Runs in the LVGL task. Dispatches every queued event. */
 static void ui_event_drain_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    if (!s_event_pending) {
+    taskENTER_CRITICAL(&s_event_lock);
+    const bool pending = s_event_pending;
+    s_event_pending = false;
+    taskEXIT_CRITICAL(&s_event_lock);
+    if (!pending) {
         return;
     }
-    s_event_pending = false;
 
-    /* Hand the whole pending list to LVGL in one go, then let lv_async_call own
-     * the nodes: it frees them through ui_async_event_cb(). */
-    taskENTER_CRITICAL(&s_event_lock);
-    ui_async_event_t *list = s_event_head;
-    s_event_head = NULL;
-    s_event_depth = 0;
-    taskEXIT_CRITICAL(&s_event_lock);
-
-    while (list != NULL) {
-        ui_async_event_t *next = list->next;
-        list->next = NULL;
-        if (lv_async_call(ui_async_event_cb, list) != LV_RESULT_OK) {
-            /* UI shutting down or out of async slots: drop it. */
-            free(list);
+    /*
+     * Take the whole pending list in one critical section and dispatch it here,
+     * rather than handing each node to lv_async_call().
+     *
+     * Two reasons, both learned the hard way on hardware:
+     *
+     *  1. lv_async_call() has its own small fixed pool. A notification burst
+     *     (a DNS failure flood at boot, a WiFi reconnect) overflowed it and made
+     *     this loop churn malloc/free while LVGL's internal lock was in play.
+     *  2. Dispatching directly is what this timer is for: it already runs inside
+     *     the LVGL task with the adapter lock held, which is exactly the context
+     *     the handlers need. Going through lv_async_call() added a second
+     *     deferral and a second lock for nothing.
+     */
+    for (;;) {
+        taskENTER_CRITICAL(&s_event_lock);
+        ui_async_event_t *ev = s_event_head;
+        if (ev != NULL) {
+            s_event_head = ev->next;
+            s_event_depth--;
         }
-        list = next;
+        taskEXIT_CRITICAL(&s_event_lock);
+
+        if (ev == NULL) {
+            break;
+        }
+
+        /* Someone could have published while we were dispatching; keep the flag
+         * consistent so the next tick still runs. */
+        if (s_event_head != NULL) {
+            s_event_pending = true;
+        }
+
+        ev->next = NULL;
+        if (ev->handler != NULL) {
+            ev->handler(ev->event_id, ev->payload);
+        } else if (ev->page < UI_PAGE_MAX) {
+            const ui_slot_t *slot = &s_slots[ev->page];
+            if (slot->desc != NULL && slot->desc->on_event != NULL) {
+                slot->desc->on_event(ev->event_id, ev->payload);
+            }
+        }
+        free(ev);
     }
 }
 
@@ -177,20 +188,22 @@ static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t han
     }
 
     taskENTER_CRITICAL(&s_event_lock);
-    if (s_event_depth >= UI_EVENT_QUEUE_MAX) {
-        taskEXIT_CRITICAL(&s_event_lock);
-        /* The UI is not draining (still booting, or wedged). Shedding the oldest
-         * notification keeps a burst from growing without bound. */
-        SYS_LOGW(TAG, "event queue full, dropping event %ld", (long)event_id);
-        free(ev);
-        return;
+    const bool full = (s_event_depth >= UI_EVENT_QUEUE_MAX);
+    if (!full) {
+        ev->next = s_event_head;
+        s_event_head = ev;
+        s_event_depth++;
+        s_event_pending = true;
     }
-    ev->next = s_event_head;
-    s_event_head = ev;
-    s_event_depth++;
     taskEXIT_CRITICAL(&s_event_lock);
 
-    s_event_pending = true;
+    if (full) {
+        /* The UI is not draining (still booting, or wedged). Shedding the event
+         * keeps a burst from growing without bound; the log is emitted outside
+         * the critical section because it takes the console lock. */
+        SYS_LOGW(TAG, "event queue full, dropping event %ld", (long)event_id);
+        free(ev);
+    }
 }
 
 /** Runs in the shared event loop task: must not touch LVGL directly. */
