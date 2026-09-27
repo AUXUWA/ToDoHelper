@@ -207,6 +207,21 @@
   .wifi-sub{font-size:13px;margin:12px 0 6px}
   .wifi-warn{border-left:4px solid var(--warning)}
 
+  /* ---------- 墨墨背单词 ---------- */
+  #maimemo>summary{list-style:none;cursor:pointer}
+  #maimemo>summary::-webkit-details-marker{display:none}
+  #maimemo>summary::marker{content:""}
+  .mm-sub{font-size:13px;margin:12px 0 6px;color:var(--muted)}
+  /* 今日词表：设备最多返回 64 条，这里再截断到 50 行并说明省略了多少。 */
+  .mm-list{list-style:none;margin:0;padding:0;max-height:280px;overflow:auto}
+  .mm-word{display:flex;align-items:center;gap:8px;padding:7px 10px;margin-bottom:5px;
+           background:var(--surface-alt);border-radius:10px}
+  .mm-word .sp{flex:1;min-width:0;font-size:14px;word-break:break-all}
+  .mm-word .chip{flex:0 0 auto}
+  .chip.mm-new{background:rgba(61,169,252,.16);color:var(--primary)}
+  .chip.mm-done{background:rgba(46,204,113,.16);color:var(--success)}
+  .chip.mm-plain{background:rgba(154,167,180,.14);color:var(--muted)}
+
   #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:30;max-width:88vw;
          padding:11px 18px;border-radius:12px;background:var(--surface-alt);border:1px solid var(--line);
          font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none}
@@ -331,6 +346,49 @@
         <div class="row-actions">
           <button class="btn primary" type="button" id="token-save">保存令牌并重连</button>
           <button class="btn" type="button" id="token-clear">清除令牌</button>
+        </div>
+      </div>
+    </details>
+
+    <!-- 墨墨背单词（开放 API）：令牌只写不读，状态 / 同步 / 今日词表都在这里 -->
+    <details class="card" id="maimemo">
+      <summary class="card-head" style="cursor:pointer;list-style:none;margin:0">
+        <h2>墨墨背单词（开放 API）</h2>
+        <span class="spacer"></span>
+        <span class="stamp" id="mm-state">状态未知</span>
+      </summary>
+      <div class="fields" style="padding-top:10px">
+        <p class="small muted" id="mm-help">
+          墨墨没有公开的第三方登录，需要在手机上取一个 <strong>开放 API 令牌</strong>：
+          「墨墨背单词 App → 我的 → 设置 → 开放 API」生成后填到下面即可。<br>
+          令牌是<strong>只写</strong>的 —— 填进来之后设备只会回一个打码的提示（如 <code>g_zV****</code>），
+          本页永远不会把完整令牌显示出来，也不写进 localStorage。
+        </p>
+
+        <div class="kv-grid" id="mm-rows"></div>
+
+        <div class="row-actions" style="margin-top:10px">
+          <button class="btn small" type="button" id="mm-refresh">刷新状态</button>
+          <button class="btn small" type="button" id="mm-sync">立即同步</button>
+          <button class="btn small" type="button" id="mm-today">拉取今日词表</button>
+        </div>
+
+        <label class="field" style="margin-top:12px"><span>API 令牌（只写，保存后不再回显）</span>
+          <input type="password" id="mm-token" autocomplete="new-password" placeholder="粘贴墨墨开放 API 令牌"></label>
+        <label class="inline-check"><input type="checkbox" id="mm-push"><span>允许设备把新词推送到墨墨（复习计划 C）</span></label>
+        <div class="row-actions">
+          <button class="btn primary" type="button" id="mm-save">保存并校验</button>
+          <button class="btn danger" type="button" id="mm-clear">清除令牌</button>
+        </div>
+        <p class="small muted">
+          「保存并校验」会带着令牌当场访问一次墨墨接口，正常需要 5–15 秒，请耐心等按钮恢复。
+          校验失败不一定代表令牌无效 —— 只有学习权限的令牌读不到助记 / 例句，属于正常现象。
+        </p>
+
+        <div id="mm-today-box" hidden>
+          <h3 class="mm-sub" id="mm-today-head">今日词表</h3>
+          <ul class="mm-list" id="mm-today-list"></ul>
+          <p class="small muted" id="mm-today-note"></p>
         </div>
       </div>
     </details>
@@ -1030,7 +1088,7 @@ $("sync-all").addEventListener("click", function (event) {
   });
 });
 
-$("reload").addEventListener("click", function () { loadAll(); loadDevice(); });
+$("reload").addEventListener("click", function () { loadAll(); loadDevice(); loadMaimemo(); });
 $("dev-refresh").addEventListener("click", function () { loadDevice(); });
 $("banner-retry").addEventListener("click", function () {
   hideBanner();
@@ -1160,7 +1218,300 @@ $("token-clear").addEventListener("click", function () {
 });
 
 /* ========================================================================
-   12. SSE：实时推送（EventSource 或带 token 的 fetch 流）+ 轮询兜底
+   12. 墨墨背单词（开放 API）
+   ======================================================================== */
+
+/* 展示用常量。令牌本身是只写的：设备只在 /status 里回 token_hint（如 g_zV****），
+   所以这里除了用户刚输入、还没提交的那一次，任何地方都不会出现完整令牌。 */
+var MM_MAX_ROWS = 50;        /* 今日词表最多画这么多行，超出的只在说明里报数 */
+var MM_SYNC_TRIES = 10;      /* 同步后轮询 /status 的次数 */
+var MM_SYNC_GAP = 2000;      /* 轮询间隔（毫秒），10 × 2s ≈ 20s */
+var MM_STATUS = null;        /* 最近一次 /status 或 /config 返回的状态对象 */
+var mmPollTimer = 0;         /* “立即同步”后的轮询定时器 */
+var mmWaitMs = 30000;        /* /config?verify=1 与 /today 都是实时调用，给足超时 */
+
+function mmSetState(text, cls) {
+  var node = $("mm-state");
+  setText(node, text);
+  node.className = "stamp";
+  node.style.color = cls ? "var(--" + cls + ")" : "";
+}
+function mmSetBusy(id, busy, busyText, idleText) {
+  var btn = $(id);
+  if (!btn) { return; }
+  btn.disabled = !!busy;
+  btn.textContent = busy ? busyText : idleText;
+}
+
+/* /status 与 /config 返回同一个状态对象，渲染逻辑共用一份。 */
+function mmRender(state, err) {
+  MM_STATUS = state || null;
+  var grid = $("mm-rows");
+  grid.textContent = "";
+
+  var add = function (label, value, cls) {
+    var cell = el("div", "kv");
+    cell.append(el("span", "k", label), el("span", "v" + (cls ? " " + cls : ""), value));
+    grid.append(cell);
+  };
+
+  if (!state) {
+    grid.append(el("p", "muted small", err ? ("状态不可用：" + err.message)
+                                            : "正在读取墨墨状态…"));
+    mmSetState(err ? "读取失败" : "状态未知", err ? "danger" : "");
+    return;
+  }
+
+  var configured = !!state.configured;
+  add("令牌", configured ? (state.token_hint || "已配置") : "未配置",
+      configured ? "ok" : "warn");
+  add("推送新词", state.push_enabled ? "已开启" : "已关闭", state.push_enabled ? "ok" : "");
+
+  var progress = state.progress;
+  if (state.synced && progress) {
+    var finished = Number(progress.finished) || 0;
+    var total = Number(progress.total) || 0;
+    add("已学 / 计划", finished + " / " + total);
+    add("剩余", String(Number(progress.remaining) || 0),
+        (Number(progress.remaining) || 0) === 0 ? "ok" : "");
+    /* study_time_min 由设备换算好，直接用；个别固件只给 ms 时兜个底。 */
+    var minutes = (typeof progress.study_time_min === "number")
+      ? progress.study_time_min
+      : Math.floor((Number(progress.study_time_ms) || 0) / 60000);
+    add("学习时长", minutes + " 分钟");
+    add("计划词数", String(Number(progress.plan_count) || 0));
+  } else {
+    add("今日进度", "点「立即同步」从墨墨拉取", "warn");
+  }
+
+  if (!configured) {
+    mmSetState("未配置令牌", "warning");
+  } else if (!state.synced) {
+    mmSetState("已配置 · 待同步", "warning");
+  } else {
+    mmSetState((state.token_hint || "已配置") + " · 已同步", "success");
+  }
+
+  /* 复选框跟设备状态走，但用户正在拨动时不要抢（避免覆盖还没提交的选择）。 */
+  var box = $("mm-push");
+  if (document.activeElement !== box) { box.checked = !!state.push_enabled; }
+}
+
+/* 令牌是只写的：任何刷新 / 重渲染都不许把它写回输入框，这里统一清空。 */
+function mmForgetInput() {
+  var input = $("mm-token");
+  if (input) { input.value = ""; }
+}
+
+function loadMaimemo() {
+  return api("/api/v1/maimemo/status", { timeoutMs: 8000 }).then(function (state) {
+    mmRender(state, null);
+    return state;
+  }).catch(function (err) {
+    mmRender(null, err);
+    /* 鉴权 / 离线交给统一的错误处理，避免这里再弹一遍横幅。 */
+    if (err.kind === "auth") { reachableWithProblem(err); }
+    return null;
+  });
+}
+
+$("mm-refresh").addEventListener("click", function () {
+  mmSetBusy("mm-refresh", true, "读取中…", "刷新状态");
+  loadMaimemo().then(function (state) {
+    if (state) { toast("墨墨状态已刷新", "ok"); }
+  }).then(function () {
+    mmSetBusy("mm-refresh", false, "", "刷新状态");
+  });
+});
+
+/* 保存令牌 / 切换推送开关：两者都走 /config，只是参数不同。 */
+$("mm-save").addEventListener("click", function () {
+  var input = $("mm-token");
+  var value = input.value.trim();
+  if (!value) {
+    /* 不带新令牌的“保存并校验”等于拿现有令牌校验一次，这是允许的。 */
+    if (MM_STATUS && !MM_STATUS.configured) {
+      toast("请先粘贴墨墨开放 API 令牌", "warn");
+      input.focus();
+      return;
+    }
+  }
+
+  var body = { verify: true };
+  if (value) { body.token = value; }
+
+  mmSetBusy("mm-save", true, "校验中…（5–15 秒）", "保存并校验");
+  api("/api/v1/maimemo/config", {
+    method: "POST",
+    body: JSON.stringify(body),
+    timeoutMs: mmWaitMs          /* 校验会真的访问墨墨，10s 默认超时不够 */
+  }).then(function (state) {
+    mmForgetInput();             /* 提交成功就抹掉输入框里的明文 */
+    mmRender(state, null);
+    var note = state && state.verify;
+    if (note === "ok") {
+      toast("令牌已保存，校验通过", "ok");
+    } else if (note) {
+      /* 校验失败 ≠ 令牌无效：可能只是网络 / 权限问题，照实报出来。 */
+      toast("令牌已保存，但校验未通过：" + note, "warn");
+    } else {
+      toast("已保存", "ok");
+    }
+  }).catch(function (err) {
+    reportError(err, "保存墨墨令牌");
+  }).then(function () {
+    mmSetBusy("mm-save", false, "", "保存并校验");
+  });
+});
+
+$("mm-clear").addEventListener("click", function () {
+  mmSetBusy("mm-clear", true, "清除中…", "清除令牌");
+  api("/api/v1/maimemo/config", {
+    method: "POST",
+    body: JSON.stringify({ clear: true })
+  }).then(function (state) {
+    mmForgetInput();
+    mmRender(state, null);
+    $("mm-today-box").hidden = true;   /* 令牌没了，旧词表就别留着了 */
+    mmStopPoll();
+    toast("已清除设备上的墨墨令牌", "ok");
+  }).catch(function (err) {
+    reportError(err, "清除墨墨令牌");
+  }).then(function () {
+    mmSetBusy("mm-clear", false, "", "清除令牌");
+  });
+});
+
+$("mm-push").addEventListener("change", function (event) {
+  var box = event.currentTarget;
+  var target = box.checked;
+  box.disabled = true;
+  api("/api/v1/maimemo/config", {
+    method: "POST",
+    body: JSON.stringify({ push: target })
+  }).then(function (state) {
+    mmRender(state, null);
+    toast(target ? "已开启新词推送" : "已关闭新词推送", "ok");
+  }).catch(function (err) {
+    box.checked = !target;    /* 回滚，绝不假装成功 */
+    reportError(err, "保存推送开关");
+  }).then(function () {
+    box.disabled = false;
+  });
+});
+
+/* 同步是异步的：/sync 立刻返回 started，进度要靠轮询 /status 慢慢刷出来。 */
+function mmStopPoll() {
+  if (mmPollTimer) { clearTimeout(mmPollTimer); mmPollTimer = 0; }
+}
+
+function mmPollSync(left) {
+  if (left <= 0) {
+    mmSetBusy("mm-sync", false, "", "立即同步");
+    toast("同步仍在进行，可稍后点「刷新状态」查看进度", "warn");
+    return;
+  }
+  mmPollTimer = setTimeout(function () {
+    loadMaimemo().then(function (state) {
+      if (state && state.synced) {
+        mmStopPoll();
+        mmSetBusy("mm-sync", false, "", "立即同步");
+        toast("同步完成：已学 " + ((state.progress && state.progress.finished) || 0) +
+              " / " + ((state.progress && state.progress.total) || 0), "ok");
+        return;
+      }
+      mmPollSync(left - 1);
+    });
+  }, MM_SYNC_GAP);
+}
+
+$("mm-sync").addEventListener("click", function () {
+  mmStopPoll();
+  mmSetBusy("mm-sync", true, "同步中…", "立即同步");
+  api("/api/v1/maimemo/sync", { method: "POST" }).then(function () {
+    toast("已开始同步，正在等待进度…", "ok");
+    mmPollSync(MM_SYNC_TRIES);
+  }).catch(function (err) {
+    /* 设备对“没令牌”“已在同步中”都回 400，msg 已经把原因写清楚了。 */
+    reportError(err, "开始同步");
+    mmSetBusy("mm-sync", false, "", "立即同步");
+  });
+});
+
+/* 今日词表：设备最多回 64 条，这里只画前 50 行，剩下的用文字说明。 */
+function mmRenderToday(data) {
+  var list = $("mm-today-list");
+  var box = $("mm-today-box");
+  list.textContent = "";
+
+  var items = (data && Array.isArray(data.items)) ? data.items : [];
+  var count = (data && typeof data.count === "number") ? data.count : items.length;
+  var shown = Math.min(items.length, MM_MAX_ROWS);
+
+  setText($("mm-today-head"), "今日词表（" + count + " 词）");
+
+  for (var i = 0; i < shown; i++) {
+    var item = items[i];
+    var row = el("li", "mm-word");
+    row.append(el("span", "sp", item.spelling || "(空)"));
+
+    var chips = el("div", "chips");
+    chips.append(item.is_new ? el("span", "chip mm-new", "新词")
+                             : el("span", "chip mm-plain", "复习"));
+    chips.append(item.is_finished ? el("span", "chip mm-done", "已完成")
+                                  : el("span", "chip mm-plain", "未完成"));
+    row.append(chips);
+    list.append(row);
+  }
+
+  var omitted = items.length - shown;
+  var note = "";
+  if (omitted > 0) {
+    note = "另有 " + omitted + " 个词未显示（本页最多列 " + MM_MAX_ROWS + " 行）。";
+  }
+  if (count > items.length) {
+    /* 设备一次最多回 64 条，词表更长时这里说清楚不是全部。 */
+    note += (note ? " " : "") + "设备本次只返回了前 " + items.length + " 条。";
+  }
+  if (!items.length) {
+    note = "墨墨没有返回今日词表，可能今天还没有学习计划。";
+  }
+  setText($("mm-today-note"), note);
+  box.hidden = false;
+}
+
+$("mm-today").addEventListener("click", function () {
+  /* 没有令牌时后端直接 400，先在本地说清楚，省一次往返。 */
+  if (MM_STATUS && !MM_STATUS.configured) {
+    toast("尚未配置墨墨令牌，请先在上方保存", "warn");
+    $("mm-token").focus();
+    return;
+  }
+  mmSetBusy("mm-today", true, "拉取中…", "拉取今日词表");
+  api("/api/v1/maimemo/today", { timeoutMs: mmWaitMs }).then(function (data) {
+    mmRenderToday(data || {});
+    toast("已拉取 " + (((data && data.count) || 0)) + " 个词", "ok");
+  }).catch(function (err) {
+    reportError(err, "拉取今日词表");
+  }).then(function () {
+    mmSetBusy("mm-today", false, "", "拉取今日词表");
+  });
+});
+
+/* 折叠时不去打扰设备：展开 / 页面回到前台时才拉一次状态。 */
+$("maimemo").addEventListener("toggle", function (event) {
+  if (event.currentTarget.open) { loadMaimemo(); }
+});
+
+/* 助记 / 例句是按词查询的，等词表里的词需要时再取；这里统一给出权限话术。 */
+function mmEnrichNote(data) {
+  if (data && data.unavailable) { return "当前令牌无权读取助记"; }
+  if (data && data.from_cache) { return "来自设备缓存"; }
+  return "";
+}
+
+/* ========================================================================
+   13. SSE：实时推送（EventSource 或带 token 的 fetch 流）+ 轮询兜底
    ======================================================================== */
 
 var sse = { live: false, fails: 0, backoff: 3000, timer: 0, source: null, controller: null, poll: 0 };
@@ -1343,7 +1694,7 @@ function sseHandle(name) {
 }
 
 /* ========================================================================
-   13. 启动
+   14. 启动
    ======================================================================== */
 
 setInterval(function () {
@@ -1366,6 +1717,7 @@ document.addEventListener("visibilitychange", function () {
   if (document.hidden) { return; }
   loadAll();
   loadDevice();
+  if ($("maimemo").open) { loadMaimemo(); }
   if (!sse.live) { sseStart(); }
 });
 
@@ -1376,7 +1728,8 @@ window.addEventListener("pageshow", function (event) {
 });
 window.addEventListener("online", function () { loadAll(); loadDevice(); });
 
-/* 首屏：先渲染“正在读取…”，再取数据，最后连推送。 */
+/* 首屏：先渲染“正在读取…”，再取数据，最后连推送。
+   墨墨面板是折叠的，等用户展开或点刷新时再问设备，避免首屏多占一个 socket。 */
 renderList();
 loadAll();
 loadDevice();

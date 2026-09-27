@@ -47,3 +47,6 @@ cmake-build-*/
 # ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+
+# Build helper log (tools/build.sh)
+build_last.log
