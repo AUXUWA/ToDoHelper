@@ -293,7 +293,7 @@ dependencies:
       type: service
     version: 3.0.3
   espressif/libpng:
-    component_hash: b8c715f76b79a127d9b1b632e09acc23e7b29d2194af890a837adc2be5a2804b
+    component_hash: d094357a329f78668629d7c9656064b2b0123196eb6d25ca77db3782e0752480
     dependencies:
     - name: idf
       require: private
@@ -305,7 +305,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 1.6.58~1
+    version: 1.6.58~2
   espressif/mdns:
     component_hash: b679eafd0acae2066e2645bd91d073e33ca5be515e2545cd3c4e55a3e3bce3cb
     dependencies:

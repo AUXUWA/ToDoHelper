@@ -26,4 +26,16 @@ menu "ToDoHelper: UI core"
             Dropping a .ttf at <storage>/todohelper/fonts/ui.ttf overrides the
             firmware font without reflashing.
 
+    config TODOHELPER_FPS_PROBE
+        bool "Log the measured refresh rate once a second (diagnostic)"
+        depends on ESP_LVGL_ADAPTER_ENABLE_FPS_STATS
+        default n
+        help
+            Enables the adapter's FPS counter and logs "fps N" from the
+            once-a-second status bar timer, so smoothness changes can be judged
+            from measurements rather than impressions.
+
+            Costs a little CPU and one log line per second: keep it off in
+            normal builds, turn it on when comparing before/after.
+
 endmenu
