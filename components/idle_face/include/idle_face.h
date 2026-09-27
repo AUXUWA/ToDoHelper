@@ -27,6 +27,11 @@
  *     still, a lid settle that springs past the resting height after a blink,
  *     an occasional attention perk (eyes widen, pupils constrict - no expression
  *     change), and asymmetric blinks where the two lids differ;
+ *   - three layers break the left/right symmetry that every layer above shares:
+ *     the eyes are lifted a hair by the breath, the two eyes reach a micro-target
+ *     a few tens of ms apart, and - once drowsiness is high - the lids
+ *     occasionally fall all the way shut and ease back up (the "fighting sleep"
+ *     nod, which a fast blink cannot express);
  *   - entering standby keeps the live NORMAL face (see
  *     idle_face_standby_enter()) and leaving it widens the eyes briefly
  *     (idle_face_standby_exit(), driven by the idle page's on_show/on_hide).
