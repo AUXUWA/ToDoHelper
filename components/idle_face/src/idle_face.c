@@ -173,6 +173,43 @@ ESP_EVENT_DEFINE_BASE(IDLE_FACE_EVENT);
 #define IDLE_FACE_BLINK_ASYM_PCT        30
 #define IDLE_FACE_BLINK_ASYM_MAX        0.30f
 
+/*
+ * Deeper idle behaviour (1.2, second batch).
+ *
+ * Every layer above moves *both eyes together*. These three add what a symmetric
+ * rig cannot do:
+ *
+ *   5. breath eye-coupling - the eyes sink and rise a hair with the breath, which
+ *      ties two unrelated animations into one body;
+ *   6. per-eye saccade skew - the two eyes reach a micro-target a few tens of ms
+ *      apart, so they are never perfectly synchronised;
+ *   7. a drowsy nod - at high drowsiness the lids occasionally fall all the way
+ *      shut and come back slowly: the "fighting sleep" beat. This is the payoff
+ *      of the drowsiness layer and only ever runs when it is warranted.
+ */
+
+/** Breath eye-coupling: vertical travel of both eyes per breath, in pixels. */
+#define IDLE_FACE_BREATH_EYE_DY         1.6f
+
+/**
+ * Per-eye saccade skew: the two eyes reach a micro-target a little apart.
+ *
+ * Expressed as a fraction of the travel one eye still owes, so it needs no extra
+ * timer - it simply scales the existing ease for one eye.
+ */
+#define IDLE_FACE_SACCADE_SKEW          0.35f
+#define IDLE_FACE_SACCADE_SKEW_MIN_MS   25
+#define IDLE_FACE_SACCADE_SKEW_MAX_MS   90
+
+/** Drowsy nod: a slow full closure, only once drowsiness is high enough. */
+#define IDLE_FACE_NOD_MIN_DROWSY        0.55f
+#define IDLE_FACE_NOD_MIN_MS            8000    /**< earliest re-arm after a nod */
+#define IDLE_FACE_NOD_MAX_MS            26000
+#define IDLE_FACE_NOD_DUR_MIN_MS        520     /**< lid fully shut at the peak */
+#define IDLE_FACE_NOD_DUR_MAX_MS        900
+/** Chance per opportunity, so a nod stays an event rather than a rhythm. */
+#define IDLE_FACE_NOD_PCT               45
+
 /** Partial (squint) blink: the eyelid only comes part of the way down. */
 #define IDLE_FACE_BLINK_PARTIAL_PCT     28
 #define IDLE_FACE_BLINK_PARTIAL_MIN     0.40f
@@ -309,6 +346,16 @@ static uint32_t s_perk_from_ms;      /**< 0 = no perk running */
 static uint32_t s_settle_from_ms;    /**< 0 = no eyelid settle running */
 /** Per-eye blink depth, so the two lids can differ (0 = left, 1 = right). */
 static float s_eye_lid[2] = { 1.0f, 1.0f };
+
+/* 1.2 batch 2: breath eye-coupling, per-eye saccade skew, drowsy nod */
+/** Per-eye saccade offset, so the two eyes never land at exactly the same time. */
+static float s_saccade_dx_eye[2];
+static float s_saccade_dy_eye[2];
+static uint32_t s_saccade_skew_ms;   /**< remaining skew time; 0 = eyes in sync */
+static int s_saccade_skew_eye;       /**< which eye arrives late this time */
+static uint32_t s_next_nod_ms;       /**< when the next nod may be considered */
+static uint32_t s_nod_from_ms;       /**< 0 = no nod running */
+static uint32_t s_nod_dur_ms;        /**< how long the current nod lasts */
 
 /* standby enter/exit envelope (see idle_face_standby_enter/exit) */
 static uint32_t s_motion_from_ms;
@@ -491,6 +538,44 @@ static bool perk_running(void)
     return s_perk_from_ms != 0;
 }
 
+/**
+ * Drowsy nod: 1.0 means "the lids are fully shut right now".
+ *
+ * Returns the *extra closure* to apply on top of the eye opening, so the caller
+ * can simply multiply the eye height by (1 - nod).
+ *
+ * The curve is deliberately asymmetric: the lid falls over the first 35 % of the
+ * duration and takes the remaining 65 % to come back up, which is what makes it
+ * read as "losing the fight with sleep" instead of a slow blink. It is exactly 0
+ * at both ends, so a nod can never leave an eye stuck shut.
+ */
+static float nod_env(uint32_t now)
+{
+    if (s_nod_from_ms == 0) {
+        return 0.0f;
+    }
+    const uint32_t elapsed = now - s_nod_from_ms;
+    if (elapsed >= s_nod_dur_ms) {
+        s_nod_from_ms = 0;
+        return 0.0f;
+    }
+
+    const float t = (float)elapsed / (float)s_nod_dur_ms;
+    const float fall_end = 0.35f;
+    if (t < fall_end) {
+        /* Falling asleep: smoothstep so the lid accelerates gently. */
+        return smoothstep01(t / fall_end);
+    }
+    /* Waking back up: slower, and eased out so it settles rather than snaps. */
+    return 1.0f - smoothstep01((t - fall_end) / (1.0f - fall_end));
+}
+
+/** True while a nod is in flight (nothing else may take the lids). */
+static bool nod_running(void)
+{
+    return s_nod_from_ms != 0;
+}
+
 static void update_xfade(uint32_t dt_ms)
 {
     s_xfade.elapsed_ms += dt_ms;
@@ -554,6 +639,17 @@ static void apply_params(uint32_t now)
     if (state == IDLE_FACE_BLINK && s_blink_depth < 0.999f) {
         open = 1.0f - (1.0f - open) * s_blink_depth;
     }
+
+    /*
+     * Drowsy nod (1.2 batch 2): a slow full closure applied after everything
+     * else, because it is the strongest "the lid wins" signal - a perk or a
+     * breath must not be able to re-open a lid that is falling asleep. Applied
+     * multiplicatively so it scales whatever height the layers above produced.
+     */
+    const float nod = nod_env(now);
+    if (nod > 0.0f) {
+        open *= 1.0f - nod;
+    }
     open = clampf(open, 0.04f, 1.6f);
 
     const int32_t eye_w = (int32_t)((float)s_eye_base_w * (1.0f + 0.05f * s_current.arc));
@@ -578,11 +674,24 @@ static void apply_params(uint32_t now)
                   clampf(1.0f - (1.0f - open) * lid_r, 0.04f, 1.6f)),
     };
 
-    /* Whole-face drift and the drowsy droop move both eyes (and the X strokes,
-     * which are aligned here as well so they stay in register) together. */
+    /*
+     * Breath eye-coupling (1.2 batch 2): a breathing body moves its eyes with the
+     * chest, so the same sine that scales the eye height also lifts the whole eye
+     * pair a hair. It uses the breath phase already computed above, so there is no
+     * second clock to keep in sync - the two can never drift apart.
+     *
+     * Deliberately tiny (1.6 px): larger reads as the face bobbing rather than
+     * breathing.
+     */
+    const float breath_lift =
+        IDLE_FACE_BREATH_EYE_DY * sinf(breath_phase * 2.0f * (float)M_PI) * motion_env(now);
+
+    /* Whole-face drift, the drowsy droop and the breath lift move both eyes (and
+     * the X strokes, aligned here too so they stay in register) together. */
     const int32_t face_x = (int32_t)s_drift_x;
     const int32_t face_y =
-        (int32_t)(s_current.eye_dy + (IDLE_FACE_DROWSY_EYE_DY * s_drowsy) + s_drift_y);
+        (int32_t)(s_current.eye_dy + (IDLE_FACE_DROWSY_EYE_DY * s_drowsy) + s_drift_y +
+                  breath_lift);
 
     for (int i = 0; i < 2; i++) {
         lv_obj_t *eye = s_face.eye[i];
@@ -637,10 +746,10 @@ static void apply_params(uint32_t now)
             }
             lv_obj_set_style_bg_opa(pupil, (lv_opa_t)(opacity * LV_OPA_COVER), 0);
 
-            /* The table's dx/dy, plus the idle glance, plus a micro-saccade, plus
-             * the continuous gaze wander, plus any perk drift. */
-            float dx = s_current.dx + s_look_dx + s_saccade_dx + s_wander_x;
-            float dy = s_current.dy + s_saccade_dy + s_wander_y;
+            /* The table's dx/dy, plus the idle glance, plus this eye's own
+             * micro-saccade offset, plus the continuous gaze wander. */
+            float dx = s_current.dx + s_look_dx + s_saccade_dx + s_saccade_dx_eye[i] + s_wander_x;
+            float dy = s_current.dy + s_saccade_dy + s_saccade_dy_eye[i] + s_wander_y;
             dx = clampf(dx, -1.0f, 1.0f);
             dy = clampf(dy, -1.0f, 1.0f);
 
@@ -854,6 +963,10 @@ static void tick_behaviour(uint32_t now)
         s_saccade_dy = (float)((int32_t)rand_between(0, 161) - 80) / 1000.0f;
         s_saccade_hold_ms = rand_between(220, 700);
         s_saccade_from_ms = now;
+        /* One eye arrives late, and which one is re-rolled every time. */
+        s_saccade_skew_eye = (int)(esp_random() & 1u);
+        s_saccade_skew_ms = rand_between(IDLE_FACE_SACCADE_SKEW_MIN_MS,
+                                         IDLE_FACE_SACCADE_SKEW_MAX_MS);
         schedule_next_saccade(now);
     }
 
@@ -1074,6 +1187,30 @@ esp_err_t idle_face_tick(uint32_t now_ms)
     }
 
     /*
+     * Per-eye saccade skew (1.2 batch 2): the two eyes land on a micro-target a
+     * few tens of milliseconds apart, so they are never perfectly synchronised.
+     *
+     * Implemented as a decaying offset on one eye rather than a second state
+     * machine: when the shared saccade fires, one eye gets a small extra offset
+     * that bleeds away over ~60 ms. Which eye lags is chosen at random each time,
+     * otherwise the same eye would always arrive late and that becomes the tell.
+     */
+    if (s_saccade_skew_ms > 0) {
+        const float remain = (float)s_saccade_skew_ms / (float)IDLE_FACE_SACCADE_SKEW_MAX_MS;
+        s_saccade_dx_eye[s_saccade_skew_eye] =
+            s_saccade_dx * IDLE_FACE_SACCADE_SKEW * remain;
+        s_saccade_dy_eye[s_saccade_skew_eye] =
+            s_saccade_dy * IDLE_FACE_SACCADE_SKEW * remain;
+        s_saccade_dx_eye[1 - s_saccade_skew_eye] = 0.0f;
+        s_saccade_dy_eye[1 - s_saccade_skew_eye] = 0.0f;
+    } else {
+        s_saccade_dx_eye[0] = 0.0f;
+        s_saccade_dy_eye[0] = 0.0f;
+        s_saccade_dx_eye[1] = 0.0f;
+        s_saccade_dy_eye[1] = 0.0f;
+    }
+
+    /*
      * Slow layers (1.1): drowsiness, head drift and pupil dilation.
      *
      * They share one property: they change over seconds to minutes, not frames,
@@ -1095,6 +1232,41 @@ esp_err_t idle_face_tick(uint32_t now_ms)
         s_drowsy -= (float)dt_ms / (float)IDLE_FACE_DROWSY_FALL_MS;
         if (s_drowsy < 0.0f) {
             s_drowsy = 0.0f;
+        }
+    }
+
+    /*
+     * Drowsy nod (1.2 batch 2): the payoff of the drowsiness layer. Once the face
+     * is properly sleepy it occasionally loses the fight and the lids fall all the
+     * way shut before easing back up - something no blink can express, because a
+     * blink is fast and this is slow.
+     *
+     * Gated three ways so it stays an event rather than a rhythm: it needs high
+     * drowsiness, it re-arms on a long random interval, and each opportunity only
+     * fires with NOD_PCT probability. It also never interrupts a blink, a glance
+     * or a mood, and never runs during an expression.
+     */
+    if (s_saccade_skew_ms > 0) {
+        const uint32_t step = (dt_ms < s_saccade_skew_ms) ? dt_ms : s_saccade_skew_ms;
+        s_saccade_skew_ms -= step;
+    }
+
+    if (!nod_running() && neutral_face && s_blink_until_ms == 0 && s_look_until_ms == 0 &&
+        !s_antic_active && !perk_running()) {
+        if (s_next_nod_ms == 0) {
+            s_next_nod_ms = now_ms + rand_between(IDLE_FACE_NOD_MIN_MS, IDLE_FACE_NOD_MAX_MS);
+        } else if ((int32_t)(now_ms - s_next_nod_ms) >= 0) {
+            if (s_drowsy >= IDLE_FACE_NOD_MIN_DROWSY &&
+                (esp_random() % 100u) < IDLE_FACE_NOD_PCT) {
+                s_nod_dur_ms = rand_between(IDLE_FACE_NOD_DUR_MIN_MS, IDLE_FACE_NOD_DUR_MAX_MS);
+                s_nod_from_ms = now_ms;
+                /* A nod owns the lids, so nothing may blink across it. */
+                s_blink_until_ms = 0;
+                schedule_next_blink(now_ms + s_nod_dur_ms + IDLE_FACE_BLINK_MIN_MS);
+                SYS_LOGD(TAG, "drowsy nod for %u ms (drowsy %u%%)",
+                         (unsigned)s_nod_dur_ms, (unsigned)(s_drowsy * 100.0f));
+            }
+            s_next_nod_ms = now_ms + rand_between(IDLE_FACE_NOD_MIN_MS, IDLE_FACE_NOD_MAX_MS);
         }
     }
 
@@ -1199,6 +1371,8 @@ esp_err_t idle_face_set_state(idle_face_state_t state)
     s_settle_from_ms = 0;
     s_eye_lid[0] = 1.0f;
     s_eye_lid[1] = 1.0f;
+    s_nod_from_ms = 0;
+    s_saccade_skew_ms = 0;
     const uint32_t now = now_ms32();
     s_next_perk_ms = 0;
     schedule_next_blink(now);
@@ -1243,6 +1417,8 @@ esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms)
     s_settle_from_ms = 0;
     s_eye_lid[0] = 1.0f;
     s_eye_lid[1] = 1.0f;
+    s_nod_from_ms = 0;
+    s_saccade_skew_ms = 0;
 
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
                             &state, sizeof(state));
@@ -1303,6 +1479,8 @@ esp_err_t idle_face_standby_enter(void)
     s_settle_from_ms = 0;
     s_eye_lid[0] = 1.0f;
     s_eye_lid[1] = 1.0f;
+    s_nod_from_ms = 0;
+    s_saccade_skew_ms = 0;
     s_next_perk_ms = now + rand_between(IDLE_FACE_PERK_MIN_MS, IDLE_FACE_PERK_MAX_MS);
     s_wander_x = 0.0f;
     s_wander_y = 0.0f;
@@ -1358,6 +1536,8 @@ esp_err_t idle_face_standby_exit(void)
     s_settle_from_ms = 0;
     s_eye_lid[0] = 1.0f;
     s_eye_lid[1] = 1.0f;
+    s_nod_from_ms = 0;
+    s_saccade_skew_ms = 0;
     s_next_perk_ms = 0;
 
     s_state = IDLE_FACE_NORMAL;
