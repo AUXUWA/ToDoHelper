@@ -5,16 +5,32 @@
 > 配套阅读顺序：**本文档 → `AGENT.md`（环境/命令/全部实测坑，尤其 §9.0~§9.0.5、§9.7）→
 > `docs/TODOHELPER_REQUIREMENTS.md`（需求）→ `docs/TODOHELPER_FRAMEWORK.md`（框架）→ `docs/API.md`（组件与 HTTP 接口）**。
 >
-> 最后更新：**`v1.1.0`** —— 待机动画"慢动作三层" + 切页交叉淡入（另修掉 3 个顺带发现的真 bug）。
+> 最后更新：**`v1.2.0`** —— 系统流畅度优化第一轮（消除 LVGL 锁内阻塞 I/O + 高频无效重绘）。
 > 提交与标签见 §6；版本变更细节见 `CHANGELOG.md`。
 
 ---
 
 ## 0. 一句话现状
 
-**版本 `1.1.0`。8 项需求全部实现；构建 0 错误 0 警告；两个阻塞性缺陷已定位到真实根因并修复；
-用户已目视确认 1.0.0 的四项体验**与 1.1 的两项新动画（待机慢动作三层、开机交接淡入）。
+**版本 `1.2.0`。8 项需求全部实现；构建 0 错误 0 警告；两个阻塞性缺陷此前已修复；
+本轮修掉"界面卡顿"的全部真实根因（含一次上机实测到的 `interrupt wdt timeout`）。
 当前没有已知阻塞问题。**
+
+本轮（流畅度）的成果与判据：
+
+| 项 | 修前 | 修后 |
+|---|---|---|
+| 点"校时" | 持 LVGL 锁等待网络，**最多冻屏 10 s**，并连带冻住整个事件系统 | 异步（`th_ntp` 任务）+ 结果 toast，回调立即返回 |
+| 单词评分 / 调词数 / 切时区 | 持锁做 cJSON 序列化 + SD 整文件重写 / NVS flash 写 | 异步，200 ms 级合并写入 |
+| 事件投递 | 发布者取 LVGL 锁（事件循环与渲染互相阻塞） | 无锁队列 + 20 ms 排空 timer，彻底解耦 |
+| 常驻重绘 | 状态栏每秒 4 标签 + 4 改色；首页/日历各 1 Hz；设置页滑杆 4 Hz 且**定时器泄漏** | 全部加脏检查；泄漏定时器在 `on_hide` 暂停 |
+| 冷启动 | 9 模块 ready | 9 模块 ready，`internal 66 KB / largest 22 KB`（与修前持平） |
+| 压力复现 | DNS 失败 + 通知突发 → **interrupt wdt panic** | 复现 ×3，0 panic |
+
+> **最重要的认知**（已写入 `AGENT.md §9.0.1.1`，改 UI 前必读）：适配器在**持有递归锁**
+> 的情况下调用 `lv_timer_handler()`，所以 `lv_timer` 回调与**所有控件事件回调都在锁内**。
+> 回调里出现 SD / flash / 网络调用就是 bug。
+
 
 两个已修缺陷（都在 1.0.0，都被更早的交接文档误判过）：
 
@@ -315,10 +331,21 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
    样式写，**不要**另起一套。
 5. 若用户反馈"插拔卡数据丢失"不可接受：把待办存储固定在片内存储，只把词库/字体放卡上
    （需要看 `storage_manager` 的根选择逻辑）。
-6. **加功能前先看内部 RAM 余量**：本次实测 boot complete 只剩 `internal 67 KB / largest 24 KB`
-   （`int-low 55 KB`），明显低于 `AGENT.md §8` 记录的上一版基线（118 KB / 74 KB）。
-   任何批量数据都必须显式 `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）；SSE 这类
-   每客户端一个任务的设计也要算进内部 RAM（每客户端 3 KB）。
+6. **加功能前先看内部 RAM 余量**：v1.2.0 实测 boot complete 为
+   `internal 66 KB / largest 22 KB`（`int-low 54 KB`）。任何批量数据都必须显式
+   `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）；SSE 这类每客户端一个任务的设计
+   也要算进内部 RAM（每客户端 3 KB）。**判据是 largest 与 int-low，不是总空闲量。**
+7. **流畅度还剩两批没做**（第一轮已完成，见 §0）：
+   - **第二批（结构性，收益中等）**：`page_splash` 每 100 ms 重建 >5 KB 日志文本并强制
+     `lv_obj_update_layout()`；`page_todo` 用 `lv_obj_clean()` + 全量重建（每项 5~7 个
+     对象 × 最多 256 项，勾选一项等于整页重建）；`page_ai_chat` 每个流式 chunk 都
+     `lv_obj_scroll_to_view(..., LV_ANIM_ON)` 导致动画堆积。
+   - **第三批（体验微调）**：切页交叉淡入对两个 800×480 容器动画 `opa`，是 SW 渲染最贵的
+     路径（位移便宜、整屏透明度贵）；`ui_fonts` 从 SD 卡 TTF 初始化 4 个独立 FreeType face
+     （16/20/28/48 px），48 px 只用于天气温度一个 label。
+   - **HTTP 侧**：`/api/v1/ai/chat/stream`（以及阻塞版）、`/api/v1/weather/refresh`（等 20 s）、
+     `/api/v1/calendar/sync`（等 10 s）仍是同步 handler，会串行化唯一 httpd 任务。
+     修法照 `sync_server.c` 的 `events_get_handler()` + `sse_client_task()`。
 
 ---
 
@@ -336,5 +363,22 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 | 开机日志缓冲 | `components/sys_utils/src/sys_log.c`、`include/sys_log.h` |
 | 开机日志页面 | `components/ui_pages/src/page_splash.c` |
 | 词库与进度 | `components/word_service/src/word_service.c`（`progress_key()`、`parse_book()`） |
+| **流畅度：事件投递与页面框架** | `components/ui_core/src/ui_core.c`（`ui_post_event()` / `ui_event_drain_cb()` 无锁队列） |
+| **流畅度：状态栏脏检查** | `components/ui_core/src/ui_statusbar.c` |
+| **流畅度：异步校时** | `components/calendar_service/src/calendar_service.c`（`calendar_sync_ntp_async()`、`sync_worker`） |
+| **流畅度：异步落盘** | `components/word_service/src/word_service.c`（`word_save_progress_async()`、`word_save_worker`） |
 | HTTP 路由总览 | `docs/API.md` |
 | 网页上位机 | `components/sync_server/web/index.html` |
+
+---
+
+## 9. 已知的文档不一致（尚未修，留待下次）
+
+- `AGENT.md §9.0` 第 4 条写"本工程用 32 KB 且 `stack_in_psram=true`"，但
+  `components/bsp/src/th_bsp.c` 实际设的是 **`stack_in_psram = false`**，且该文件有
+  详细注释说明为什么必须 false（UI 任务会写 NVS，flash 写期间 cache 关闭使 PSRAM 栈
+  不可访问 → `esp_task_stack_is_sane_cache_disabled()` 断言）。**以代码注释为准**，
+  `AGENT.md` 那句需要回改。
+- `AGENT.md §8` 的内部 RAM 预算表已被同文件新增的"v1.2.0 现行基线"一行取代为判据，
+  两处数值一致（66/22/54 vs 67/24/55），不需要回改，但表头年份可更新。
+

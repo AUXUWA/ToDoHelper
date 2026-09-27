@@ -309,6 +309,10 @@ Project build complete.
 | `ai_service` | 67 KB | 24 KB | 10613 KB | 55 KB |
 | `boot complete` | **67 KB** | **24 KB** | 10293 KB | **55 KB** |
 
+> **v1.2.0 现行基线**（2026-09 流畅度优化后实测，同一张卡）：`boot complete`
+> **internal 66 KB / largest 22 KB / int-low 54 KB**，`storage=/sdcard`。与上表基本一致，
+> 说明「异步化 + 脏检查」没有吃掉内部 RAM（新增任务都是按需创建、平时不占栈）。
+
 > 每一行由 `sys_heap_log()` 在 `app_main` 里输出。**排障时看「最大连续块」而不是总空闲量**：
 > 首轮上机出现的全部 `ESP_ERR_NO_MEM` 都是内部 RAM 碎片化造成的——总空闲看着还有十几 KB，
 > 但最大连续块是 0，于是 WiFi / mDNS / I2S DMA / SDMMC DMA 全线失败。
@@ -462,6 +466,59 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
   的 `events_get_handler()` + `sse_client_task()`（每客户端一个 3 KB 任务、一个队列）。
   **同类隐患仍在**：`ai_service_http.c` 的 `/api/v1/ai/chat/stream`（以及阻塞版
   `/api/v1/ai/chat`）在一次 AI 回复期间会把整台设备的 HTTP 全部堵住 —— 修法同上。
+
+### 9.0.1.1 流畅度五条铁律（v1.2.0 加入，**改 UI 前必读**）
+
+这五条是"界面卡顿/掉帧"的全部真实根因，都已在真机复现并修掉。它们是 §9.0.1
+那两条锁规则的直接推论。
+
+1. **`lv_timer` 回调与所有控件事件回调都在 LVGL 锁内运行。**
+   适配器是这么驱动渲染的（`esp_lv_adapter.c`）：
+   ```c
+   if (esp_lv_adapter_lock(-1) == ESP_OK) {
+       next_delay_ms_raw = lv_timer_handler();   /* 锁内！ */
+       esp_lv_adapter_unlock();
+   }
+   ```
+   所以**回调里做任何同步 I/O 都等于冻结整个 UI**。
+   - 实测最坏例子：`page_calendar` / `page_settings` 的"校时"按钮直接调
+     `calendar_sync_ntp(0)` → `esp_netif_sntp_sync_wait(10 s)`，持锁最多 **10 秒**
+     零重绘，并且因为 `ui_post_event()` 当时也要取同一把锁，**整个事件系统一起冻住**。
+   - → 校时用 `calendar_sync_ntp_async()`（结果走 `CALENDAR_EVENT_SYNC_RESULT` 事件）；
+     落盘用 `word_save_progress_async()`；NVS/flash 写放一次性任务。
+   - 判据：**回调里出现 SD 卡 / flash / 网络调用就是 bug。**
+     `calendar_sync_ntp()` 与 `word_save_progress()` 的头注释都写明了"禁止在 LVGL 任务调用"。
+
+2. **`lv_label_set_text*()` 即使文本完全相同也会 invalidate 对象。**
+   任何周期性刷新都必须先比较再写。曾经的代价：状态栏 4 个标签 + 4 次改色每秒无脑重写，
+   首页/日历/设置页各自再来一遍 → 整屏每秒重排，所有动画都被拖着。
+   → 模式：缓存上次渲染值（字符串或字段），相同就 `return`。
+   `ui_statusbar.c` / `page_home.c` / `page_calendar.c` / `page_wifi.c` /
+   `page_settings.c` 都已按此改写。
+
+3. **`lv_async_call()` 的池很小，不要用它做批量投递。**
+   跨任务投递事件时若对每个节点调一次 `lv_async_call()`，通知突发（启动期 DNS 失败洪峰、
+   WiFi 重连）会打满该池，循环退化成反复 malloc/free 并与 LVGL 内部锁叠加。真机实测复现
+   过一次 **interrupt wdt timeout**（`MCAUSE=0x18`，两核栈都在 `vListInsert` /
+   `xQueueSemaphoreTake`）。
+   → 正确做法见 `ui_core.c` 的 `ui_event_drain_cb()`：**无锁单链表 + 一个 20 ms
+   `lv_timer`，在回调内直接派发**（该回调本就在 LVGL 任务里且已持锁，正是 handler
+   需要的上下文）。队列有上限（64），满了丢事件并告警——丢通知可接受，阻塞发布者不可接受。
+
+4. **定时器要有主。**
+   `page_settings` 曾经 `lv_timer_create(settings_tick, 250, NULL)` **不保存句柄**：
+   页面隐藏后它仍在 4 Hz 重写 4 个标签，且永不释放。现在句柄存 `s_slider_timer`、
+   `on_hide` 里 `lv_timer_pause()`、`on_show` 里 resume。
+   → 页面级定时器一律保存句柄并实现 `on_hide`（`ui_core` 会暂停 `on_tick`，
+   但**不管你自己创建的 timer**）。
+
+5. **整屏 alpha 淡入是软件渲染最贵的操作。**
+   `ui_core` 的切页交叉淡入对两个 800×480 容器同时动画 `opa`，12~15 帧走混合路径
+   （每个像素读-改-写）。位移很便宜，整屏不透明度很贵。若后续还要压帧率，
+   这里是第一个该动的地方（降时长短/只保留位移）。
+
+**测量**：`CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS=y` 已开，可用
+`esp_lv_adapter_fps_stats_enable()` + `esp_lv_adapter_get_fps()`（`esp_lv_adapter.h`）打点。
 
 ### 9.0.2 日志：`esp_log_writev()` 是无前缀、无换行的原样输出
 

@@ -6,6 +6,56 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.2.0] — 2026-09-24
+
+**系统流畅度优化（第一轮：消除锁内阻塞 I/O + 高频无效重绘）。** 需求条目没有变化，
+改的是"界面跟不跟手"这件事。**没有破坏性变更**：HTTP API、NVS 键语义、存储格式全部不变。
+
+根因一句话：**适配器在持有递归锁的情况下调用 `lv_timer_handler()`，所以所有 `lv_timer`
+回调与控件事件回调都在锁内运行**，回调里任何同步 I/O 都会冻结整个 UI。详见新增的
+`AGENT.md §9.0.1.1`（流畅度五条铁律）。
+
+### Fixed
+- **点"校时"会冻屏最多 10 秒**（`page_calendar` / `page_settings`）：点击回调直接调
+  `calendar_sync_ntp(0)` → `esp_netif_sntp_sync_wait()`，持锁等待网络往返；而且因为
+  `ui_post_event()` 当时要取同一把锁，**整个事件系统一起冻住**（SSE、待机表情、
+  各服务的事件消费者全部停摆）。
+- **每次单词评分都会卡一下**（`page_word` → `word_review` → `word_save_progress`）：
+  持锁做 cJSON 序列化 + SD 卡整文件重写（open→write→remove→rename）。设置页的
+  "每日单词数 ±5"、时区切换（NVS flash 写）同理。
+- **设置页的 250 ms 滑杆定时器永不释放**：句柄没保存、页面隐藏后仍以 4 Hz 重写 4 个标签。
+  现在保存句柄、`on_hide` 暂停、`on_show` 恢复，且值没变就不写。
+- **上机实测的一次 `interrupt wdt timeout`**（`MCAUSE=0x18`，两核栈都在
+  `vListInsert`/`xQueueSemaphoreTake`；触发条件是"WiFi 切换期 DNS 失败 + 通知突发"）：
+  事件排空对每个节点调一次 `lv_async_call()`，打满其小固定池后退化为反复 malloc/free。
+  改为在排空回调内直接派发（见 Changed）。
+
+### Changed
+- **事件投递改为无锁队列**（`ui_core.c`）：`ui_post_event()` 不再取 LVGL 锁，只把节点挂到
+  单链表（短临界区），由 ui_core 自己的 20 ms `lv_timer` 在 LVGL 任务内排空并派发。
+  队列上限 64，满了丢事件并告警（丢通知可接受，阻塞发布者不可接受）。发布者
+  （事件循环 / 各 worker）与渲染任务彻底解耦，不再有双向阻塞。
+- **新增异步 API**：
+  - `calendar_sync_ntp_async()` + `CALENDAR_EVENT_SYNC_RESULT` 事件；校时跑在按需创建的
+    `th_ntp` 任务（3072 B / prio 4）上，UI 用 toast 呈现结果。
+  - `word_save_progress_async()`：600 ms 合并窗口，连续评分 / 连点只写一次卡；
+    `word_review()` / `word_set_daily_count()` / `word_reset_progress()` 全部改走它。
+  - 时区 NVS 提交改由一次性任务 `th_tz` 执行（flash 写会短暂关闭 cache）。
+- **所有周期性 label 刷新加脏检查**（文本 / 字段不变则不写；`lv_label_set_text*` 即使文本
+  相同也会 invalidate 对象并触发重排）：状态栏 4 个标签、首页 summary 与时钟、日历时钟、
+  WiFi 状态块、设置页信息块。状态栏此前每秒无脑重写 4 标签 + 4 次改色。
+- `calendar_sync_ntp()` 与 `word_save_progress()` 的**头注释明确标注"禁止在 LVGL 任务调用"**，
+  避免后来人再把同步版本接回 UI 路径。
+
+### 实测（COM34，插卡 `root=/sdcard`）
+- 冷启动 ×4：`abort=0`、9 模块全 ready、`boot complete internal 66 KB (largest 22 KB)`、
+  `int-low 54 KB` —— 与优化前的 67/24/55 KB 持平，说明异步化没有吃掉内部 RAM
+  （新任务都是按需创建、平时不占栈）。
+- 触发条件复现 ×3（DNS 失败 + 12 路并发写 + weather/calendar 通知）：0 panic。
+- HTTP 端到端：8 路并发 POST 全部落库、GET/DELETE 正常，设备稳定。
+
+---
+
 ## [1.1.0] — 2026-09-23
 
 **待机动画与开机交接动画的增强。** 需求条目没有变化，改的是"看起来像活的"这件事。
