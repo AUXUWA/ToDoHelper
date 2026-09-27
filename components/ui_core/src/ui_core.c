@@ -467,6 +467,19 @@ static void page_anim_reset(lv_obj_t *page)
     lv_obj_set_style_opa(page, LV_OPA_COVER, 0);
 }
 
+/**
+ * Bring the incoming page in.
+ *
+ * Deliberately **translate only, fully opaque**. Animating `opa` on a full-screen
+ * 800x480 container forces every pixel of the page through the alpha-blended
+ * path for 12-15 frames, which is the single most expensive thing the software
+ * renderer can be asked to do (smoothness audit: "整屏 alpha 淡入"). Position is
+ * cheap - LVGL only has to redraw the union of the old and new areas.
+ *
+ * The cross-fade impression is kept by the *outgoing* page fading out underneath
+ * (see page_animate_out): the new page slides over a page that is dissolving,
+ * which reads as a transition without ever blending the incoming tree.
+ */
 static void page_animate_in(lv_obj_t *page)
 {
     /* Re-entering a page quickly must not stack animations on it (and must cancel
@@ -481,22 +494,20 @@ static void page_animate_in(lv_obj_t *page)
     lv_anim_set_exec_cb(&anim, page_anim_translate_cb);
     lv_anim_set_values(&anim, UI_PAGE_ANIM_OFFSET, 0);
     lv_anim_start(&anim);
-
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, page);
-    lv_anim_set_duration(&anim, UI_PAGE_ANIM_MS);
-    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&anim, page_anim_opa_cb);
-    lv_anim_set_values(&anim, LV_OPA_TRANSP, LV_OPA_COVER);
-    lv_anim_start(&anim);
 }
 
 /**
- * Fade the page we are leaving out and hide it when it is done.
+ * Move the page we are leaving aside and hide it when the window closes.
  *
- * The container keeps rendering its last frame for UI_PAGE_ANIM_OUT_MS, which is
- * the window a page gets to finish an exit animation: the idle face widens its
- * eyes in it (idle_face_standby_exit()), the boot log simply fades away.
+ * The container keeps rendering for UI_PAGE_ANIM_OUT_MS, which is the window a
+ * page gets to finish an exit animation: the idle face widens its eyes in it
+ * (idle_face_standby_exit()), the boot log simply drifts away. The window itself
+ * is load-bearing - do not shorten it without checking the idle face.
+ *
+ * This used to also animate `opa` to transparent. Since the incoming page is now
+ * opaque and slides over the top, that fade was mostly invisible yet still sent a
+ * full 800x480 tree through the alpha-blend path every frame. It keeps the drift
+ * (cheap: only the moved strip is redrawn) and drops the fade.
  */
 static void page_animate_out(lv_obj_t *page)
 {
@@ -510,14 +521,8 @@ static void page_animate_out(lv_obj_t *page)
     lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
     lv_anim_set_exec_cb(&anim, page_anim_drift_cb);
     lv_anim_set_values(&anim, 0, UI_PAGE_ANIM_OUT_OFFSET);
-    lv_anim_start(&anim);
-
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, page);
-    lv_anim_set_duration(&anim, UI_PAGE_ANIM_OUT_MS);
-    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
-    lv_anim_set_exec_cb(&anim, page_anim_opa_cb);
-    lv_anim_set_values(&anim, LV_OPA_COVER, LV_OPA_TRANSP);
+    /* The exit window ends by hiding the page; this is the only animation whose
+     * completion matters, so it carries the callback. */
     lv_anim_set_completed_cb(&anim, page_anim_out_done);
     lv_anim_start(&anim);
 }

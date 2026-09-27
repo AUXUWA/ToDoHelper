@@ -14,6 +14,8 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "calendar_service.h"
 #include "http_router.h"
@@ -109,16 +111,57 @@ static esp_err_t month_get_handler(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t sync_post_handler(httpd_req_t *req)
+/**
+ * POST /api/v1/calendar/sync - start an NTP sync and answer when it lands.
+ *
+ * The handler must not run the sync inline. esp_http_server executes every URI
+ * handler in the **single** httpd task, so `calendar_sync_ntp(0)` waiting up to
+ * 10 s would serialize the whole HTTP server for that long - the same defect the
+ * SSE endpoint hit, where one slow handler made the device look unreachable
+ * (AGENT.md 9.0.1). Instead the socket is detached with
+ * httpd_req_async_handler_begin() and a short-lived task owns the reply.
+ */
+#define CAL_SYNC_TASK_STACK 3072
+#define CAL_SYNC_TASK_PRIO  4
+
+static void cal_sync_respond_task(void *arg)
 {
-    esp_err_t err = calendar_sync_ntp(0);
+    httpd_req_t *req = (httpd_req_t *)arg;
+
+    /* Blocking is fine here: this task exists only to wait for the sync. */
+    const esp_err_t err = calendar_sync_ntp(0);
     if (err != ESP_OK) {
-        return http_reply_err(req, 503, "NTP sync failed (is the network up?)");
+        (void)http_reply_err(req, 503, "NTP sync failed (is the network up?)");
+    } else {
+        char data[64];
+        snprintf(data, sizeof(data), "{\"synced\":true,\"ts\":%lld}",
+                 (long long)sys_time_ts());
+        (void)http_reply_ok(req, data);
     }
 
-    char data[64];
-    snprintf(data, sizeof(data), "{\"synced\":true,\"ts\":%lld}", (long long)sys_time_ts());
-    return http_reply_ok(req, data);
+    /* Frees the session slot; skipping this eventually stops accept() entirely
+     * (the IDF header is explicit about it). */
+    (void)httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t sync_post_handler(httpd_req_t *req)
+{
+    httpd_req_t *async_req = NULL;
+    /* After this call `req` may no longer be used. */
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        return http_reply_unavailable(req, "async handler unavailable");
+    }
+
+    if (xTaskCreate(cal_sync_respond_task, "th_ntp_http", CAL_SYNC_TASK_STACK,
+                    async_req, CAL_SYNC_TASK_PRIO, NULL) != pdPASS) {
+        (void)httpd_resp_set_status(async_req, "503 Service Unavailable");
+        (void)httpd_resp_send(async_req, "no memory for sync task", HTTPD_RESP_USE_STRLEN);
+        (void)httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t time_post_handler(httpd_req_t *req)

@@ -14,6 +14,8 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "http_router.h"
 #include "weather_internal.h"
@@ -84,34 +86,78 @@ static esp_err_t weather_get_handler(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t refresh_post_handler(httpd_req_t *req)
+/**
+ * POST /api/v1/weather/refresh - trigger a fetch and answer when it lands.
+ *
+ * weather_refresh() waits up to WEATHER_REFRESH_WAIT_MS (20 s) for the worker.
+ * esp_http_server runs every handler in the single httpd task, so doing that
+ * inline serializes all HTTP for 20 s (AGENT.md 9.0.1). The socket is detached
+ * with httpd_req_async_handler_begin() and a short-lived task owns the reply.
+ */
+#define WEATHER_HTTP_TASK_STACK 4096
+#define WEATHER_HTTP_TASK_PRIO  4
+
+static void weather_refresh_respond_task(void *arg)
 {
-    esp_err_t err = weather_refresh();
+    httpd_req_t *req = (httpd_req_t *)arg;
+
+    /* Blocking is fine here: this task exists only to wait for the fetch. */
+    const esp_err_t err = weather_refresh();
     switch (err) {
     case ESP_OK:
         break;
     case ESP_ERR_NOT_FOUND:
-        return http_reply_bad_request(req, "city not set: POST /api/v1/weather/city first");
+        (void)http_reply_bad_request(req, "city not set: POST /api/v1/weather/city first");
+        goto done;
     case ESP_ERR_INVALID_STATE:
-        return http_reply_unavailable(req, "offline, showing the cached reading");
+        (void)http_reply_unavailable(req, "offline, showing the cached reading");
+        goto done;
     case ESP_ERR_TIMEOUT:
-        return http_reply_unavailable(req, "weather API did not answer in time");
+        (void)http_reply_unavailable(req, "weather API did not answer in time");
+        goto done;
     default:
-        return http_reply_unavailable(req, esp_err_to_name(err));
+        (void)http_reply_unavailable(req, esp_err_to_name(err));
+        goto done;
     }
 
     weather_data_t data;
     if (weather_get(&data) != ESP_OK) {
-        return http_reply_unavailable(req, "no reading available");
+        (void)http_reply_unavailable(req, "no reading available");
+        goto done;
     }
 
     char *json = weather_to_json(&data);
     if (json == NULL) {
-        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "weather");
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "weather");
+        goto done;
     }
-    err = http_reply_ok(req, json);
+    (void)http_reply_ok(req, json);
     cJSON_free(json);
-    return err;
+
+done:
+    /* Frees the session slot; skipping this eventually stops accept() entirely
+     * (the IDF header is explicit about it). */
+    (void)httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t refresh_post_handler(httpd_req_t *req)
+{
+    httpd_req_t *async_req = NULL;
+    /* After this call `req` may no longer be used. */
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        return http_reply_unavailable(req, "async handler unavailable");
+    }
+
+    if (xTaskCreate(weather_refresh_respond_task, "th_wx_http", WEATHER_HTTP_TASK_STACK,
+                    async_req, WEATHER_HTTP_TASK_PRIO, NULL) != pdPASS) {
+        (void)httpd_resp_set_status(async_req, "503 Service Unavailable");
+        (void)httpd_resp_send(async_req, "no memory for refresh task", HTTPD_RESP_USE_STRLEN);
+        (void)httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t city_post_handler(httpd_req_t *req)
@@ -141,9 +187,13 @@ static esp_err_t city_post_handler(httpd_req_t *req)
         return http_reply_esp_error(req, err, "set city");
     }
 
-    /* Refresh right away so the caller sees the effect; a failure is not fatal
-     * because the city is already stored and the timer will retry. */
-    (void)weather_refresh();
+    /* Refresh right away so the effect is visible; a failure is not fatal
+     * because the city is already stored and the timer will retry.
+     *
+     * Async on purpose: weather_refresh() waits up to 20 s for the worker and
+     * this handler runs in the single httpd task (AGENT.md 9.0.1). The result is
+     * discarded here anyway, so waiting for it was pure latency. */
+    (void)weather_refresh_async();
 
     weather_data_t data;
     if (weather_get(&data) == ESP_OK) {
@@ -182,9 +232,10 @@ static esp_err_t locate_post_handler(httpd_req_t *req)
         return http_reply_err(req, 502, "geolocation provider unreachable");
     }
 
-    /* Detection only sets the coordinates; fetch the reading before answering so
-     * the caller sees the result of the whole operation. */
-    (void)weather_refresh();
+    /* Detection only sets the coordinates. Kick the fetch off asynchronously
+     * rather than waiting 20 s for it inside the httpd task; the reading arrives
+     * via WEATHER_EVENT_UPDATED (or the next GET). */
+    (void)weather_refresh_async();
 
     weather_data_t data;
     if (weather_get(&data) != ESP_OK) {
