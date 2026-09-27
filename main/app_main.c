@@ -28,6 +28,7 @@
 #include "ai_service.h"
 #include "calendar_service.h"
 #include "idle_face.h"
+#include "maimemo_client.h"
 #include "storage_manager.h"
 #include "sync_server.h"
 #include "sys_utils.h"
@@ -59,6 +60,9 @@ static const app_module_t s_modules[] = {
     { .name = "todo_manager",     .init = todo_manager_init, .optional = true,  .after_ui = true },
     { .name = "weather_service",  .init = weather_service_init, .optional = true,  .after_ui = true },
     { .name = "calendar_service", .init = calendar_service_init, .optional = true, .after_ui = true },
+    /* Before word_service: the cloud queue (plan A) reads the token and the
+     * enrichment cache, so its config and lock must already exist. */
+    { .name = "maimemo_client",   .init = maimemo_client_init, .optional = true,  .after_ui = true },
     { .name = "word_service",     .init = word_service_init, .optional = true,  .after_ui = true },
     { .name = "sync_server",      .init = sync_server_init, .optional = true,  .after_ui = true },
     { .name = "idle_face",        .init = idle_face_init, .optional = true,  .after_ui = true },
@@ -222,6 +226,22 @@ void app_main(void)
     }
 
     (void)run_modules(true);
+
+    /*
+     * Plan A: once WiFi and the word service are up, pull today's plan and the
+     * real progress from MaiMemo in the background. This is deliberately after
+     * the UI is interactive: the fetch is blocking TLS and the user should never
+     * wait for a network round trip to see their home screen. It no-ops when no
+     * token is configured or cloud mode is off, so the offline path is unaffected.
+     */
+    if (word_cloud_mode()) {
+        esp_err_t sync_err = maimemo_sync_start();
+        if (sync_err != ESP_OK) {
+            SYS_LOGW(TAG, "maimemo sync not started: %s", esp_err_to_name(sync_err));
+        } else {
+            SYS_LOGI(TAG, "maimemo sync started (cloud queue)");
+        }
+    }
 
     /* Do not touch the status bar from here: ui_core owns it, and LVGL must only
      * be driven from the LVGL task or under the lock. Ask for a refresh instead. */

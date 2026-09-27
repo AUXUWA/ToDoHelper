@@ -40,8 +40,21 @@ typedef esp_err_t (*http_route_handler_t)(httpd_req_t *req);
 /** Auth hook, installed by sync_server (it owns the token and the policy). */
 typedef bool (*http_auth_check_t)(httpd_req_t *req);
 
-/** Maximum number of registered routes. */
-#define HTTP_ROUTER_MAX_ROUTES 48
+/**
+ * Maximum number of registered routes.
+ *
+ * Each (path, method) pair occupies one slot, and registration is
+ * first-come-first-served in module order: once the table is full every later
+ * route_add() fails with "route table full" and that endpoint simply 404s at
+ * runtime - there is no compile-time warning.
+ *
+ * The table was 48 and 1.3.0 added 6 maimemo routes, which took the total to
+ * exactly 48: the table was full with **zero** headroom, so any further endpoint
+ * would have been dropped silently. Raised to 64 to leave room for the next
+ * feature; the cost is 16 * sizeof(http_route_t) of .bss (route paths are 64 B
+ * each, so under 2 KB).
+ */
+#define HTTP_ROUTER_MAX_ROUTES 64
 
 /* ------------------------------------------------------------------------ */
 /* Registration                                                              */

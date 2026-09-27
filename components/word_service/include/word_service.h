@@ -53,6 +53,16 @@ typedef enum {
 /** Upper bound on the loaded book, so a bad file cannot exhaust memory. */
 #define WORD_MAX_ITEMS 2000
 
+/**
+ * Sentinel id for a card that came from the MaiMemo study plan (plan A) but has
+ * no matching entry in the local book.
+ *
+ * Such a word can still be shown and graded, but there is no local scheduling
+ * record for it: its progress lives in the account, so grading routes to the
+ * cloud push path instead of the local spaced-repetition state.
+ */
+#define WORD_ID_CLOUD 0xFFFFFFFFu
+
 typedef struct {
     uint32_t id;
     char spelling[WORD_SPELLING_MAX];
@@ -106,6 +116,30 @@ const char *word_get_book(void);
 
 /** @brief Select and persist a book name, then reload. */
 esp_err_t word_set_book(const char *book);
+
+/* ---- MaiMemo cloud queue (plan A) ---------------------------------------- */
+
+/**
+ * @brief Is today's queue sourced from the MaiMemo study plan?
+ *
+ * True only when cloud mode is selected **and** a token is configured, so a
+ * missing token silently keeps the offline book working.
+ */
+bool word_cloud_mode(void);
+
+/** @brief Switch between the cloud plan and the local book (persisted). */
+esp_err_t word_set_cloud_mode(bool enabled);
+
+/**
+ * @brief Fetch the account's today-list into the queue. Blocking.
+ *
+ * On failure the cloud queue is dropped and the local book takes over, so the
+ * user never ends up with an empty page because the network was down.
+ */
+esp_err_t word_cloud_refresh(void);
+
+/** @brief Number of cloud words currently loaded. */
+size_t word_cloud_count(void);
 
 /**
  * @brief Today's queue: due words first, then new words, capped by the daily count.

@@ -12,8 +12,12 @@
  * is the "翻卡：先单词，后释义" behaviour the requirement asks for.
  */
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "pages_internal.h"
 
+#include "maimemo_client.h"
 #include "word_service.h"
 
 static const char *TAG = "page_word";
@@ -23,14 +27,126 @@ static lv_obj_t *s_card_label;
 static lv_obj_t *s_hint_label;
 static lv_obj_t *s_stats_label;
 static lv_obj_t *s_grade_bar;
+/** 助记/例句 fetched from MaiMemo (plan B); hidden when unavailable. */
+static lv_obj_t *s_enrich_label;
 
 static word_item_t s_word;
 static bool s_have_word;
 static bool s_revealed;
 
+/**
+ * Enrichment for the card on screen.
+ *
+ * Fetched on a worker task because maimemo_enrich() may do TLS; the label is
+ * updated from that task via lv_async_call, never from inside the fetch (AGENT.md
+ * 9.0.1: LVGL work must happen on the LVGL task).
+ */
+static maimemo_enrich_t s_enrich;
+static bool s_enrich_valid;
+static bool s_enrich_pending;
+
 /* ------------------------------------------------------------------------ */
 /* Rendering                                                                 */
 /* ------------------------------------------------------------------------ */
+
+static void render_enrich(void)
+{
+    if (s_enrich_label == NULL) {
+        return;
+    }
+    if (!s_revealed || !s_enrich_valid ||
+        (s_enrich.mnemonic[0] == '\0' && s_enrich.example[0] == '\0')) {
+        lv_obj_add_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    /* Both fields are optional; only label the one(s) we actually have. */
+    char text[560];
+    text[0] = '\0';
+    if (s_enrich.mnemonic[0] != '\0') {
+        snprintf(text + strlen(text), sizeof(text) - strlen(text), "助记 %s",
+                 s_enrich.mnemonic);
+    }
+    if (s_enrich.example[0] != '\0') {
+        if (text[0] != '\0') {
+            strlcat(text, "\n", sizeof(text));
+        }
+        snprintf(text + strlen(text), sizeof(text) - strlen(text), "例句 %s",
+                 s_enrich.example);
+    }
+
+    lv_label_set_text(s_enrich_label, text);
+    lv_obj_remove_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+/** Applied on the LVGL task after the worker finishes fetching. */
+static void enrich_ready_async(void *arg)
+{
+    (void)arg;
+    s_enrich_pending = false;
+    render_enrich();
+}
+
+/*
+ * Subscription handlers for the MaiMemo sync events, defined below with the page
+ * table but referenced by word_create().
+ *
+ * They use ui_event_subscribe() rather than ui_event_bind(): a page has one
+ * on_event() handler and it is not told which base fired, so with both
+ * WORD_EVENT_LOADED (0) and MAIMEMO_EVENT_* (0,1,2) bound to the same page the
+ * ids would be ambiguous. Separate handlers keep them distinguishable.
+ */
+static esp_err_t maimemo_sync_done_event(int32_t event_id, void *data);
+static esp_err_t maimemo_sync_failed_event(int32_t event_id, void *data);
+
+static void enrich_worker(void *arg)
+{
+    char *spelling = (char *)arg;
+    maimemo_enrich_t enrich;
+    const esp_err_t err = maimemo_enrich(spelling, &enrich);
+    free(spelling);
+
+    if (err == ESP_OK) {
+        s_enrich = enrich;
+        s_enrich_valid = true;
+    } else {
+        /* Not an error to report: a study-scoped token simply cannot read 助记/
+         * 例句, and a word may have neither. The card just does not grow a
+         * footnote. */
+        memset(&s_enrich, 0, sizeof(s_enrich));
+        s_enrich_valid = false;
+        SYS_LOGD(TAG, "no enrichment (%s)", esp_err_to_name(err));
+    }
+
+    lv_async_call(enrich_ready_async, NULL);
+    vTaskDelete(NULL);
+}
+
+/** Kick off a plan B prefetch for the current card (never blocks the UI). */
+static void enrich_start(const char *spelling)
+{
+    memset(&s_enrich, 0, sizeof(s_enrich));
+    s_enrich_valid = false;
+    if (s_enrich_label != NULL) {
+        lv_obj_add_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (spelling == NULL || spelling[0] == '\0' || !maimemo_has_token() ||
+        s_enrich_pending) {
+        return;
+    }
+
+    char *copy = strdup(spelling);
+    if (copy == NULL) {
+        return;
+    }
+    s_enrich_pending = true;
+    /* 5 KB: TLS handshake plus JSON parsing, and paging after a 24 KB body. */
+    if (xTaskCreate(enrich_worker, "th_mm_enrich", 5120, copy, 3, NULL) != pdPASS) {
+        s_enrich_pending = false;
+        free(copy);
+    }
+}
 
 static void render_card(void)
 {
@@ -59,7 +175,7 @@ static void render_card(void)
             lv_obj_add_flag(s_grade_bar, LV_OBJ_FLAG_HIDDEN);
         }
     } else {
-        /* Back: meaning and example. */
+        /* Back: meaning and example, plus the 助记 from MaiMemo when we have it. */
         lv_label_set_text_fmt(s_card_label, "%s\n\n%s\n\n%s",
                               s_word.spelling,
                               s_word.meaning[0] ? s_word.meaning : "（无释义）",
@@ -69,6 +185,7 @@ static void render_card(void)
             lv_obj_remove_flag(s_grade_bar, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    render_enrich();
 }
 
 static void render_progress(void)
@@ -83,12 +200,36 @@ static void render_progress(void)
     }
 
     if (s_stats_label != NULL) {
+        /* In cloud mode the account's own progress is the meaningful number, so
+         * show that instead of the local book's counters (which would read
+         * "0/833" no matter how much the user studied on their phone). */
+        maimemo_progress_t cloud;
+        if (word_cloud_mode() && maimemo_get_cached_progress(&cloud) == ESP_OK) {
+            /* Show seconds below a minute: rounding 59 s down to "0 分" reads as
+             * "you have not studied", which is both wrong and discouraging. */
+            if (cloud.study_time_ms < 60000) {
+                lv_label_set_text_fmt(s_stats_label,
+                                      "墨墨今日 %d/%d · 已用 %d 秒 · 计划 %d 词%s",
+                                      cloud.finished, cloud.total, cloud.study_time_ms / 1000,
+                                      cloud.due_count,
+                                      (word_cloud_count() > 0) ? "" : " · 待同步");
+            } else {
+                lv_label_set_text_fmt(s_stats_label,
+                                      "墨墨今日 %d/%d · 已用 %d 分 · 计划 %d 词%s",
+                                      cloud.finished, cloud.total, cloud.study_time_ms / 60000,
+                                      cloud.due_count,
+                                      (word_cloud_count() > 0) ? "" : " · 待同步");
+            }
+            return;
+        }
+
         word_stats_t stats;
         if (word_stats(&stats) == ESP_OK) {
             lv_label_set_text_fmt(s_stats_label,
-                                  "词库 %u 词 · 新词 %u · 待复习 %u · 已掌握 %u",
+                                  "词库 %u 词 · 新词 %u · 待复习 %u · 已掌握 %u%s",
                                   (unsigned)stats.total, (unsigned)stats.new_words,
-                                  (unsigned)stats.due, (unsigned)stats.learned);
+                                  (unsigned)stats.due, (unsigned)stats.learned,
+                                  word_cloud_mode() ? " · 云端待同步" : "");
         }
     }
 }
@@ -103,6 +244,15 @@ static void next_word(void)
     s_have_word = (word_next(&s_word) == ESP_OK);
     render_card();
     render_progress();
+
+    /* Plan B: warm the 助记/例句 for the card we just moved to. The fetch runs on
+     * its own task; the front of the card does not need it, so it has the whole
+     * time the user spends recalling the word to finish. */
+    if (s_have_word) {
+        enrich_start(s_word.spelling);
+    } else {
+        enrich_start(NULL);
+    }
 }
 
 static void card_clicked_cb(lv_event_t *e)
@@ -128,8 +278,21 @@ static void grade_clicked_cb(lv_event_t *e)
         return;
     }
 
+    /* Plan C: a word the user does not recognise is exactly the word worth
+     * learning, so send it back to the MaiMemo study plan. maimemo_push_unknown()
+     * runs the TLS call on its own task and is a silent no-op unless the user
+     * opted in, because it mutates the account. */
+    if (grade == WORD_REVIEW_UNKNOWN && maimemo_push_enabled()) {
+        (void)maimemo_push_unknown(s_word.spelling);
+    }
+
     esp_err_t err = word_review(s_word.id, grade);
-    if (err != ESP_OK) {
+    if (err == ESP_ERR_NOT_FOUND && s_word.id == WORD_ID_CLOUD) {
+        /* A cloud-only card: nothing local to record. The push above (or the
+         * account's own sync) is the record. Be explicit rather than silent. */
+        SYS_LOGD(TAG, "'%s' is not in the local book; graded in the account only",
+                 s_word.spelling);
+    } else if (err != ESP_OK) {
         ui_toast("记录失败：%s", esp_err_to_name(err));
     }
     next_word();
@@ -180,6 +343,15 @@ static esp_err_t word_create(lv_obj_t *parent)
     s_hint_label = lv_label_create(parent);
     lv_obj_set_style_text_font(s_hint_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_hint_label, UI_COLOR_TEXT_MUTED, 0);
+
+    /* Plan B: 助记/例句 from MaiMemo, shown under the hint once revealed. Hidden
+     * by default so the card keeps its shape when there is nothing to add. */
+    s_enrich_label = lv_label_create(parent);
+    lv_obj_set_width(s_enrich_label, LV_PCT(100));
+    lv_label_set_long_mode(s_enrich_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(s_enrich_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_enrich_label, UI_COLOR_PRIMARY, 0);
+    lv_obj_add_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
 
     s_grade_bar = lv_obj_create(parent);
     lv_obj_remove_style_all(s_grade_bar);
@@ -239,6 +411,12 @@ static esp_err_t word_create(lv_obj_t *parent)
     next_word();
 
     (void)ui_event_bind(WORD_EVENT, WORD_EVENT_LOADED, UI_PAGE_WORD, 0);
+    /* Refresh the progress line when a background MaiMemo sync lands, and bring
+     * the cloud queue in with it (plan A). */
+    (void)ui_event_subscribe(MAIMEMO_EVENT, MAIMEMO_EVENT_SYNC_DONE, 0,
+                             maimemo_sync_done_event);
+    (void)ui_event_subscribe(MAIMEMO_EVENT, MAIMEMO_EVENT_SYNC_FAILED, sizeof(esp_err_t),
+                             maimemo_sync_failed_event);
     SYS_LOGD(TAG, "word page built");
     return ESP_OK;
 }
@@ -257,6 +435,52 @@ static esp_err_t word_on_event(int32_t event_id, void *data)
 {
     (void)event_id;
     (void)data;
+    render_progress();
+    return ESP_OK;
+}
+
+/**
+ * A MaiMemo sync finished: pull today's plan into the queue and restart.
+ *
+ * Runs on the LVGL task (ui_event_subscribe marshals there), and
+ * word_cloud_refresh() does blocking TLS - so the fetch is handed to a worker
+ * task; this handler only schedules it.
+ */
+static void cloud_fetch_worker(void *arg)
+{
+    (void)arg;
+    const esp_err_t err = word_cloud_refresh();
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "cloud queue refresh failed: %s", esp_err_to_name(err));
+    }
+    lv_async_call(enrich_ready_async, NULL);   /* re-render, on the LVGL task */
+    vTaskDelete(NULL);
+}
+
+/*
+ * These use ui_event_subscribe() rather than ui_event_bind(): see the forward
+ * declaration above for why.
+ */
+static esp_err_t maimemo_sync_done_event(int32_t event_id, void *data)
+{
+    (void)event_id;
+    (void)data;
+    if (word_cloud_mode()) {
+        if (xTaskCreate(cloud_fetch_worker, "th_mm_fetch", 5120, NULL, 3, NULL) != pdPASS) {
+            SYS_LOGW(TAG, "cannot start cloud fetch task");
+        }
+    }
+    render_progress();
+    return ESP_OK;
+}
+
+static esp_err_t maimemo_sync_failed_event(int32_t event_id, void *data)
+{
+    (void)event_id;
+    /* Not surfaced as a toast: the page still works offline, and a failed
+     * background sync is not something the user asked for. */
+    const esp_err_t err = (data != NULL) ? *(const esp_err_t *)data : ESP_FAIL;
+    SYS_LOGW(TAG, "maimemo sync failed: %s", esp_err_to_name(err));
     render_progress();
     return ESP_OK;
 }

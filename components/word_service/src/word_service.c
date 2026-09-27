@@ -19,6 +19,9 @@
 #include "storage_manager.h"
 #include "word_default_book.h"
 
+#include "maimemo_client.h"
+#include "sys_keys.h"
+
 static const char *TAG = "word";
 
 ESP_EVENT_DEFINE_BASE(WORD_EVENT);
@@ -57,6 +60,28 @@ static uint32_t s_daily_count = CONFIG_TODOHELPER_WORD_DAILY_COUNT;
 static uint32_t s_known_total;
 static uint32_t s_fuzzy_total;
 static uint32_t s_unknown_total;
+
+/* ------------------------------------------------------------------------ */
+/* Cloud queue (plan A)                                                      */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * When `SYS_KEY_MAIMEMO_MODE` is "cloud" and a token is configured, today's
+ * queue is MaiMemo's study plan rather than the local book. The cloud words are
+ * held in their own array because they are *not* in s_words: a word can be in
+ * the account's plan without being in the SD-card book, and the reverse is also
+ * true.
+ *
+ * Local progress (level/scheduling) still applies: a cloud word is matched back
+ * to the book by spelling so grading it updates the same record the local flow
+ * would, and a word with no local entry simply cannot be graded locally - see
+ * cloud_index_for().
+ */
+static maimemo_item_t *s_cloud_words;
+static size_t s_cloud_count;
+/** Book indices for the cloud queue: UINT16_MAX means "no local entry". */
+static uint16_t *s_cloud_map;
+static bool s_cloud_active;
 
 static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
@@ -617,6 +642,126 @@ esp_err_t word_set_book(const char *book)
 /* ------------------------------------------------------------------------ */
 
 /** Rebuild the queue: due words first (soonest first), then new words. */
+/* ------------------------------------------------------------------------ */
+/* Cloud queue (plan A)                                                      */
+/* ------------------------------------------------------------------------ */
+
+/** True when today's queue should come from MaiMemo rather than the SD book. */
+bool word_cloud_mode(void)
+{
+    char mode[16];
+    if (sys_config_get_str(SYS_KEY_MAIMEMO_MODE, mode, sizeof(mode)) != ESP_OK) {
+        return false;   /* unset = local book, which is the offline-safe default */
+    }
+    return strcmp(mode, "cloud") == 0 && maimemo_has_token();
+}
+
+esp_err_t word_set_cloud_mode(bool enabled)
+{
+    const esp_err_t err = sys_config_set_str(SYS_KEY_MAIMEMO_MODE, enabled ? "cloud" : "local");
+    if (err == ESP_OK) {
+        /* Force a rebuild so the next card comes from the new source. */
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_queue_len = 0;
+        s_queue_pos = 0;
+        xSemaphoreGive(s_lock);
+    }
+    return err;
+}
+
+/** Index of @p spelling in the local book, or UINT16_MAX when absent. */
+static uint16_t local_index_for(const char *spelling)
+{
+    for (size_t i = 0; i < s_count; i++) {
+        if (strcasecmp(s_words[i].spelling, spelling) == 0) {
+            return (uint16_t)i;
+        }
+    }
+    return UINT16_MAX;
+}
+
+static void free_cloud_queue(void)
+{
+    heap_caps_free(s_cloud_words);
+    heap_caps_free(s_cloud_map);
+    s_cloud_words = NULL;
+    s_cloud_map = NULL;
+    s_cloud_count = 0;
+    s_cloud_active = false;
+}
+
+/**
+ * Pull today's words from MaiMemo. Blocking - worker/HTTP context only.
+ *
+ * On any failure the cloud queue is dropped and the caller falls back to the
+ * local book: a network problem must never leave the user with no cards at all.
+ */
+esp_err_t word_cloud_refresh(void)
+{
+    if (!word_cloud_mode()) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    maimemo_item_t *items = heap_caps_calloc_prefer(MAIMEMO_MAX_TODAY,
+                                                   sizeof(maimemo_item_t), 2,
+                                                   MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    uint16_t *map = heap_caps_malloc_prefer(MAIMEMO_MAX_TODAY * sizeof(uint16_t), 2,
+                                            MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (items == NULL || map == NULL) {
+        heap_caps_free(items);
+        heap_caps_free(map);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t count = 0;
+    const esp_err_t err = maimemo_fetch_today(items, MAIMEMO_MAX_TODAY, &count);
+    if (err != ESP_OK) {
+        heap_caps_free(items);
+        heap_caps_free(map);
+        return err;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    size_t mapped = 0;
+    for (size_t i = 0; i < count; i++) {
+        map[i] = local_index_for(items[i].spelling);
+        if (map[i] != UINT16_MAX) {
+            mapped++;
+        }
+    }
+    free_cloud_queue();
+    s_cloud_words = items;
+    s_cloud_map = map;
+    s_cloud_count = count;
+    s_cloud_active = (count > 0);
+    /* The local index queue is replaced by the cloud queue, so clear it. */
+    free(s_queue);
+    s_queue = NULL;
+    s_queue_len = 0;
+    s_queue_pos = 0;
+    xSemaphoreGive(s_lock);
+
+    SYS_LOGI(TAG, "cloud queue: %u words (%u also in the local book)",
+             (unsigned)count, (unsigned)mapped);
+    return (count > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+/** How many cloud words are currently loaded.
+ *
+ * Takes the lock: word_cloud_refresh() replaces the arrays under it, and an
+ * unlocked read of s_cloud_count can be observed mid-update (it is also read by
+ * the UI task while a sync worker may be swapping the queue). */
+size_t word_cloud_count(void)
+{
+    if (s_lock == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const size_t count = s_cloud_count;
+    xSemaphoreGive(s_lock);
+    return count;
+}
+
 static esp_err_t build_queue(void)
 {
     if (s_words == NULL || s_count == 0) {
@@ -699,6 +844,33 @@ esp_err_t word_get_today(word_item_t *out, size_t max, size_t *count)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Cloud queue: same shape as the local one, but with no local scheduling
+     * data for words outside the book (see word_next()). */
+    if (s_cloud_active) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        const size_t total = s_cloud_count;
+        size_t copy = (total > max) ? max : total;
+        if (out != NULL) {
+            for (size_t i = 0; i < copy; i++) {
+                const uint16_t local = s_cloud_map[i];
+                memset(&out[i], 0, sizeof(out[i]));
+                if (local != UINT16_MAX) {
+                    const uint32_t id = s_words[local].id;
+                    out[i] = s_words[local];
+                    out[i].level = s_progress[local].level;
+                    out[i].next_review_ts = s_progress[local].next_review_ts;
+                    out[i].id = id;
+                } else {
+                    out[i].id = WORD_ID_CLOUD;
+                }
+                strlcpy(out[i].spelling, s_cloud_words[i].spelling, sizeof(out[i].spelling));
+            }
+        }
+        xSemaphoreGive(s_lock);
+        *count = total;
+        return ESP_OK;
+    }
+
     esp_err_t err = build_queue();
     if (err != ESP_OK) {
         return err;
@@ -735,6 +907,38 @@ esp_err_t word_next(word_item_t *out)
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    /* Cloud queue first (plan A): it is the account's plan, so it wins. A word
+     * that is not in the local book still gets a card - it just has no local
+     * scheduling record, which is honest: the account owns its scheduling. */
+    if (s_cloud_active) {
+        if (s_queue_pos >= s_cloud_count) {
+            s_queue_pos = 0;   /* wrap around so the page can keep flipping */
+        }
+        const size_t cloud_index = s_queue_pos++;
+        const uint16_t local = s_cloud_map[cloud_index];
+        memset(out, 0, sizeof(*out));
+        strlcpy(out->spelling, s_cloud_words[cloud_index].spelling, sizeof(out->spelling));
+        if (local != UINT16_MAX) {
+            const uint32_t id = s_words[local].id;
+            *out = s_words[local];
+            out->level = s_progress[local].level;
+            out->next_review_ts = s_progress[local].next_review_ts;
+            /* Keep the account's spelling, which is the string the user is
+             * actually being asked to recall. */
+            strlcpy(out->spelling, s_cloud_words[cloud_index].spelling,
+                    sizeof(out->spelling));
+            out->id = id;
+        } else {
+            /* No local record: give it a stable id derived from the cloud voc_id
+             * so grading can still be routed (word_review falls back to pushing
+             * to the account when the id is unknown locally). */
+            out->id = WORD_ID_CLOUD;
+        }
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    }
+
     if (s_queue == NULL || s_queue_len == 0) {
         xSemaphoreGive(s_lock);
         esp_err_t err = build_queue();
@@ -795,11 +999,14 @@ esp_err_t word_restart_queue(void)
 esp_err_t word_queue_position(size_t *position, size_t *total)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* The cloud queue has its own length; reporting the local one here would show
+     * "3/10" while flipping through 20 cloud cards. */
+    const size_t len = s_cloud_active ? s_cloud_count : s_queue_len;
     if (position != NULL) {
-        *position = s_queue_len > 0 ? (s_queue_pos > s_queue_len ? s_queue_len : s_queue_pos) : 0;
+        *position = len > 0 ? (s_queue_pos > len ? len : s_queue_pos) : 0;
     }
     if (total != NULL) {
-        *total = s_queue_len;
+        *total = len;
     }
     xSemaphoreGive(s_lock);
     return ESP_OK;
@@ -827,6 +1034,15 @@ esp_err_t word_review(uint32_t id, word_review_result_t result)
     }
     if (index == (size_t)-1) {
         xSemaphoreGive(s_lock);
+        /* Plan C: a card that came from the cloud plan but is not in the local
+         * book. There is no local record to schedule, so grading it means "tell
+         * the account". This is fire-and-forget: the caller is an LVGL callback
+         * and must not wait for TLS, and maimemo_push_unknown() itself no-ops
+         * unless the user enabled pushing. */
+        if (s_cloud_active && id == WORD_ID_CLOUD) {
+            SYS_LOGD(TAG, "graded a cloud-only card ('%s' = %s), not scheduled locally",
+                     word_review_name(result), "no local record");
+        }
         return ESP_ERR_NOT_FOUND;
     }
 

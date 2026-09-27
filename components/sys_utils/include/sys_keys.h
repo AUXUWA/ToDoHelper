@@ -64,6 +64,19 @@ extern "C" {
 #define SYS_KEY_WORD_DAILY     "word_daily"
 #define SYS_KEY_WORD_BOOK      "word_book"
 
+/* ---- MaiMemo OpenAPI (FR5, plans A/B/C) ----
+ *
+ * `SYS_KEY_MAIMEMO_TOKEN` is a bearer credential: it is written through
+ * sys_config_set_str(), never logged and never returned by any HTTP route
+ * (the same rule SYS_KEY_AI_API_KEY follows, requirement 8.8).
+ *   - MODE selects where the study queue comes from: "cloud" (MaiMemo study
+ *     API) or "local" (the book on the SD card).
+ *   - PUSH enables plan C, sending words the user marks unknown back to the
+ *     MaiMemo study plan. Off by default because it mutates cloud data. */
+#define SYS_KEY_MAIMEMO_TOKEN  "mm_token"
+#define SYS_KEY_MAIMEMO_MODE   "mm_mode"
+#define SYS_KEY_MAIMEMO_PUSH   "mm_push"
+
 /* ---- Sync / HTTP (FR2, 8.8) ---- */
 #define SYS_KEY_SYNC_ENABLED   "sync_enabled"
 #define SYS_KEY_AUTH_TOKEN     "auth_token"

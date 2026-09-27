@@ -17,6 +17,7 @@ idf_component_register(
         calendar_service
         weather_service
         word_service
+        maimemo_client
         sync_server
         idle_face
         ai_service
