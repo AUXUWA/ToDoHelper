@@ -135,6 +135,44 @@ ESP_EVENT_DEFINE_BASE(IDLE_FACE_EVENT);
 #define IDLE_FACE_DROWSY_BLINK_SPEEDUP  0.35f   /**< blink intervals shrink by up to 35% */
 #define IDLE_FACE_DROWSY_BLINK_LONGER   0.60f   /**< blink durations grow by up to 60% */
 
+/*
+ * Richer idle behaviour (1.2).
+ *
+ * Everything above moves the eyes in *discrete events*: a blink happens, a glance
+ * happens, a mood happens. The face still reads as "posing between events". These
+ * layers add continuous or reflexive motion on top:
+ *
+ *   1. gaze wander - a slow 2-D orbit of both pupils, so the eyes are never
+ *      perfectly still between glances (a real eye has continuous micro-drift);
+ *   2. eyelid settle - a small overshoot when an eye re-opens, instead of the
+ *      lid arriving exactly at its resting height;
+ *   3. attention perk - occasionally the eyes widen and the pupils constrict for
+ *      a moment, as if something was noticed, with no expression change at all;
+ *   4. blink asymmetry - one lid sometimes comes down further than the other.
+ *
+ * All four are additive, bounded, and allocation-free: they only perturb values
+ * that apply_params() already computes.
+ */
+
+/** Gaze wander: two slow, mutually irrational sines trace a drifting ellipse. */
+#define IDLE_FACE_WANDER_X              0.16f   /**< pupil travel fraction, x */
+#define IDLE_FACE_WANDER_Y              0.10f   /**< pupil travel fraction, y */
+
+/** Eyelid settle: how far past the resting height a re-opened lid overshoots. */
+#define IDLE_FACE_SETTLE_OPEN           0.055f
+#define IDLE_FACE_SETTLE_MS             260
+
+/** Attention perk: widen + constrict for a beat, then fade. */
+#define IDLE_FACE_PERK_MIN_MS           17000
+#define IDLE_FACE_PERK_MAX_MS           46000
+#define IDLE_FACE_PERK_MS               520
+#define IDLE_FACE_PERK_OPEN             0.18f   /**< eye height gain at the peak */
+#define IDLE_FACE_PERK_PUPIL            (-0.10f)/**< pupils constrict (focus) */
+
+/** Blink asymmetry: how much the two lids may differ, and how often it matters. */
+#define IDLE_FACE_BLINK_ASYM_PCT        30
+#define IDLE_FACE_BLINK_ASYM_MAX        0.30f
+
 /** Partial (squint) blink: the eyelid only comes part of the way down. */
 #define IDLE_FACE_BLINK_PARTIAL_PCT     28
 #define IDLE_FACE_BLINK_PARTIAL_MIN     0.40f
@@ -262,6 +300,15 @@ static float s_drift_x;
 static float s_drift_y;
 static float s_blink_depth = 1.0f;   /**< 1 = full blink, < 1 = squint */
 static float s_drowsy;               /**< 0 = alert, 1 = about to nod off */
+
+/* 1.2: continuous gaze wander, eyelid settle, attention perk, blink asymmetry */
+static float s_wander_x;             /**< pupil wander, -1..1 (eased) */
+static float s_wander_y;
+static uint32_t s_next_perk_ms;      /**< when the next attention perk may start */
+static uint32_t s_perk_from_ms;      /**< 0 = no perk running */
+static uint32_t s_settle_from_ms;    /**< 0 = no eyelid settle running */
+/** Per-eye blink depth, so the two lids can differ (0 = left, 1 = right). */
+static float s_eye_lid[2] = { 1.0f, 1.0f };
 
 /* standby enter/exit envelope (see idle_face_standby_enter/exit) */
 static uint32_t s_motion_from_ms;
@@ -395,6 +442,55 @@ static float wake_env(uint32_t now)
     return IDLE_FACE_WAKE_OVERSHOOT * sinf(t * (float)M_PI);
 }
 
+/**
+ * Eyelid settle: a small overshoot just after a blink re-opens.
+ *
+ * Without it the lid arrives exactly at its resting height and stops, which reads
+ * as a mechanical shutter. A real lid springs slightly past the resting position
+ * and eases back. Like wake_env() this is a bounded bump that is zero at both
+ * ends, so it can never leave the eye in a wrong state.
+ */
+static float settle_env(uint32_t now)
+{
+    if (s_settle_from_ms == 0) {
+        return 0.0f;
+    }
+    const uint32_t elapsed = now - s_settle_from_ms;
+    if (elapsed >= IDLE_FACE_SETTLE_MS) {
+        s_settle_from_ms = 0;
+        return 0.0f;
+    }
+    const float t = (float)elapsed / (float)IDLE_FACE_SETTLE_MS;
+    return IDLE_FACE_SETTLE_OPEN * sinf(t * (float)M_PI);
+}
+
+/**
+ * Attention perk: 0 at both ends, peaks in the middle.
+ *
+ * Driven by s_perk_from_ms; the caller starts it. Positive return widens the eye,
+ * and the caller scales the pupil by (1 + perk * PERK_PUPIL/PERK_OPEN) so the
+ * pupils constrict as the eyes open - the "focusing on something" reflex.
+ */
+static float perk_env(uint32_t now)
+{
+    if (s_perk_from_ms == 0) {
+        return 0.0f;
+    }
+    const uint32_t elapsed = now - s_perk_from_ms;
+    if (elapsed >= IDLE_FACE_PERK_MS) {
+        s_perk_from_ms = 0;
+        return 0.0f;
+    }
+    const float t = (float)elapsed / (float)IDLE_FACE_PERK_MS;
+    return IDLE_FACE_PERK_OPEN * sinf(t * (float)M_PI);
+}
+
+/** True while a perk is in flight (the scheduler must not start another). */
+static bool perk_running(void)
+{
+    return s_perk_from_ms != 0;
+}
+
 static void update_xfade(uint32_t dt_ms)
 {
     s_xfade.elapsed_ms += dt_ms;
@@ -444,18 +540,43 @@ static void apply_params(uint32_t now)
     /* Drowsiness shortens the eye; a partial blink then only closes it part of
      * the way, which is what turns a mechanical shutter into a squint. */
     open *= 1.0f - (IDLE_FACE_DROWSY_OPEN * s_drowsy);
+
+    /*
+     * Attention perk and eyelid settle: two more bounded bumps on the same open
+     * value. The perk widens both eyes; the settle is the lid springing just past
+     * its resting height after a blink. Both are zero at their endpoints, so
+     * neither can leave the eye stuck open or shut.
+     */
+    const float perk = perk_env(now);
+    open += perk;
+    open += settle_env(now);
+
     if (state == IDLE_FACE_BLINK && s_blink_depth < 0.999f) {
         open = 1.0f - (1.0f - open) * s_blink_depth;
     }
     open = clampf(open, 0.04f, 1.6f);
 
-    const int32_t eye_h = (int32_t)((float)s_eye_base_h * open);
     const int32_t eye_w = (int32_t)((float)s_eye_base_w * (1.0f + 0.05f * s_current.arc));
     const int32_t border = (int32_t)((float)CONFIG_TODOHELPER_IDLE_LINE_WIDTH *
                                      s_current.width_scale);
     const bool cross_mode = s_current.cross > 0.5f;
     const bool arc_mode = !cross_mode && s_current.arc > 0.5f;
     const float pupil_fade = sqrtf(clampf(open, 0.0f, 1.0f));
+
+    /*
+     * Per-eye lid depth. Usually both eyes share s_blink_depth, but an asymmetric
+     * blink (one lid further down than the other) is one of the small tells that
+     * separates a face from a metronome, so a fraction of blinks split the depth.
+     * A perk is also never perfectly symmetric for the same reason.
+     */
+    const float lid_l = (state == IDLE_FACE_BLINK) ? s_eye_lid[0] : 1.0f;
+    const float lid_r = (state == IDLE_FACE_BLINK) ? s_eye_lid[1] : 1.0f;
+    const int32_t eye_h_eye[2] = {
+        (int32_t)((float)s_eye_base_h *
+                  clampf(1.0f - (1.0f - open) * lid_l, 0.04f, 1.6f)),
+        (int32_t)((float)s_eye_base_h *
+                  clampf(1.0f - (1.0f - open) * lid_r, 0.04f, 1.6f)),
+    };
 
     /* Whole-face drift and the drowsy droop move both eyes (and the X strokes,
      * which are aligned here as well so they stay in register) together. */
@@ -473,7 +594,7 @@ static void apply_params(uint32_t now)
         const int32_t eye_x = (i == 0) ? -(int32_t)(s_eye_gap / 2 + s_eye_base_w / 2)
                                        : (int32_t)(s_eye_gap / 2 + s_eye_base_w / 2);
 
-        lv_obj_set_size(eye, eye_w, arc_mode ? eye_h / 2 : eye_h);
+        lv_obj_set_size(eye, eye_w, arc_mode ? eye_h_eye[i] / 2 : eye_h_eye[i]);
         lv_obj_align(eye, LV_ALIGN_CENTER, eye_x + face_x, face_y);
 
         lv_obj_set_style_border_width(eye, border, 0);
@@ -485,14 +606,20 @@ static void apply_params(uint32_t now)
 
         /* Pupil: kept inside the eye and shifted by dx/dy. */
         if (pupil != NULL) {
-            /* Dilation + a little extra when the face is paying attention. */
+            /* Dilation + a little extra when the face is paying attention.
+             * A perk constricts the pupils as the eyes widen - the focusing
+             * reflex - which is what stops the widen from reading as surprise. */
             float scale = s_pupil_scale;
             if (state == IDLE_FACE_LISTENING) {
                 scale *= 1.06f;
             }
-            const int32_t pupil_size = (int32_t)((float)eye_h * 0.34f * scale);
+            if (perk > 0.0f) {
+                scale *= 1.0f + (perk / IDLE_FACE_PERK_OPEN) * IDLE_FACE_PERK_PUPIL;
+            }
+            const int32_t pupil_size =
+                (int32_t)((float)eye_h_eye[i] * 0.34f * clampf(scale, 0.5f, 1.5f));
             const int32_t travel_x = (eye_w - pupil_size) / 2 - border;
-            const int32_t travel_y = (eye_h - pupil_size) / 2 - border;
+            const int32_t travel_y = (eye_h_eye[i] - pupil_size) / 2 - border;
 
             lv_obj_set_size(pupil, pupil_size, pupil_size);
             lv_obj_set_style_radius(pupil, LV_RADIUS_CIRCLE, 0);
@@ -510,9 +637,10 @@ static void apply_params(uint32_t now)
             }
             lv_obj_set_style_bg_opa(pupil, (lv_opa_t)(opacity * LV_OPA_COVER), 0);
 
-            /* The table's dx/dy, plus the idle glance, plus a micro-saccade. */
-            float dx = s_current.dx + s_look_dx + s_saccade_dx;
-            float dy = s_current.dy + s_saccade_dy;
+            /* The table's dx/dy, plus the idle glance, plus a micro-saccade, plus
+             * the continuous gaze wander, plus any perk drift. */
+            float dx = s_current.dx + s_look_dx + s_saccade_dx + s_wander_x;
+            float dy = s_current.dy + s_saccade_dy + s_wander_y;
             dx = clampf(dx, -1.0f, 1.0f);
             dy = clampf(dy, -1.0f, 1.0f);
 
@@ -684,6 +812,9 @@ static void tick_behaviour(uint32_t now)
     /* Finish an in-flight blink first: it overrides everything else. */
     if (s_blink_until_ms != 0 && now >= s_blink_until_ms) {
         s_blink_until_ms = 0;
+        /* The lid springs slightly past its resting height before settling
+         * (1.2). Without it the eye arrives and stops, which looks mechanical. */
+        s_settle_from_ms = now;
         /* Occasionally follow up immediately: real eyes blink in bursts, and a
          * single fixed interval is exactly what makes an idle face look fake. */
         if ((esp_random() % 100u) < IDLE_FACE_BLINK_DOUBLE_PCT) {
@@ -744,6 +875,29 @@ static void tick_behaviour(uint32_t now)
                                    1000.0f)
                             : 1.0f;
 
+        /*
+         * Asymmetric blink (1.2): sometimes one lid travels further than the
+         * other. Both stay within the same full/partial class, so this only ever
+         * skews the pair - it can never turn a full blink into a half one.
+         */
+        s_eye_lid[0] = s_blink_depth;
+        s_eye_lid[1] = s_blink_depth;
+        if ((esp_random() % 100u) < IDLE_FACE_BLINK_ASYM_PCT) {
+            const float skew = (float)rand_between(0, (uint32_t)(IDLE_FACE_BLINK_ASYM_MAX * 1000.0f)) /
+                               1000.0f;
+            /* Which eye lags is random too, otherwise the face always squints the
+             * same way and the asymmetry itself becomes the pattern. */
+            const float deeper = clampf(s_blink_depth + skew, IDLE_FACE_BLINK_PARTIAL_MIN, 1.0f);
+            const float shallower = clampf(s_blink_depth - skew, IDLE_FACE_BLINK_PARTIAL_MIN, 1.0f);
+            if ((esp_random() & 1u) != 0u) {
+                s_eye_lid[0] = deeper;
+                s_eye_lid[1] = shallower;
+            } else {
+                s_eye_lid[0] = shallower;
+                s_eye_lid[1] = deeper;
+            }
+        }
+
         s_blink_until_ms = now + duration;
         schedule_next_blink(now + duration);
     }
@@ -766,6 +920,25 @@ static void tick_behaviour(uint32_t now)
         (s_look_dx < 0.15f && s_look_dx > -0.15f) && s_next_antic_ms != 0 &&
         (int32_t)(now - s_next_antic_ms) >= 0) {
         start_antic(now);
+    }
+
+    /*
+     * Attention perk (1.2): the eyes widen and the pupils tighten for ~0.5 s as
+     * if something was noticed. No expression change is involved, which is what
+     * makes it read as a reflex rather than a mood.
+     *
+     * It must not start while an eye is shut or a mood owns the face (the mood
+     * already sets the eye shape, and a perk on top would fight it), and it never
+     * starts twice - perk_env() clears the timestamp when it finishes.
+     */
+    if (!perk_running() && s_blink_until_ms == 0 && s_look_until_ms == 0 && !s_antic_active) {
+        if (s_next_perk_ms == 0) {
+            s_next_perk_ms = now + rand_between(IDLE_FACE_PERK_MIN_MS, IDLE_FACE_PERK_MAX_MS);
+        } else if ((int32_t)(now - s_next_perk_ms) >= 0) {
+            s_perk_from_ms = now;
+            s_next_perk_ms = now + rand_between(IDLE_FACE_PERK_MIN_MS, IDLE_FACE_PERK_MAX_MS);
+            SYS_LOGD(TAG, "attention perk");
+        }
     }
 }
 
@@ -937,6 +1110,26 @@ esp_err_t idle_face_tick(uint32_t now_ms)
     s_drift_x = xfade_value(s_drift_x, drift_x_want, IDLE_FACE_DRIFT_GAIN, 0.01f);
     s_drift_y = xfade_value(s_drift_y, drift_y_want, IDLE_FACE_DRIFT_GAIN, 0.01f);
 
+    /*
+     * Continuous gaze wander (1.2).
+     *
+     * The blink/glance/saccade layers are all *events*: between them the pupils
+     * are perfectly still, which is the one thing a real eye never is. This adds a
+     * slow two-axis Lissajous drift on top, so there is always a little motion.
+     * Frequencies are deliberately incommensurate (0.041 / 0.029 and 0.037 /
+     * 0.021 Hz) so the path never visibly closes.
+     *
+     * Eased rather than written directly, so switching it off (an expression
+     * arrives) or on again never snaps the pupils.
+     */
+    const float wander_gate = neutral_face ? 1.0f : 0.0f;
+    const float wander_x_want =
+        IDLE_FACE_WANDER_X * wander_gate * (0.7f * sinf(slow_s * 0.26f) + 0.3f * sinf(slow_s * 0.41f));
+    const float wander_y_want =
+        IDLE_FACE_WANDER_Y * wander_gate * (0.6f * sinf(slow_s * 0.19f) + 0.4f * sinf(slow_s * 0.33f));
+    s_wander_x = xfade_value(s_wander_x, wander_x_want, 0.06f, 0.002f);
+    s_wander_y = xfade_value(s_wander_y, wander_y_want, 0.06f, 0.002f);
+
     if (s_next_dilate_ms == 0 || (int32_t)(now_ms - s_next_dilate_ms) >= 0) {
         if ((esp_random() & 1u) != 0u) {
             s_pupil_scale_target = IDLE_FACE_PUPIL_WIDE_MIN +
@@ -999,7 +1192,15 @@ esp_err_t idle_face_set_state(idle_face_state_t state)
     s_wake_active = false;
     s_antic_active = false;
     s_drowsy = 0.0f;
+    /* 1.2 layers: a new expression takes the eyes, so drop any perk and lid
+     * settle (a perk mid-expression would widen an ERROR face) and put both lids
+     * back to neutral. The gaze wander eases to zero by itself via its gate. */
+    s_perk_from_ms = 0;
+    s_settle_from_ms = 0;
+    s_eye_lid[0] = 1.0f;
+    s_eye_lid[1] = 1.0f;
     const uint32_t now = now_ms32();
+    s_next_perk_ms = 0;
     schedule_next_blink(now);
     schedule_next_look(now);
     schedule_next_saccade(now);
@@ -1034,9 +1235,14 @@ esp_err_t idle_face_express(idle_face_state_t state, uint32_t duration_ms)
     s_override_until_ms = now_ms32() + duration_ms;
 
     /* Something real is happening: drop the mood and the drowsiness so the
-     * expression is not shown through half-closed, tired eyes. */
+     * expression is not shown through half-closed, tired eyes. The 1.2 layers go
+     * with them - a perk or a lid settle must not deform an expression. */
     s_antic_active = false;
     s_drowsy = 0.0f;
+    s_perk_from_ms = 0;
+    s_settle_from_ms = 0;
+    s_eye_lid[0] = 1.0f;
+    s_eye_lid[1] = 1.0f;
 
     (void)sys_event_post_to(IDLE_FACE_EVENT, IDLE_FACE_EVENT_STATE_CHANGED,
                             &state, sizeof(state));
@@ -1091,6 +1297,15 @@ esp_err_t idle_face_standby_enter(void)
      * next couple of minutes (see the slow layers in idle_face_tick). */
     s_drowsy = 0.0f;
     s_antic_active = false;
+    /* 1.2 layers restart from neutral as well, so the standby screen always opens
+     * on the same clean face. */
+    s_perk_from_ms = 0;
+    s_settle_from_ms = 0;
+    s_eye_lid[0] = 1.0f;
+    s_eye_lid[1] = 1.0f;
+    s_next_perk_ms = now + rand_between(IDLE_FACE_PERK_MIN_MS, IDLE_FACE_PERK_MAX_MS);
+    s_wander_x = 0.0f;
+    s_wander_y = 0.0f;
     schedule_next_blink(now);
     schedule_next_look(now);
     schedule_next_saccade(now);
@@ -1131,12 +1346,19 @@ esp_err_t idle_face_standby_exit(void)
     s_wake_active = true;
     s_motion_active = false;
 
-    /* Waking up wipes out the drowsiness and the current mood: the user is back. */
+    /* Waking up wipes out the drowsiness and the current mood: the user is back.
+     * The 1.2 layers are cleared too so the wake overshoot is the only thing
+     * moving the eyelids at that moment. */
     s_drowsy = 0.0f;
     s_antic_active = false;
     s_blink_until_ms = 0;
     s_look_until_ms = 0;
     s_look_dx_target = 0.0f;
+    s_perk_from_ms = 0;
+    s_settle_from_ms = 0;
+    s_eye_lid[0] = 1.0f;
+    s_eye_lid[1] = 1.0f;
+    s_next_perk_ms = 0;
 
     s_state = IDLE_FACE_NORMAL;
     schedule_next_blink(now + IDLE_FACE_WAKE_MS);
