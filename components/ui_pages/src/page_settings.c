@@ -34,6 +34,8 @@ static const char *TAG = "page_settings";
 
 static lv_obj_t *s_info_label;
 static lv_obj_t *s_auth_label;
+/** Web console address, shown large so it can be read off the screen. */
+static lv_obj_t *s_url_label;
 
 /* ------------------------------------------------------------------------ */
 /* Sliders                                                                   */
@@ -251,6 +253,9 @@ static void word_reset_cb(lv_event_t *e)
     ui_toast("单词进度已清空");
 }
 
+/* Defined below; the auth callbacks use it to re-render the security card. */
+static void refresh_info(void);
+
 static void auth_enable_cb(lv_event_t *e)
 {
     (void)e;
@@ -265,10 +270,16 @@ static void auth_enable_cb(lv_event_t *e)
 
     esp_err_t err = sync_server_set_auth_token(token);
     if (err == ESP_OK) {
-        ui_dialog("HTTP 鉴权已开启",
-                  "请把下面的 token 填入浏览器（会保存在浏览器本地）：\n\n"
-                  "见串口日志，或调用 GET /api/v1/device/status 确认 auth_enabled=true。",
-                  "知道了", NULL, NULL);
+        /* The token is the whole point of this dialog, so it is rendered as a
+         * highlighted, wrapped value rather than described in prose. The earlier
+         * version told the user to copy "the token below" while showing only
+         * explanatory text - and the text was long enough to push the box off
+         * the screen. */
+        ui_dialog_secret("HTTP 鉴权已开启",
+                         "把下面的 token 填进网页控制台的「访问令牌」，只需一次。",
+                         token,
+                         "也可从串口日志读到；随时可在这里重新生成。",
+                         "知道了");
         /* Logged once on purpose: this is the only way to read it off the
          * device, and requirement 8.8 only forbids it appearing in backups and
          * routine logs. Rotate it if that matters to you. */
@@ -276,10 +287,9 @@ static void auth_enable_cb(lv_event_t *e)
     } else {
         ui_toast("开启失败：%s", esp_err_to_name(err));
     }
-    if (s_auth_label != NULL) {
-        lv_label_set_text_fmt(s_auth_label, "鉴权：%s",
-                              sync_server_auth_required() ? "已开启" : "未开启");
-    }
+    /* Go through refresh_info() rather than writing the label here, so the
+     * dirty-check buffer stays in sync with what is on screen. */
+    refresh_info();
 }
 
 static void auth_disable_cb(lv_event_t *e)
@@ -287,9 +297,7 @@ static void auth_disable_cb(lv_event_t *e)
     (void)e;
     (void)sync_server_set_auth_token(NULL);
     ui_toast("HTTP 鉴权已关闭");
-    if (s_auth_label != NULL) {
-        lv_label_set_text(s_auth_label, "鉴权：未开启");
-    }
+    refresh_info();
 }
 
 static void reboot_cb(lv_event_t *e)
@@ -344,6 +352,9 @@ static lv_obj_t *add_row(lv_obj_t *parent)
  * text is compared before the label is touched (smoothness audit P1-10).
  */
 static char s_info_text[320];
+/** Dirty-check buffers for the security card's two lines (see refresh_info). */
+static char s_url_text[64];
+static char s_auth_text[96];
 
 static void refresh_info(void)
 {
@@ -375,6 +386,46 @@ static void refresh_info(void)
              weather_get_city()[0] ? weather_get_city() : "未设置",
              (unsigned)word_get_daily_count(),
              word_get_book());
+
+    /*
+     * The security card is refreshed here too, not just at creation. Its URL line
+     * depends on the DHCP address, and this function is the page's periodic
+     * (on_show + tick) refresh point, so this is where a changed address is
+     * picked up. Both writes are dirty-checked: a 1 Hz unconditional
+     * lv_label_set_text would repaint the page forever.
+     */
+    if (s_url_label != NULL) {
+        /*
+         * Show both forms when mDNS is on. `todohelper.local` is nicer to type but
+         * only resolves with Bonjour on Windows and not at all where multicast is
+         * blocked, so the IP is always shown as well - the user should never have
+         * to go hunting for an address that works.
+         */
+        char ip_url[40];
+        sync_server_ip_url(ip_url, sizeof(ip_url));
+
+        char url[128];
+        const char *primary = sync_server_url();
+        if (strstr(primary, ".local") != NULL) {
+            snprintf(url, sizeof(url), "%s\n或 %s", primary, ip_url);
+        } else {
+            snprintf(url, sizeof(url), "%s", primary);
+        }
+
+        if (strcmp(url, s_url_text) != 0) {
+            strlcpy(s_url_text, url, sizeof(s_url_text));
+            lv_label_set_text(s_url_label, s_url_text);
+        }
+    }
+    if (s_auth_label != NULL) {
+        char auth[96];
+        snprintf(auth, sizeof(auth), "鉴权：%s · 二维码/网址填这个地址",
+                 sync_server_auth_required() ? "已开启（网页需填 token）" : "未开启");
+        if (strcmp(auth, s_auth_text) != 0) {
+            strlcpy(s_auth_text, auth, sizeof(s_auth_text));
+            lv_label_set_text(s_auth_label, s_auth_text);
+        }
+    }
 
     if (strcmp(text, s_info_text) == 0) {
         return;
@@ -466,12 +517,23 @@ static esp_err_t settings_create(lv_obj_t *parent)
         return ESP_ERR_NO_MEM;
     }
 
+    /*
+     * The web console address gets its own prominent row.
+     *
+     * It is the one string on this page the user has to read and then type into a
+     * browser on another device, so it is rendered at the title font in the
+     * primary colour on its own line - not buried in the muted info block.
+     * Refreshed in refresh_info() so a DHCP change is reflected.
+     */
+    s_url_label = lv_label_create(sec_card);
+    lv_obj_set_width(s_url_label, LV_PCT(100));
+    lv_label_set_long_mode(s_url_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(s_url_label, ui_font(UI_FONT_TITLE), 0);
+    lv_obj_set_style_text_color(s_url_label, UI_COLOR_PRIMARY, 0);
+
     s_auth_label = lv_label_create(sec_card);
     lv_obj_set_style_text_font(s_auth_label, ui_font(UI_FONT_BODY), 0);
     lv_obj_set_style_text_color(s_auth_label, UI_COLOR_TEXT, 0);
-    lv_label_set_text_fmt(s_auth_label, "鉴权：%s · 地址 %s",
-                          sync_server_auth_required() ? "已开启" : "未开启",
-                          sync_server_url());
 
     lv_obj_t *sec_row = add_row(sec_card);
     add_button(sec_row, "生成并开启 token", auth_enable_cb, NULL, UI_COLOR_PRIMARY);

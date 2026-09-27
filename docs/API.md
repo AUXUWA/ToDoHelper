@@ -1273,8 +1273,8 @@ I (xxx) TH:app: ready (storage=/sdcard)
 当前注册 **51** 条：`sync_server` 8 + `todo_manager` 7 + `weather_service` 5 +
 `calendar_service` 5 + `word_service` 5 + `wifi_manager` 7 + `ai_service` 6 + `voice_service` 2 +
 `maimemo_client` 6 = 51。
-（1.0.0 真机实测 45 条 = 上表去掉 `maimemo_client` 的 6 条；**1.3.0 的 6 条尚未上机复核
-`routes` 字段**，预期为 51 —— 见 `docs/HANDOVER.md` §4 第 7 组。）
+（**1.3.0 已上机复核**：`GET /api/v1/device/status` 返回 `"routes":51`，与上面按注册表
+推算的数字一致。1.0.0 的真机值为 45 条，即本表去掉 `maimemo_client` 的 6 条。）
 
 > **1.0.0 更正**：旧版这张表把 `/api/v1/wifi/*` 记为"组件里没有任何 `http_router_register()`
 > 调用 → 404"、把 `ai_service` 记为"不在 `app_main` 模块表里 → 运行时 404"。**两条都是错的**，

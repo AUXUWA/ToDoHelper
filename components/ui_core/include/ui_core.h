@@ -199,9 +199,26 @@ lv_obj_t *ui_card_create(lv_obj_t *parent, const char *title, lv_obj_t **out_bod
  */
 esp_err_t ui_toast(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-/** @brief Show a persistent message box. @p on_close may be NULL. */
+/**
+ * @brief Show a persistent message box. @p on_close may be NULL.
+ *
+ * The box is clamped to the screen and its body scrolls, so a long message stays
+ * fully readable instead of growing off the panel.
+ */
 lv_obj_t *ui_dialog(const char *title, const char *text,
                     const char *ok_text, lv_event_cb_t on_close, void *user_data);
+
+/**
+ * @brief Message box that displays a long copyable secret (e.g. the auth token).
+ *
+ * Splits the content into @p lead_in, a highlighted @p secret, and a muted
+ * @p note, so the value the user must copy is actually visible instead of being
+ * described in prose. Wraps long secrets and clamps the box to the screen.
+ *
+ * @return The msgbox, or NULL when @p secret is NULL or the UI lock is held.
+ */
+lv_obj_t *ui_dialog_secret(const char *title, const char *lead_in, const char *secret,
+                           const char *note, const char *ok_text);
 
 /** @brief Screen size helpers (kept here so pages never hardcode 800x480). */
 int32_t ui_screen_width(void);

@@ -72,8 +72,19 @@ esp_err_t sync_server_stop(void);
 /** @brief True while the HTTP server is listening. */
 bool sync_server_is_running(void);
 
-/** @brief "http://todohelper.local" or "http://192.168.1.23"; static storage. */
+/** @brief "http://todohelper.local" or "http://192.168.1.23"; static storage.
+ *
+ * Recomputed on every call, so it never reports a stale DHCP address. */
 const char *sync_server_url(void);
+
+/**
+ * @brief The plain-IP form of the console address, e.g. "http://192.168.1.23".
+ *
+ * Offered alongside sync_server_url() because mDNS is not universal: Windows
+ * resolves `*.local` only with Bonjour installed, and multicast is blocked on
+ * some networks. Writes "（未连接 WiFi）" when there is no address yet.
+ */
+void sync_server_ip_url(char *out, size_t len);
 
 /** @brief The httpd handle, or NULL when stopped. */
 httpd_handle_t sync_server_handle(void);

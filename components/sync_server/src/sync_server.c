@@ -99,6 +99,28 @@ static void refresh_url(void)
     snprintf(s_url, sizeof(s_url), "http://%s", ip);
 }
 
+void sync_server_ip_url(char *out, size_t len)
+{
+    if (out == NULL || len == 0) {
+        return;
+    }
+
+    /*
+     * The plain-IP form of the same address.
+     *
+     * Needed next to sync_server_url() because mDNS is not actually universal:
+     * Windows only resolves `*.local` when Bonjour is installed, and some
+     * routers/guest networks block multicast entirely. So the device shows both -
+     * the friendly name when mDNS is on, plus the IP the user can always type.
+     */
+    char ip[16] = { 0 };
+    if (wifi_manager_get_ip(ip, sizeof(ip)) != ESP_OK || ip[0] == '\0') {
+        snprintf(out, len, "（未连接 WiFi）");
+        return;
+    }
+    snprintf(out, len, "http://%s", ip);
+}
+
 bool sync_server_is_running(void)
 {
     return s_server != NULL;
@@ -111,9 +133,16 @@ httpd_handle_t sync_server_handle(void)
 
 const char *sync_server_url(void)
 {
-    if (s_url[0] == '\0') {
-        refresh_url();
-    }
+    /*
+     * Recompute every time rather than caching after the first call.
+     *
+     * The IP is handed out by DHCP, and a lease can change after a router reboot
+     * or a long power-off. Since this URL is now shown on the device's settings
+     * page for the user to type into a browser, a stale address is worse than a
+     * small amount of formatting work: the displayed address must be the one the
+     * device actually has. refresh_url() is a snprintf plus one netif query.
+     */
+    refresh_url();
     return s_url;
 }
 
