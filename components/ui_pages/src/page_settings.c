@@ -14,6 +14,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "calendar_service.h"
@@ -117,11 +118,17 @@ static lv_obj_t *add_slider(lv_obj_t *parent, const setting_slider_t *def)
 /**
  * LVGL has no "bind label to slider" helper, so a small shared timer refreshes
  * the readouts of the sliders this page created.
+ *
+ * The timer is owned by the page (s_slider_timer) and paused in on_hide(): it
+ * used to be created without keeping the handle, so it kept re-formatting four
+ * labels four times a second *forever* - including while the user was on a
+ * completely different page (found in the smoothness audit).
  */
 #define SETTINGS_MAX_SLIDERS 4
 static lv_obj_t *s_slider_objs[SETTINGS_MAX_SLIDERS];
 static lv_obj_t *s_slider_values[SETTINGS_MAX_SLIDERS];
 static size_t s_slider_count;
+static lv_timer_t *s_slider_timer;
 
 static void settings_tick(lv_timer_t *timer)
 {
@@ -130,7 +137,14 @@ static void settings_tick(lv_timer_t *timer)
         if (s_slider_objs[i] == NULL || s_slider_values[i] == NULL) {
             continue;
         }
-        lv_label_set_text_fmt(s_slider_values[i], "%d", (int)lv_slider_get_value(s_slider_objs[i]));
+        /* Only touch the label when the value actually changed: writing the same
+         * text still invalidates the label and costs a repaint. */
+        const int value = (int)lv_slider_get_value(s_slider_objs[i]);
+        if (value == (int)(intptr_t)lv_obj_get_user_data(s_slider_values[i])) {
+            continue;
+        }
+        lv_obj_set_user_data(s_slider_values[i], (void *)(intptr_t)value);
+        lv_label_set_text_fmt(s_slider_values[i], "%d", value);
     }
 }
 
@@ -138,23 +152,72 @@ static void settings_tick(lv_timer_t *timer)
 /* Simple action rows                                                        */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Timezone change: the NVS commit is a flash write, so it is handed to a tiny
+ * one-shot task instead of running in the LVGL callback (a flash write also
+ * disables the cache for its duration). The label is updated optimistically
+ * because calendar_set_timezone() only fails on invalid input, which cannot
+ * happen here - the strings come from a fixed table.
+ */
+typedef struct {
+    char tz[48];
+} tz_request_t;
+
+static void tz_apply_task(void *arg)
+{
+    tz_request_t *req = (tz_request_t *)arg;
+    const esp_err_t err = calendar_set_timezone(req->tz);
+    free(req);
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "timezone change failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void tz_clicked_cb(lv_event_t *e)
 {
     const char *tz = (const char *)lv_event_get_user_data(e);
     if (tz == NULL) {
         return;
     }
-    esp_err_t err = calendar_set_timezone(tz);
-    ui_toast(err == ESP_OK ? "时区已设为 %s" : "设置失败：%s",
-             err == ESP_OK ? tz : esp_err_to_name(err));
+
+    tz_request_t *req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+        ui_toast("设置失败：内存不足");
+        return;
+    }
+    strlcpy(req->tz, tz, sizeof(req->tz));
+
+    /* 3072 B stack, priority 3: it only does one NVS write and exits. */
+    if (xTaskCreate(tz_apply_task, "th_tz", 3072, req, 3, NULL) != pdPASS) {
+        free(req);
+        ui_toast("设置失败：无法创建任务");
+        return;
+    }
+    ui_toast("时区已设为 %s", tz);
 }
 
 static void sync_ntp_cb(lv_event_t *e)
 {
     (void)e;
-    ui_toast("正在校时…");
-    esp_err_t err = calendar_sync_ntp(0);
+    /* Async: the old synchronous call waited up to 10 s on the network *with the
+     * LVGL lock held*, freezing the whole UI (and the event loop behind it). */
+    const esp_err_t err = calendar_sync_ntp_async();
+    if (err == ESP_ERR_TIMEOUT) {
+        ui_toast("正在校时，请稍候…");
+    } else if (err != ESP_OK) {
+        ui_toast("校时失败：%s", esp_err_to_name(err));
+    } else {
+        ui_toast("正在校时…");
+    }
+}
+
+/** Result of a requested sync, delivered on the LVGL task by ui_core. */
+static esp_err_t settings_on_sync_result(int32_t event_id, void *data)
+{
+    (void)event_id;
+    const esp_err_t err = (data != NULL) ? *(const esp_err_t *)data : ESP_FAIL;
     ui_toast(err == ESP_OK ? "校时成功" : "校时失败：%s", esp_err_to_name(err));
+    return ESP_OK;
 }
 
 static void city_clicked_cb(lv_event_t *e)
@@ -410,7 +473,17 @@ static esp_err_t settings_create(lv_obj_t *parent)
     add_button(info_row, "重启设备", reboot_cb, NULL, UI_COLOR_DANGER);
 
     refresh_info();
-    (void)lv_timer_create(settings_tick, 250, NULL);
+    /* Owned by the page so on_hide() can stop it (see settings_tick). */
+    s_slider_timer = lv_timer_create(settings_tick, 250, NULL);
+    if (s_slider_timer != NULL) {
+        lv_timer_pause(s_slider_timer);
+    }
+
+    /* The NTP outcome is delivered on the LVGL task by ui_core, so the toast can
+     * be shown without the page ever blocking on the network. */
+    (void)ui_event_subscribe(CALENDAR_EVENT, CALENDAR_EVENT_SYNC_RESULT,
+                             sizeof(esp_err_t), settings_on_sync_result);
+
     SYS_LOGD(TAG, "settings page built");
     return ESP_OK;
 }
@@ -418,6 +491,17 @@ static esp_err_t settings_create(lv_obj_t *parent)
 static esp_err_t settings_on_show(void)
 {
     refresh_info();
+    if (s_slider_timer != NULL) {
+        lv_timer_resume(s_slider_timer);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t settings_on_hide(void)
+{
+    if (s_slider_timer != NULL) {
+        lv_timer_pause(s_slider_timer);
+    }
     return ESP_OK;
 }
 
@@ -432,6 +516,7 @@ const ui_page_t page_settings = {
     .name = "settings",
     .create = settings_create,
     .on_show = settings_on_show,
+    .on_hide = settings_on_hide,
     .on_tick = settings_on_tick,
     .tick_period_ms = 5000,
 };

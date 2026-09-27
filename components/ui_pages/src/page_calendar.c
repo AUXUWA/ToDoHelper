@@ -36,8 +36,27 @@ static int s_year = 2026;
 static int s_month = 1;
 static bool s_have_date;
 
+/**
+ * Last values painted into the clock label.
+ *
+ * refresh_clock() runs every second (tick_period_ms = 1000) but only the seconds
+ * field changes that often, so the label is rewritten only when a field it
+ * actually shows differs. Without this the 1 Hz write invalidated the label and
+ * re-laid-out the enclosing flex column every second (smoothness audit P1-8).
+ */
+static bool s_clock_text_synced;
+static int s_last_sec = -1;
+static int s_last_min = -1;
+static int s_last_hour = -1;
+static int s_last_mday = -1;
+static int s_last_mon = -1;
+static int s_last_year = -1;
+
 /** UTF-8 weekday names: one entry per column, indexed like tm_wday. */
 static const char *const s_week_names[] = { "日", "一", "二", "三", "四", "五", "六" };
+
+/* Defined below, needed by the sync-result handler declared earlier. */
+static void refresh_clock(void);
 
 /* ------------------------------------------------------------------------ */
 /* Grid                                                                      */
@@ -139,9 +158,29 @@ static void today_clicked_cb(lv_event_t *e)
 static void refresh_clicked_cb(lv_event_t *e)
 {
     (void)e;
-    ui_toast("正在校时…");
-    esp_err_t err = calendar_sync_ntp(0);
+    /* Async: the synchronous variant waits up to 10 s on the network while the
+     * LVGL lock is held, which froze the whole UI (smoothness audit P0). The
+     * outcome arrives as CALENDAR_EVENT_SYNC_RESULT. */
+    const esp_err_t err = calendar_sync_ntp_async();
+    if (err == ESP_ERR_TIMEOUT) {
+        ui_toast("正在校时，请稍候…");
+    } else if (err != ESP_OK) {
+        ui_toast("校时失败：%s", esp_err_to_name(err));
+    } else {
+        ui_toast("正在校时…");
+    }
+}
+
+/** Result of a requested sync, marshalled onto the LVGL task by ui_core. */
+static esp_err_t calendar_on_sync_result(int32_t event_id, void *data)
+{
+    (void)event_id;
+    const esp_err_t err = (data != NULL) ? *(const esp_err_t *)data : ESP_FAIL;
     ui_toast(err == ESP_OK ? "校时成功" : "校时失败：%s", esp_err_to_name(err));
+    if (err == ESP_OK) {
+        refresh_clock();
+    }
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -157,8 +196,11 @@ static void refresh_clock(void)
     const bool synced = calendar_time_synced();
     if (!synced) {
         /* Requirement FR4: "时间未同步", never 1970. */
-        lv_label_set_text(s_clock, UI_STATUS_TIME_UNSYNCED);
-        lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT_MUTED, 0);
+        if (s_clock_text_synced) {
+            s_clock_text_synced = false;
+            lv_label_set_text(s_clock, UI_STATUS_TIME_UNSYNCED);
+            lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT_MUTED, 0);
+        }
         if (s_have_date) {
             s_have_date = false;
             render_grid();
@@ -174,10 +216,26 @@ static void refresh_clock(void)
     static const char *const weekdays[] = { "日", "一", "二", "三", "四", "五", "六" };
     const char *wd = (now.tm_wday >= 0 && now.tm_wday < 7) ? weekdays[now.tm_wday] : "?";
 
-    lv_label_set_text_fmt(s_clock, "%02d:%02d:%02d\n%04d-%02d-%02d 星期%s",
-                          now.tm_hour, now.tm_min, now.tm_sec,
-                          now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, wd);
-    lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT, 0);
+    /* Only repaint when a *displayed* field changed. The label is not fixed
+     * width, so re-setting identical text still invalidates it and makes the
+     * enclosing flex column re-layout - and this runs at 1 Hz (audit P1-8). */
+    if (!s_clock_text_synced || now.tm_sec != s_last_sec || now.tm_min != s_last_min ||
+        now.tm_hour != s_last_hour || now.tm_mday != s_last_mday ||
+        now.tm_mon != s_last_mon || now.tm_year != s_last_year) {
+        lv_label_set_text_fmt(s_clock, "%02d:%02d:%02d\n%04d-%02d-%02d 星期%s",
+                              now.tm_hour, now.tm_min, now.tm_sec,
+                              now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, wd);
+        s_last_sec = now.tm_sec;
+        s_last_min = now.tm_min;
+        s_last_hour = now.tm_hour;
+        s_last_mday = now.tm_mday;
+        s_last_mon = now.tm_mon;
+        s_last_year = now.tm_year;
+        if (!s_clock_text_synced) {
+            s_clock_text_synced = true;
+            lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT, 0);
+        }
+    }
 
     /* Adopt the real month the first time the clock becomes valid. */
     if (!s_have_date) {
@@ -333,6 +391,9 @@ static esp_err_t calendar_create(lv_obj_t *parent)
 
     (void)ui_event_bind(CALENDAR_EVENT, CALENDAR_EVENT_TIME_SYNCED, UI_PAGE_CALENDAR, 0);
     (void)ui_event_bind(CALENDAR_EVENT, CALENDAR_EVENT_TIMEZONE_CHANGED, UI_PAGE_CALENDAR, 0);
+    /* Outcome of a *requested* sync (this page's NTP button). */
+    (void)ui_event_subscribe(CALENDAR_EVENT, CALENDAR_EVENT_SYNC_RESULT,
+                             sizeof(esp_err_t), calendar_on_sync_result);
     SYS_LOGD(TAG, "calendar page built");
     return ESP_OK;
 }

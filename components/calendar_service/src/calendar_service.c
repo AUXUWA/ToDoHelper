@@ -15,6 +15,7 @@
 #include "esp_heap_caps.h"
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "calendar";
 
@@ -33,6 +34,90 @@ static bool s_initialized;
 static bool s_sntp_started;
 static char s_tz[48] = CONFIG_TODOHELPER_TZ_DEFAULT;
 static char s_ntp[64] = CONFIG_TODOHELPER_NTP_SERVER;
+
+/*
+ * Async sync worker.
+ *
+ * calendar_sync_ntp() blocks on a network round trip for up to 10 s. Every LVGL
+ * timer and widget event callback runs with the adapter lock held (the adapter
+ * calls lv_timer_handler() under it, see AGENT.md 9.0.1), so a button callback
+ * that waited for NTP used to freeze the entire UI - and, because
+ * ui_post_event() also takes that lock, the whole event system behind it.
+ *
+ * The worker is created once, on first request, and then parks on a task
+ * notification. It is intentionally *not* created in init: a device that never
+ * asks for a manual sync (the common case - SNTP starts by itself when the link
+ * comes up) pays nothing for it.
+ */
+#define CALENDAR_SYNC_TASK_STACK 3072
+#define CALENDAR_SYNC_TASK_PRIO  4
+
+static TaskHandle_t s_sync_task;
+static volatile bool s_sync_pending;
+/** Serialises lazy worker creation without pulling in a mutex at init time. */
+static StaticSemaphore_t s_sync_lock_buf;
+static SemaphoreHandle_t s_sync_lock;
+
+static void sync_worker(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        /* calendar_sync_ntp() posts SYNC_FAILED itself; a *requested* sync also
+         * reports back through SYNC_RESULT so the UI can toast the outcome. */
+        const esp_err_t err = calendar_sync_ntp(0);
+
+        s_sync_pending = false;
+        (void)sys_event_post_to(CALENDAR_EVENT, CALENDAR_EVENT_SYNC_RESULT,
+                                &err, sizeof(err));
+    }
+}
+
+esp_err_t calendar_sync_ntp_async(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_sync_pending) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_sync_lock == NULL) {
+        s_sync_lock = xSemaphoreCreateMutexStatic(&s_sync_lock_buf);
+        if (s_sync_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    xSemaphoreTake(s_sync_lock, portMAX_DELAY);
+    if (s_sync_task == NULL) {
+        /* Internal RAM on purpose: this task never writes flash, but it is small
+         * and the pool that matters on this board is internal (AGENT.md 9.0). */
+        const BaseType_t ok = xTaskCreate(sync_worker, "th_ntp",
+                                          CALENDAR_SYNC_TASK_STACK, NULL,
+                                          CALENDAR_SYNC_TASK_PRIO, &s_sync_task);
+        if (ok != pdPASS) {
+            s_sync_task = NULL;
+            xSemaphoreGive(s_sync_lock);
+            SYS_LOGE(TAG, "cannot create the sync worker");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    TaskHandle_t task = s_sync_task;
+    xSemaphoreGive(s_sync_lock);
+
+    s_sync_pending = true;
+    SYS_LOGI(TAG, "async NTP sync requested");
+    xTaskNotifyGive(task);
+    return ESP_OK;
+}
+
+bool calendar_sync_ntp_pending(void)
+{
+    return s_sync_pending;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Timezone                                                                  */

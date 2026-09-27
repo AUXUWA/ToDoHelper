@@ -34,7 +34,16 @@ ESP_EVENT_DECLARE_BASE(CALENDAR_EVENT);
 typedef enum {
     CALENDAR_EVENT_TIME_SYNCED = 0, /**< payload: int64_t unix seconds */
     CALENDAR_EVENT_SYNC_FAILED,     /**< no payload */
-    CALENDAR_EVENT_TIMEZONE_CHANGED /**< payload: const char *tz */
+    CALENDAR_EVENT_TIMEZONE_CHANGED,/**< payload: const char *tz */
+    /**
+     * Result of a *requested* sync, i.e. calendar_sync_ntp_async().
+     *
+     * payload: esp_err_t (ESP_OK on success, ESP_ERR_TIMEOUT on failure).
+     * The unsolicited background sync only posts TIME_SYNCED/SYNC_FAILED; this
+     * event exists so a UI that asked for a sync can tell the user the outcome
+     * without ever blocking on the network (see calendar_sync_ntp_async()).
+     */
+    CALENDAR_EVENT_SYNC_RESULT
 } calendar_event_id_t;
 
 /** Timezone used when the NVS key is absent: China Standard Time. */
@@ -55,8 +64,33 @@ esp_err_t calendar_service_init(void);
  *
  * @param timeout_ms 0 uses the default (10 s).
  * @return ESP_OK when the clock is synchronised, ESP_ERR_TIMEOUT otherwise.
+ *
+ * @warning **Never call this from the LVGL task.** It blocks for up to
+ *          @p timeout_ms on a network round trip, and every LVGL timer/event
+ *          callback runs with the adapter lock held (see AGENT.md 9.0.1), so
+ *          calling it from a button callback freezes the whole UI for the
+ *          entire timeout. Use calendar_sync_ntp_async() from UI code.
+ *          It is safe to call from a dedicated worker task (HTTP handlers do
+ *          this deliberately when the caller wants a synchronous answer).
  */
 esp_err_t calendar_sync_ntp(uint32_t timeout_ms);
+
+/**
+ * @brief Request a time synchronisation without blocking the caller.
+ *
+ * Returns immediately. The work runs on calendar_service's own worker task and
+ * the outcome is reported as CALENDAR_EVENT_SYNC_RESULT (payload: esp_err_t),
+ * so a page can subscribe with ui_event_subscribe() and show a toast when it
+ * lands. This is the variant every UI path must use.
+ *
+ * @return ESP_OK if the request was queued, ESP_ERR_INVALID_STATE if the
+ *         service is not initialised, ESP_ERR_TIMEOUT if a request is already
+ *         in flight (the caller may treat that as "already syncing").
+ */
+esp_err_t calendar_sync_ntp_async(void);
+
+/** @brief True while a calendar_sync_ntp_async() request is in flight. */
+bool calendar_sync_ntp_pending(void);
 
 /** @brief True once a real wall-clock time is available. */
 bool calendar_time_synced(void);

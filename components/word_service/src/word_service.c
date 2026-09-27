@@ -62,6 +62,47 @@ static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
 
 /* ------------------------------------------------------------------------ */
+/* Deferred saving                                                           */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * word_save_progress() serialises every reviewed word and rewrites the whole
+ * file on the SD card (open -> write -> remove -> rename). It used to be called
+ * directly from two LVGL widget callbacks - grading a card and tapping the
+ * daily-count buttons - which run *with the adapter lock held*, because the
+ * adapter calls lv_timer_handler() under it (AGENT.md 9.0.1). Every tap
+ * therefore stalled rendering for the duration of a FAT write.
+ *
+ * Requests now only wake a worker that coalesces them: tapping "+5" ten times
+ * produces one write, and the UI never waits for the card.
+ */
+#define WORD_SAVE_TASK_STACK 4096
+#define WORD_SAVE_TASK_PRIO  3
+/** Coalescing window: long enough to absorb a burst of taps, short enough that
+ *  losing power right after grading costs at most this much. */
+#define WORD_SAVE_DEBOUNCE_MS 600
+
+static TaskHandle_t s_save_task;
+static StaticSemaphore_t s_save_lock_buf;
+static SemaphoreHandle_t s_save_lock;
+
+static void word_save_worker(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* Absorb a burst of requests before touching the card. */
+        vTaskDelay(pdMS_TO_TICKS(WORD_SAVE_DEBOUNCE_MS));
+
+        const esp_err_t err = word_save_progress();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            SYS_LOGW(TAG, "deferred progress save failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------ */
 
@@ -341,6 +382,43 @@ esp_err_t word_save_progress(void)
         (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_PROGRESS_SAVED, NULL, 0);
     }
     return err;
+}
+
+/**
+ * Mark the progress dirty and let the worker write it out. Never blocks on the
+ * card, so it is safe to call from an LVGL callback. See the block comment at
+ * word_save_worker().
+ */
+esp_err_t word_save_progress_async(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_save_lock == NULL) {
+        s_save_lock = xSemaphoreCreateMutexStatic(&s_save_lock_buf);
+        if (s_save_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    xSemaphoreTake(s_save_lock, portMAX_DELAY);
+    if (s_save_task == NULL) {
+        const BaseType_t ok = xTaskCreate(word_save_worker, "th_word_save",
+                                          WORD_SAVE_TASK_STACK, NULL,
+                                          WORD_SAVE_TASK_PRIO, &s_save_task);
+        if (ok != pdPASS) {
+            s_save_task = NULL;
+            xSemaphoreGive(s_save_lock);
+            SYS_LOGE(TAG, "cannot create the progress writer");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    TaskHandle_t task = s_save_task;
+    xSemaphoreGive(s_save_lock);
+
+    xTaskNotifyGive(task);
+    return ESP_OK;
 }
 
 static esp_err_t load_progress(void)
@@ -763,7 +841,9 @@ esp_err_t word_review(uint32_t id, word_review_result_t result)
 
     (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_REVIEWED, &id, sizeof(id));
     (void)sys_notify("word_reviewed", NULL);
-    return word_save_progress();
+    /* Deferred: grading happens in an LVGL callback, so it must not wait for the
+     * card. The worker coalesces a burst of grades into one write. */
+    return word_save_progress_async();
 }
 
 esp_err_t word_stats(word_stats_t *out)
@@ -824,7 +904,7 @@ esp_err_t word_set_daily_count(uint32_t count)
     xSemaphoreGive(s_lock);
 
     const esp_err_t err = sys_config_set_i32(SYS_KEY_WORD_DAILY, (int32_t)count);
-    return (err == ESP_OK) ? word_save_progress() : err;
+    return (err == ESP_OK) ? word_save_progress_async() : err;
 }
 
 esp_err_t word_reset_progress(void)
@@ -845,7 +925,7 @@ esp_err_t word_reset_progress(void)
     xSemaphoreGive(s_lock);
 
     SYS_LOGI(TAG, "progress reset");
-    return word_save_progress();
+    return word_save_progress_async();
 }
 
 /* ------------------------------------------------------------------------ */

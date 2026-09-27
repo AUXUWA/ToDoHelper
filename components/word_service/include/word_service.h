@@ -133,8 +133,26 @@ esp_err_t word_queue_position(size_t *position, size_t *total);
  */
 esp_err_t word_review(uint32_t id, word_review_result_t result);
 
-/** @brief Persist progress to `words/progress.json`. */
+/**
+ * @brief Persist progress to `words/progress.json`.
+ *
+ * @warning **Never call this from the LVGL task.** It serialises every reviewed
+ *          word and rewrites the whole file on the SD card, and LVGL callbacks
+ *          run with the adapter lock held (AGENT.md 9.0.1), so calling it from a
+ *          button handler stalls rendering for the duration of a FAT write.
+ *          word_review(), word_set_daily_count() and word_reset_progress() all
+ *          use word_save_progress_async() internally for this reason; call this
+ *          only from a worker task or when the result must be known immediately.
+ */
 esp_err_t word_save_progress(void);
+
+/**
+ * @brief Mark progress dirty and write it from a worker task (never blocks).
+ *
+ * Requests are coalesced inside a short debounce window, so a burst of grades or
+ * taps produces a single write. This is the variant every UI path must use.
+ */
+esp_err_t word_save_progress_async(void);
 
 /** @brief Aggregate counters for the UI and the HTTP API. */
 esp_err_t word_stats(word_stats_t *out);
