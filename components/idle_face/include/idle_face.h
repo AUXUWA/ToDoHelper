@@ -22,6 +22,11 @@
  *     spontaneous moods (a brief random expression every 13-34 s), pupil
  *     dilation, whole-face drift, and a drowsiness value that builds up while
  *     nobody interacts and is wiped out by any real activity;
+ *   - four continuous/reflexive layers (v1.2.0) remove the "posing between
+ *     events" feel: a slow 2-D gaze wander so the pupils are never perfectly
+ *     still, a lid settle that springs past the resting height after a blink,
+ *     an occasional attention perk (eyes widen, pupils constrict - no expression
+ *     change), and asymmetric blinks where the two lids differ;
  *   - entering standby keeps the live NORMAL face (see
  *     idle_face_standby_enter()) and leaving it widens the eyes briefly
  *     (idle_face_standby_exit(), driven by the idle page's on_show/on_hide).
@@ -91,11 +96,14 @@ esp_err_t idle_face_standby_enter(void);
  * Called by the idle page's @c on_hide, i.e. when the screen is woken. Also wipes
  * the drowsiness and any spontaneous mood, because the user is back.
  *
- * Visible only because `ui_core` keeps the outgoing page around for
- * `UI_PAGE_ANIM_OUT_MS` (240 ms) while it cross-fades to the next page - the
- * overshoot peak sits at ~200 ms, inside that window. Returns
- * @c ESP_ERR_INVALID_STATE when an expression owns the face (which must not be
- * replaced by a yawn).
+ * @note Since v1.2.0 the page switch is an atomic same-frame swap (the cross-fade
+ *       was removed - it caused the previous page to ghost, see AGENT.md
+ *       9.0.1.1), so this overshoot is **no longer visible on screen**: the idle
+ *       page is gone in the same frame. The envelope is kept because it is
+ *       harmless and correct, and because a future host may render the face
+ *       somewhere it can be seen (for example as an overlay on lv_layer_top()).
+ *       Returns @c ESP_ERR_INVALID_STATE when an expression owns the face (which
+ *       must not be replaced by a yawn).
  */
 esp_err_t idle_face_standby_exit(void);
 
