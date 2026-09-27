@@ -3,7 +3,7 @@
 **ESP32-S31-Korvo 上的局域网待办助手**：待办清单 / 天气 / 日历 / 单词书 / 待机小眼睛 / AI 对话，
 一块 800×480 触摸屏 + 一个内嵌浏览器上位机，数据落在 SD 卡（或片内 LittleFS）。
 
-> **当前版本：`1.1.0`**（工程根目录 `version.txt`，同时出现在设备「设置」页、开机页、
+> **当前版本：`1.3.0`**（工程根目录 `version.txt`，同时出现在设备「设置」页、开机页、
 > `GET /api/v1/device/info` 的 `version` 与 `build/todohelper.bin` 的 app descriptor 里）。
 > 版本规则与发布步骤见 `AGENT.md §8.1`，变更历史见 `CHANGELOG.md`。
 
@@ -20,10 +20,16 @@
 | 天气（Open-Meteo，免 Key）+ IP 定位 + 定时刷新 + 缓存降级 | ✅ |
 | 日历：SNTP 校时 + POSIX 时区 + 月历（无 RTC，断电不保持） | ✅ |
 | 单词：CET-6 词库（833 词，放 SD 卡）+ 翻卡 + 三档评分 + 间隔复习 | ✅ |
+| 单词云端同步：墨墨背单词（开放 API）今日队列 / 真实进度 / 助记例句缓存 / 反向推词 | ✅ 未上机 |
 | 待机小眼睛：纯程序化绘制，11 种表情（眨眼/半眯/慢眨/二连看/呼吸 + 自发小表情/困倦度/瞳孔缩放/整脸漂移） | ✅ |
 | 设置页：固件版本/亮度/待机/时区/单词数/HTTP token/设备信息 | ✅ |
 | AI 对话（DeepSeek，流式）+ 小眼睛联动 | ✅ |
 | 语音：录音回放真实可用；ASR/TTS 走可配置 HTTP 端点（选型未定） | ⚠️ 半成品 |
+
+> **墨墨背单词是可选功能**：令牌存 NVS（`mm_token`），从网页上位机的「墨墨背单词」面板录入，
+> **只写不读、不记日志**（与 AI Key 同规则）。**不配令牌就静默降级**：云端模式关闭，
+> 本地 CET-6 词库照常工作。云端队列用 NVS `mm_mode` 切换，反向推词（把「不认识」的词推回
+> 墨墨学习计划）默认关闭，因为那会**改动账号数据**，需要显式用 NVS `mm_push` 开启。
 
 ## 快速开始
 
@@ -39,6 +45,19 @@ pwsh tools\flash.ps1 -NoBuild
 # 3) 抓开机日志（idf.py monitor 不能脚本化）
 python tools\monitor_capture.py --port COM34 --seconds 20 --out build\boot.log
 ```
+
+**在 Git-Bash / 自动化里构建**（MSYS 下 `idf.py` 会直接拒绝运行）：
+
+```bash
+# 1.3.0 新增：bash 入口包装器，把活交给原生 powershell 并原样回传退出码
+bash tools/build.sh build          # 等价于 idf.py build
+bash tools/build.sh flash          # 等价于 idf.py flash
+bash tools/build.sh -v build       # 详细构建
+```
+
+输出同时重定向到 `build_last.log`（已 gitignore）。三个会**静默产出空日志 + 退出码 0** 的坑
+（profile 把 `idf.py` 定义成函数、原生 exe 接不进 cmdlet 管道、`env -i` 清空环境）
+记录在 `AGENT.md §4.2`。
 
 开机后浏览器打开 **`http://todohelper.local/`**（或设备 IP，本机实测 `192.168.137.110`）。
 SD 卡只需 FAT32 可挂载：`<卡根>/todohelper/` 下的词库、字体、待办缓存由固件首次启动自动创建

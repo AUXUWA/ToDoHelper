@@ -5,27 +5,34 @@
 > 配套阅读顺序：**本文档 → `AGENT.md`（环境/命令/全部实测坑，尤其 §9.0~§9.0.5、§9.7）→
 > `docs/TODOHELPER_REQUIREMENTS.md`（需求）→ `docs/TODOHELPER_FRAMEWORK.md`（框架）→ `docs/API.md`（组件与 HTTP 接口）**。
 >
-> 最后更新：**`v1.2.0`** —— 系统流畅度优化第一轮（消除 LVGL 锁内阻塞 I/O + 高频无效重绘）。
+> 最后更新：**`v1.3.0`** —— 单词学习接入墨墨背单词（开放 API，方案 A/B/C）+ 音标字形修复
+> + Git-Bash 构建包装器。**本轮的代码只构建、未烧录**，所以文中凡"真机"字样都指 v1.2.0 及更早。
 > 提交与标签见 §6；版本变更细节见 `CHANGELOG.md`。
 
 ---
 
 ## 0. 一句话现状
 
-**版本 `1.2.0`。8 项需求全部实现；构建 0 错误 0 警告；两个阻塞性缺陷此前已修复；
-本轮修掉"界面卡顿"的全部真实根因（含一次上机实测到的 `interrupt wdt timeout`）。
+**版本 `1.3.0`。8 项需求全部实现；构建 0 错误 0 警告（`todohelper.bin` 0x2e4fd0，app 分区剩 64%）；
+两个阻塞性缺陷此前已修复；流畅度第一轮的根因（含一次上机实测到的 `interrupt wdt timeout`）
+已修完。本轮的云端同步三方案与音标修复都**尚未上机**（接口已对线上 API 实测），
 当前没有已知阻塞问题。**
 
-本轮（流畅度）的成果与判据：
+本轮（墨墨同步 + 音标）的成果与判据：
 
-| 项 | 修前 | 修后 |
+| 项 | 修前 / 之前 | 修后 |
 |---|---|---|
-| 点"校时" | 持 LVGL 锁等待网络，**最多冻屏 10 s**，并连带冻住整个事件系统 | 异步（`th_ntp` 任务）+ 结果 toast，回调立即返回 |
-| 单词评分 / 调词数 / 切时区 | 持锁做 cJSON 序列化 + SD 整文件重写 / NVS flash 写 | 异步，200 ms 级合并写入 |
-| 事件投递 | 发布者取 LVGL 锁（事件循环与渲染互相阻塞） | 无锁队列 + 20 ms 排空 timer，彻底解耦 |
-| 常驻重绘 | 状态栏每秒 4 标签 + 4 改色；首页/日历各 1 Hz；设置页滑杆 4 Hz 且**定时器泄漏** | 全部加脏检查；泄漏定时器在 `on_hide` 暂停 |
-| 冷启动 | 9 模块 ready | 9 模块 ready，`internal 66 KB / largest 22 KB`（与修前持平） |
-| 压力复现 | DNS 失败 + 通知突发 → **interrupt wdt panic** | 复现 ×3，0 panic |
+| 音标 `/əˈbrʌpt/` | 渲染成 `/ br pt/`（元音全空白）—— 根源是 **Noto Sans SC 里没有 IPA 字形**，Montserrat 兜底也无效 | `merge_ipa_glyphs()` 从拉丁字体合入 **203 个字形**（×0.488），词书 1252 字符 **0 缺失** |
+| 字体产物校验 | 只查 cmap（**所以坏字体通过了**） | `validate_font()` **重新打开产物**逐表核对度量，不过就构建失败 |
+| 单词来源 | 只认本地 CET-6 词库（833 词） | 云端模式今日队列与**账号真实进度**来自墨墨（实测 10/20、20 词队列） |
+| 助记/例句 | 没有 | 缓存到 `words/enrich.json`，卡片离线也能显示（**快乐路径未在设备上观察到**，见 §9） |
+| 不会的词 | 只记在本地 | 可选推回墨墨学习计划（**默认关闭**，因为会改账号数据） |
+| 从 Git-Bash 构建 | `idf.py` 直接拒绝运行 | `bash tools/build.sh build`（三个坑见 §5 第 11 条） |
+
+> **最重要的认知之一**（已写入 `AGENT.md §9.0.4.2`）：**检查写错了比没有检查更糟。**
+> 第一版字体校验只问"文件里有没有 ə？"，而 `vmtx` 短了 406 字节的坏字体
+> **每个 cmap 条目都在**，于是检查通过、坏字体照样出厂。事后校验必须
+> **重新打开产物**并**按表逐项核对**，而不是在原对象上查一个字段。
 
 > **最重要的认知**（已写入 `AGENT.md §9.0.1.1`，改 UI 前必读）：适配器在**持有递归锁**
 > 的情况下调用 `lv_timer_handler()`，所以 `lv_timer` 回调与**所有控件事件回调都在锁内**。
@@ -88,6 +95,99 @@
 - **L0 `SYS_EVENT_TIME_SYNCED` 事件**：已在 `AGENT.md §9.7` 降级为**可选** —— `weather_task`
   现在会等时钟最多 75 秒，已覆盖原场景。
 
+### 0.5.5 v1.3.0 这一轮做了什么（墨墨同步 + 音标修复）
+
+**用户要的两件事**：① 把单词学习接到**墨墨背单词（开放 API）**，让设备显示账号的真实进度；
+② 修掉音标显示成 `/ br pt/` 的问题。用户从三个方案里确认了 **A / B / C 全做**。
+
+#### ① 音标缺失：根因是"源字体里根本没有 IPA 字形"
+
+- **现象**：`/əˈbrʌpt/` 渲染成 `/ br pt/`，元音符号整片空白。
+- **根因**：**Noto Sans SC（CJK 子集的来源）里一个 IPA 字形都没有** —— U+0259 ə、U+028C ʌ、
+  U+026A ɪ、U+02D0 ː、U+02C8 ˈ 等**不在它的 cmap 里**，字符集写多大都取不出来。
+  **LVGL 内置的 Montserrat 兜底也无效**（cmap 稀疏，只有 FontAwesome 区段）。
+  也就是说 §9.0.4 那条 fallback 链对 IPA 帮不上忙。
+- **修法**（`tools/gen_cjk_font.py` 的 `merge_ipa_glyphs()`）：把 IPA 字形从**一份拉丁字体**
+  合入 CJK 子集（Linux DejaVu Sans；Windows `segoeui`/`arial`/`calibri`）。
+  - `fontTools.merge` **不能用**：它断言两边 `unitsPerEm` 相等，而拉丁是 **2048**、CJK 是 **1000**
+    → 只能手写合并 + **坐标/advance 缩放 0.488**。
+  - 字形必须**展平成普通轮廓**：组件会引用目标字体里不存在的字形 → 编译期 `KeyError: 'uni02BE'`。
+  - 实测从 `segoeui.ttf` 合入 **203 个字形**。
+- **验收数值**：词书 **1252 个不同字符、0 缺失**；`/əˈbrʌpt/` 全部有真实轮廓，
+  advance 已正确缩放（ə=523 vs b=618 / r=388 / p=620）。
+
+#### ② 顺带挖出的潜伏 bug：`vmtx` 没跟着 `hmtx` 一起更新
+
+- 第一版合并更新了 `hmtx` 却漏了 `vmtx`。两张表都以**字形名**为键、都必须**每个字形一条记录**，
+  所以产物本身已经不合法：**`vmtx` 少 406 字节（2 × 203）**，
+  fontTools 连**重新解析**都做不到 —— `not enough 'vmtx' table data: expected 10686, got 10280`。
+  **这份 CJK 子集确实带中文竖排度量**（`vmtx`/`vhea` 都在），所以不是理论问题。
+- **为什么它会出厂**：当时的校验只问 **"文件里有没有 ə？"**，而坏字体**每个 cmap 条目都在** →
+  **检查通过**。`cmap` 只描述码位到字形名的映射，**完全不涉及度量表**。
+- **修法两半**：给每个合入的字形**同时写 `vmtx` 记录**，并把
+  `hhea.numberOfHMetrics` / `vhea.numberOfVMetrics` **夹到字形总数以内**；
+  新增 **`validate_font()`**：重新打开**保存后**的文件，核对
+  `len(hmtx.metrics) == len(vmtx.metrics) == maxp.numGlyphs`、计数不越界、必需字符在 cmap 里，
+  **不过就 `sys.exit()` 让构建失败**。校验只要求**内容字符**（词书字符 + 有拉丁源时的 IPA），
+  不要求装饰性 Unicode 区段 —— 否则会变成人人无视的噪音。
+
+#### ③ 新组件 `components/maimemo_client/`（墨墨开放 API，三个方案）
+
+| 方案 | 内容 | 默认 |
+|---|---|---|
+| **A 学习同步** | 今日队列与**账号真实进度**来自墨墨，而不是本地书。`/study/get_study_progress`、`/study/get_today_items`、`/study/query_study_records`（`{"as_count":true}` 取计划词数）。**实测线上**：10/20 完成、20 词队列 | 需令牌 + NVS `mm_mode=cloud` |
+| **B 助记/例句预取** | `/notes`、`/phrases` 缓存到 `<app_dir>/words/enrich.json`（`storage_read_text()` / `storage_write_file()` **原子写**），整文件读进 PSRAM、整文件重写 | 需令牌**且有读取作用域** |
+| **C 反向推送** | 评为「不认识」的词用 `/study/add_words` 推回墨墨学习计划 | **默认关闭**（会改账号数据），NVS `mm_push` |
+
+- **令牌与作用域是一等问题**：存 NVS `mm_token`（`sys_config_set_str`），网页控制台录入，
+  **不记日志、任何 API 都不回读**（与 AI Key 同规则，需求 §8.8）；
+  `GET /api/v1/maimemo/status` 只回 `configured` + 掩码提示（`g_zV****`）。
+  **用户的令牌是学习作用域的**：`/study/*` 可用，`/notes`、`/phrases` 返回
+  `common_permission_denied`。这被映射为 **`ESP_ERR_NOT_SUPPORTED`**（"别再问了"）
+  并**按词缓存为不可用**，而不是当错误反复重试 —— 能同步队列但不显示助记的设备**仍是有用的**。
+- **错误模型**：墨墨**权限错误也返回 HTTP 200**，错误写在信封的 `success:false` +
+  `errors[].code` 里 → **只看状态码会漏掉全部权限/参数错误**，必须解析信封
+  （`AGENT.md §9.0.6 ①`）。
+- **`advance` 是 `/study/add_words` 的必需属性**：漏掉它即使请求其它部分合法也报
+  `common_invalid_param: {base} must have required property 'advance'`。现在**永远发送**
+  （`false` 也发），并回报**服务器自己的 `added_count`**而不是发送条数（`AGENT.md §9.0.6 ②`）。
+- **无令牌静默降级**：云端模式无声关闭，本地 CET-6 词库照常工作，不报错不弹窗
+  （`maimemo_client` 在 `app_main.c` 里是 `optional = true`）。
+- **线程规则**：组件内所有网络函数都是**阻塞 TLS**，**绝不允许从 LVGL 任务调用**
+  （LVGL 回调持有适配器锁，见 `AGENT.md §9.0.1.1`）。UI 只调 `maimemo_sync_start()`
+  （worker 任务 + 事件回调）或只读内存的 `maimemo_get_cached_progress()`；
+  `page_word.c` 的助记预取用 `lv_async_call` 起一次性任务。
+
+#### ④ UI 与网页
+
+- **`page_word.c`**：云端模式下显示账号真实进度
+  （「墨墨今日 10/20 · 已用 59 秒 · 计划 20 词」，否则回退本地计数器）；
+  **小于 1 分钟时显示秒**，因为把 59 秒四舍五入成「0 分」读起来是"你今天没学过"。
+  助记/例句显示在答案下方（方案 B），拿不到时**整块隐藏**。
+- **网页上位机新增「墨墨背单词（开放 API）」面板**
+  （`components/sync_server/web/index.html`）：令牌录入（**只写不读**，已核实无回显路径）、
+  推送开关、带轮询的「立即同步」、今日词表查看器。
+- **`word_service` 新增云端队列**：`word_cloud_mode()` / `word_set_cloud_mode()` /
+  `word_cloud_refresh()` / `word_cloud_count()`。云端词按 `voc_spelling` **匹配回本地词库**，
+  匹配得上就继续用本地 level / 间隔；匹配不上的标 `WORD_ID_CLOUD`。
+
+#### ⑤ 构建工具 `tools/build.sh`（MSYS 下不能直接驱动 `idf.py`）
+
+MSYS/Git-Bash 里 `idf.py` **拒绝运行**（ESP-IDF 的 wrapper 检测 MSYS 环境后打印
+`MSys/Mingw is no longer supported`）。新增 `tools/build.sh`（bash 入口）+ `tools/build.ps1`：
+
+```bash
+bash tools/build.sh build      # 或 flash，或 -v build
+```
+
+三个坑**都会静默产出空日志 + 退出码 0**，详见 §5 第 11 条与 `AGENT.md §4.2.1`。
+
+#### ⑥ 本轮新增的 HTTP 路由（6 条）
+
+`GET /api/v1/maimemo/status`、`POST /api/v1/maimemo/config`、`POST /api/v1/maimemo/sync`、
+`GET /api/v1/maimemo/today`、`GET /api/v1/maimemo/enrich?spelling=`、
+`POST /api/v1/maimemo/push`。组件细节见 `components/maimemo_client/README.md`。
+
 ---
 
 ## 1. 环境与命令（原文档漏了标题）
@@ -126,6 +226,14 @@ python -m esptool --chip esp32s31 -p COM34 -b 921600 --before=default-reset --af
 ```powershell
 python tools\monitor_capture.py --port COM34 --seconds 16 --out build\boot.log   # 会做一次复位
 python tools\monitor_capture.py --port COM34 --seconds 16 --no-reset --out build\x.log
+```
+
+**在 Git-Bash / 自动化里构建**（v1.3.0 新增；MSYS 下 `idf.py` 会直接拒绝运行）：
+
+```bash
+bash tools/build.sh build          # 等价 idf.py build（默认动作就是 build）
+bash tools/build.sh flash          # 等价 idf.py flash
+bash tools/build.sh -v build       # 详细构建；日志同时落在 build_last.log（已 gitignore）
 ```
 
 ---
@@ -203,6 +311,10 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 
 > 回归复现命令：`python tools\monitor_capture.py --port COM34 --seconds 18 --out build\boot.log`，
 > 然后统计 `abort\(\) was called` 与 `TH:app: ready` 的出现次数。
+> **v1.3.0 起模块数从 9 变成 10**（新增 `maimemo_client`，`optional = true`，
+> 排在 `word_service` 之前）—— 上面这行"9 模块全 ready"是 v1.0.0 的记录，
+> 下次上机应当看到 **10 模块 ready**（无令牌时 `TH:maimemo: ready (token=unset, push=off)`
+> 也算 ready，**不会**因为没有令牌而失败）。
 > **注意**：PC 侧偶发 `http 000` / ping 丢包是 Windows 热点的老问题（实测丢包 33%），
 > 不是设备问题 —— 判断设备死活请看串口的 `TH:wifi: link:` 行。
 
@@ -221,13 +333,17 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 | 6 | 开机屏幕滚动启动日志 | ✅ 已实现，**用户目视确认正常（2026-09-23）** | `sys_log` 新增无锁 64×80 环形缓冲（seqlock 发布、PSRAM 分配+内部 RAM 兜底、serial 路径不变）；`page_splash.c` 用 `lv_timer` 刷新并 tail 最新行。`main/app_main.c` 改为固定 3s 延迟（用户要求）后切 HOME；用户确认 3 秒内滚动顺畅、不卡启动 |
 | 7 | 时刻更新 harness 待办 | ✅ | 各轮均同步维护 |
 | 8 | 子 agent + 文档 + git | ✅ | 用了 8 个子 agent 分工；构建 0 错误 0 警告；文档已同步；全部提交见 §6 |
+| — | **v1.3.0 追加需求**：单词接墨墨（方案 A/B/C）+ 修音标 | ⚠️ **代码完成、线上 API 实测、未上机** | 详见 §0.5.5 与本轮 `CHANGELOG.md` 1.3.0 的 `### Verified（真机）` / `### Known gaps`。**用户下达的是"做"而非"烧录验证"**，本轮按此执行：没有烧录设备 |
 
 ---
 
 ## 4. 只有"人"能完成的验证（AI 做不了）
 
-> **状态：全部六项均已由用户确认（2026-09-23，含 1.1 的待机三层慢动作与开机交接淡入）。**
+> **状态：§4 前六项均已由用户确认（2026-09-23，含 1.1 的待机三层慢动作与开机交接淡入）。**
 > 下面是保留下来作为**回归清单** —— 以后改动 UI/HTTP/内存相关代码后，请再走一遍。
+>
+> **v1.3.0 追加了第 7 组（墨墨 + 音标），但它还没有被任何人验证过** ——
+> 本轮只构建、未烧录，所以下面第 7 组是**待办清单**而不是"已确认"。
 
 1. **待机动画**（1.1 重点）：
    - 基础层不变：待机时**保持睁眼**、按时眨眼、偶尔左右看；
@@ -238,11 +354,24 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 2. **开机日志**：3 秒内日志是否顺畅滚动、状态行省略号是否在动、是否卡启动。
 3. **待办页**：勾选完成/删除按钮的观感与误触率（删除按钮 52×34，放在行尾）。
 4. **开机 → 主界面的交接**（1.1 新增）：日志页应**淡出并微微上移**、主界面同时淡入滑入
-   （交叉淡入，约 0.24 s），不应有瞬间硬切；另外网页与设置页顶部应分别显示 `固件 1.1.0`。
+   （交叉淡入，约 0.24 s），不应有瞬间硬切；另外网页与设置页顶部应分别显示 `固件 1.3.0`。
 5. **网页**：页面打开后应能读到待办与设备状态；"推送：实时推送中"与能用的页面**同时**存在
    （1.0.0 之前这两者是互斥的，见 §3 需求 5）；离线/401 横幅、移动端布局。
 6. 若要继续做 WiFi 面板：`/api/v1/wifi/*` 7 条路由都已注册，本轮实测 `GET status` → connected、
    `POST scan` → `{"scanning":true}`、随后 `GET scan` → 22 个 AP（报文语义见 §7 第 4 条）。
+7. **v1.3.0 待验证（本轮全部未做）**：
+   - **音标**（最便宜、判据最硬）：把新生成的 `ui_cjk.ttf` 拷到
+     `<storage>/todohelper/fonts/` 覆盖同名文件后**重启**（**不需要重新烧录**）。
+     判据：单词卡背面的 `/əˈbrʌpt/` 里 ə、ʌ、ˈ、ː **不再是空白**；顺带确认没有新的方框。
+   - **墨墨面板**（网页）：「保存并校验」是否返回 `verify: "ok"`；令牌输入框
+     **刷新后应保持空白**（只写不读）；「立即同步」后设备单词页顶部是否变成
+     「墨墨今日 N/M · …」。
+   - **方案 B**：**当前令牌做不到**（学习作用域读不了 `/notes`）——
+     能验证的只是"没有助记时卡片不出现空白块、也不报错"。
+     要看到真助记得换一个能读 `/notes` 的令牌。
+   - **方案 C**：默认关闭。开启后评「不认识」，去墨墨 App 确认词**真的进了学习计划**
+     （设备侧只会打 `pushed to the study plan: N accepted of M resolved`）。
+   - **不配令牌的降级**：清掉令牌后重启，单词页应完整回退本地词库，**不报错、不弹窗**。
 
 ---
 
@@ -284,7 +413,30 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
    `httpd_req_async_handler_begin()` + 自己的任务。**这是本轮用户实测踩到的第二个坑**，
    详见 `AGENT.md §9.0.1` 最后一条（`/api/v1/ai/chat/stream` 还有同类隐患没修）。
 10. 更完整的坑位清单（内部 RAM 最紧处、PSRAM 栈不能碰 flash、日志格式陷阱、
-   `esp_log_writev` 原样输出、PHY 需 30KB 连续块……）全部在 **`AGENT.md §9.0 ~ §9.0.5`**。
+   `esp_log_writev` 原样输出、PHY 需 30KB 连续块……）全部在 **`AGENT.md §9.0 ~ §9.0.6`**。
+11. **MSYS 下 `idf.py` 根本不能被驱动，而且四个坑都静默失败（空日志 + 退出码 0）**（v1.3.0）：
+    - ESP-IDF 的 wrapper 检测到 MSYS 环境**直接拒绝运行**（`MSys/Mingw is no longer supported`）；
+    - IDF 的 PowerShell profile 把 `idf.py` 定义成**函数**并用 `@args` 转发，**该简写不绑定**
+      当调用方是 `powershell -Command`/`-File` → `idf.py build` 静默什么都不做；
+    - **原生 exe 接不进 cmdlet 管道**（`Cannot run a document in the middle of a pipeline:
+      ...python.exe`），所以 `| Tee-Object` 用不了；
+    - **`env -i` 清空环境是致命一击**：powershell 正常启动并打印横幅，但原生 python 子进程
+      **一点输出都没有**，`$LASTEXITCODE` 保持 `$null` → 空日志 + 假成功。
+      → 保留 bash 继承的环境，在 PowerShell **内部** `Remove-Item Env:MSYSTEM`
+      （在 bash 里 unset 没用：MSYS 会把它重新注入每个原生子进程）。
+    用 `bash tools/build.sh` 或照 `AGENT.md §4.2.1` 自己写；**日志是空的几乎必然是这四条之一**。
+12. **字体这类"多表互相索引"的二进制格式，改一处往往要改好几处**（v1.3.0）：
+    合并字形时只更新 `hmtx` 没更新 `vmtx`，产物**少 406 字节**、fontTools 连重新解析都做不到。
+    **而只查 cmap 的校验会愉快放行**（坏字体每个 cmap 条目都在）。
+    → 事后校验必须**重新打开产物、按表逐项核对**，且**校验的覆盖面要对着 bug 的类型设计**。
+    详见 `AGENT.md §9.0.4.2`。**检查写错了比没有检查更糟。**
+13. **对接第三方云 API 的两条通用规律**（v1.3.0，墨墨）：
+    ① **HTTP 200 也可能是失败** —— 错误写在 `success:false` + `errors[].code` 信封里，
+    只看状态码会漏掉全部权限/参数错误；
+    ② **哪些字段是必填只能靠实际打一次来确认** —— `/study/add_words` 的 `advance` 是**必填**
+    （漏了报 `common_invalid_param: ... must have required property 'advance'`，文档没写清）。
+    并且**返回值以对端自报的为准**（回报服务器的 `added_count`，不是我们发过去的条数）。
+    详见 `AGENT.md §9.0.6`。
 
 ---
 
@@ -292,7 +444,9 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 
 | commit / tag | 内容 |
 |---|---|
-| **`v1.1.0`**（tag） | **待机动画慢动作三层**（自发表情 / 困倦度 / 瞳孔缩放 + 整脸漂移）、**切页交叉淡入 + 离场动画窗口**（开机日志 → 主界面）、开机页动画省略号与真实版本号；顺带修掉 `standby_exit` 死代码、首次进待机被过期表情拒绝、开机页版本恒为 `0.1.0`（本轮提交） |
+| **`v1.3.0`**（tag，本轮） | **墨墨背单词开放 API（方案 A/B/C）**：新组件 `maimemo_client`（今日队列 + 账号真实进度 + 助记例句缓存 + 反向推词）、`page_word.c` 云端进度与助记显示、网页「墨墨背单词」面板、6 条 `/api/v1/maimemo/*` 路由；**音标修复**（`merge_ipa_glyphs()` 合入 203 个 IPA 字形）与潜伏的 `vmtx` 缺条目 bug（新增 `validate_font()`）；**`tools/build.sh` / `build.ps1`** 让 Git-Bash 能构建。**只构建、未烧录** |
+| **`v1.2.0`**（tag） | **流畅度第一轮**：消除 LVGL 锁内阻塞 I/O（异步校时 / 合并落盘 / 时区任务）、事件投递改无锁队列、周期性 label 全加脏检查、**整页动画删除改为同帧原子替换**（修切页重影）；待机动画第二批三层（呼吸联动 / 双眼扫视错峰 / 困倦点头）与 FPS 探针 |
+| **`v1.1.0`**（tag） | **待机动画慢动作三层**（自发表情 / 困倦度 / 瞳孔缩放 + 整脸漂移）、**切页交叉淡入 + 离场动画窗口**（开机日志 → 主界面）、开机页动画省略号与真实版本号；顺带修掉 `standby_exit` 死代码、首次进待机被过期表情拒绝、开机页版本恒为 `0.1.0` |
 | **`v1.0.0`**（tag） | **首个编号版本**：新增 `version.txt` 并在设备设置页显示、根 `README.md` 改写为 ToDoHelper 说明、新增 `CHANGELOG.md`、全量文档回改 |
 | `86ba312` | **修复 SSE 冻住整个 HTTP 服务器**：`/api/v1/events` 改异步 handler + 每客户端流式任务，并发 4→3；用户实测"网页设备不可达"的真因 |
 | `cfdf817` | 记录 `b4d7683` 提交哈希 |
@@ -307,11 +461,27 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 | `162ba2d` | 字库移出 app：镜像 4.16MB→2.94MB，烧录 43.6s→31.6s |
 
 > 交接时工作区应当是**干净**的。若 `git status` 有改动，先判断是不是构建产物。
+> **v1.3.0 交接时工作区是脏的**：`components/maimemo_client/`、`tools/build.sh`、
+> `tools/build.ps1` 是新增未提交，另有若干组件与文档改动 —— 本轮**尚未提交**。
 
 ---
 
 ## 7. 建议的接手顺序
 
+0. **最新一件（v1.3.0 遗留）：把本轮上机验证掉。** 本轮**只构建、未烧录**，所以下面三件事
+   都还是纸面结论。按性价比排序：
+   1. **音标修复**（最便宜、判据最硬）：字体是运行期从 `<storage>/todohelper/fonts/ui_cjk.ttf`
+      加载的（**没烘进镜像**），所以**拷新字库文件到卡上覆盖同名文件 + 重启**即可，
+      **不必重新烧录**。判据：单词卡背面的 `/əˈbrʌpt/` 里 ə、ʌ、ˈ、ː **不再是空白**。
+      顺手确认 1252 个词书字符里没有新的方框。
+   2. **墨墨云端同步（方案 A）**：网页「墨墨背单词」面板录令牌 → 点「立即同步」→
+      看设备单词页是否显示「墨墨今日 N/M」。**若云端队列没起来，先看串口有没有
+      `cloud queue: N words`**（`word_service` 打的），以及 NVS `mm_mode` 是不是 `cloud`。
+   3. **方案 B 的快乐路径**（**当前令牌做不到**）：现有令牌是学习作用域，
+      `/notes`、`/phrases` 恒返回 `common_permission_denied`。要看到助记，需要一个能读
+      `/notes` 的令牌；在那之前只能验证"权限拒绝被正确吞掉、卡片不留空白块"。
+   4. **方案 C**：默认关闭。要测就先确认"推上去的词会出现在墨墨 App 的学习计划里"，
+      再决定要不要长期开着（**接口没有反向删除**）。
 1. ~~验完 §2 的崩溃修复~~ —— **已完成**：插卡 3/3 冷启动 `abort=0`、`TH:app: ready` 3/3，
    词库 833 词 3/3 加载成功（证据见 §2）。
 2. **请用户做 §4 的目视确认**，重点是 1.1 的两项：待机"慢动作三层"（等 1~2 分钟看自发表情、
@@ -332,9 +502,11 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 5. 若用户反馈"插拔卡数据丢失"不可接受：把待办存储固定在片内存储，只把词库/字体放卡上
    （需要看 `storage_manager` 的根选择逻辑）。
 6. **加功能前先看内部 RAM 余量**：v1.2.0 实测 boot complete 为
-   `internal 66 KB / largest 22 KB`（`int-low 54 KB`）。任何批量数据都必须显式
-   `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）；SSE 这类每客户端一个任务的设计
-   也要算进内部 RAM（每客户端 3 KB）。**判据是 largest 与 int-low，不是总空闲量。**
+   `internal 66 KB / largest 22 KB`（`int-low 54 KB`）；**v1.3.0 未在设备上复核**
+   （新增的 `th_mm_sync` 任务是按需创建、6 KB 栈，平时不占）。
+   任何批量数据都必须显式 `MALLOC_CAP_SPIRAM`（§2 的崩溃就是没这么做造成的）；SSE 这类
+   每客户端一个任务的设计也要算进内部 RAM（每客户端 3 KB）。
+   **判据是 largest 与 int-low，不是总空闲量。**
 7. **流畅度还剩两批没做**（第一轮已完成，见 §0）：
    - **第二批（结构性，收益中等）**：`page_splash` 每 100 ms 重建 >5 KB 日志文本并强制
      `lv_obj_update_layout()`；`page_todo` 用 `lv_obj_clean()` + 全量重建（每项 5~7 个
@@ -367,7 +539,13 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
 | **流畅度：状态栏脏检查** | `components/ui_core/src/ui_statusbar.c` |
 | **流畅度：异步校时** | `components/calendar_service/src/calendar_service.c`（`calendar_sync_ntp_async()`、`sync_worker`） |
 | **流畅度：异步落盘** | `components/word_service/src/word_service.c`（`word_save_progress_async()`、`word_save_worker`） |
-| HTTP 路由总览 | `docs/API.md` |
+| **墨墨开放 API（方案 A/B/C）** | `components/maimemo_client/src/maimemo_client.c`（`mm_post()` / `mm_classify()` / `enrich_cache_*`）、`src/maimemo_http.c`（6 条路由）、`components/maimemo_client/README.md` |
+| **云端队列（本地书 ↔ 墨墨）** | `components/word_service/src/word_service.c`（`word_cloud_mode()` / `word_cloud_refresh()` / `cloud_index_for()`） |
+| **单词页：云端进度与助记** | `components/ui_pages/src/page_word.c`（`render_progress()` / `enrich_start()` / `grade_clicked_cb()`） |
+| 网页「墨墨背单词」面板 | `components/sync_server/web/index.html`（`mm*` 函数，约 1221 行起） |
+| **字库生成（IPA 合并 + 校验）** | `tools/gen_cjk_font.py`（`merge_ipa_glyphs()` / `flatten_components()` / `validate_font()`） |
+| **Git-Bash 构建包装器** | `tools/build.sh` + `tools/build.ps1`（日志 `build_last.log`） |
+| HTTP 路由总览 | `docs/API.md`（含 §2.5 墨墨接口详解；**51 条路由待上机校准**） |
 | 网页上位机 | `components/sync_server/web/index.html` |
 
 ---
@@ -381,4 +559,22 @@ cJSON 每个 JSON 元素 ≈56 B 节点（外加键与字符串值的拷贝）�
   `AGENT.md` 那句需要回改。
 - `AGENT.md §8` 的内部 RAM 预算表已被同文件新增的"v1.2.0 现行基线"一行取代为判据，
   两处数值一致（66/22/54 vs 67/24/55），不需要回改，但表头年份可更新。
+- ✅ **已关闭（v1.3.0）**：~~`docs/API.md` 没有收录 6 条 `/api/v1/maimemo/*` 路由、
+  `maimemo_client` 组件章节与 `words/enrich.json` 存储条目~~ —— **已补齐**：
+  `docs/API.md` 新增 `maimemo_client` 组件一节（函数表、事件、**线程规则**、令牌/作用域模型、
+  错误模型、最小测试步骤）、§2.1 的 6 条路由、**§2.5 墨墨接口详解**（逐条请求/响应 +
+  状态码语义 + `X-Auth-Token` 规则）、§3 的 `mm_token`/`mm_mode`/`mm_push`、
+  §4.2 的 `words/enrich.json`；并更正了该文件若干 1.0.0 时代的过期记录
+  （§1 依赖表、§2.4 路由数、§5.3 的"WiFi API 未注册 / `voice_service` 不存在 /
+  `ai_service` 未接入 / FreeType 未启用"、§5.4 第 1、2 条）。
+- ⚠️ **`docs/API.md` 的新遗留项（下次上机请核对）**：
+  - §2.1 与 §2.4 现在统一写"注册 **51** 条路由"，这是**按各组件注册表推算**的
+    （1.0.0 真机实测 45 + 本轮 6）。**51 尚未上机复核** ——
+    请用 `GET /api/v1/device/status` 的 `routes` 字段校准。
+  - `HTTP_ROUTER_MAX_ROUTES = 48`，而按 51 条算**路由表已接近/超过上限**。文档只按事实标注，
+    **代码能否真的注册进 51 条没有上机确认**（表满会 `SYS_LOGE("route table full (48)")`）。
+    下次上机看一眼串口有没有这行：若有，要么抬常量、要么核对条数口径。
+- `docs/API.md §1` 记录了一处**架构债**：`word_service`(L3) 与 `ui_pages`(L4) 都
+  `REQUIRES maimemo_client`(L5)，**属于向上依赖**，与"依赖只能向下"的规则相悖
+  （1.3.0 的实现取舍，已在文中写明理由与"干净路线"的改法）。不是 bug，但值得留意。
 

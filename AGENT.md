@@ -62,11 +62,13 @@ components/
   ui_pages/           L4  11 个页面（组合层，可依赖任意非 UI 组件）
   ai_service/         L5  FR7 DeepSeek（阻塞/流式/历史/中断）
   voice_service/      L5  FR7 录音回放 + ASR/TTS 端点桥接
+  maimemo_client/     L5  墨墨背单词开放 API（方案 A 同步 / B 助记例句 / C 反向推词，可选降级）
   esp_cam_sensor/     —   本地组件，覆盖托管组件（BSP 需要）
 main/
-  app_main.c              表驱动模块编排（9 个模块，全部 after_ui），无可选模块失败阻塞 UI
+  app_main.c              表驱动模块编排（10 个模块，全部 after_ui），无可选模块失败阻塞 UI
 assets/ui/                扁平 PNG 资源（w_*.png），打包进 assets 分区
-tools/gen_cjk_font.py     生成内嵌 CJK 子集字体
+tools/gen_cjk_font.py     生成内嵌 CJK 子集字体（含 IPA 字形合并 + `validate_font()` 校验）
+tools/build.sh            从 Git-Bash 驱动 idf.py 的包装器（配 tools/build.ps1，见 §4.2）
 docs/                     需求 / 框架 / API / 交接
 ```
 
@@ -108,7 +110,9 @@ L0 sys_utils
 可用的有：`joltwallet/littlefs`、`espressif/mdns`、`espressif/cjson`、`espressif/mqtt`。
 
 `idf.py` **不在 Git Bash 的 PATH 里**；IDF v6.1 在 Git Bash 下会打印
-`MSys/Mingw is no longer supported` 警告（`MSYSTEM` 被注入子进程）。**构建请走 PowerShell**。
+`MSys/Mingw is no longer supported` 警告（`MSYSTEM` 被注入子进程）并**拒绝运行**。
+**构建走 PowerShell，或在 Git-Bash 里用 `bash tools/build.sh`**（v1.3.0 新增的包装器，
+见 §4.2）。
 
 ---
 
@@ -125,6 +129,22 @@ idf.py -p COM34 monitor          # 退出：Ctrl+]
 ```
 
 ### 4.2 从 Git Bash / 自动化调用（等价写法）
+
+**首选（v1.3.0 新增）**：`tools/build.sh` 把活交给原生 powershell 并**原样回传退出码**。
+
+```bash
+cd /d/project/ESP-IDFv6.1/ToDoHelper
+bash tools/build.sh build          # 等价 idf.py build（默认动作就是 build）
+bash tools/build.sh flash          # 等价 idf.py flash
+bash tools/build.sh -v build       # 详细构建
+bash tools/build.sh --version      # 只验证调用链是通的
+```
+
+脚本名之后的所有参数**原样转发**给 `idf.py`。输出同时重定向到 `build_last.log`
+（已 gitignore），因为**原生 exe 不能接进 cmdlet 管道**（见下）。退出码是 `idf.py` 自己的，
+所以可以直接 `if bash tools/build.sh build; then ... fi`。
+
+手工等价写法（不装脚本时）：
 
 ```bash
 cd /d/project/ESP-IDFv6.1/ToDoHelper
@@ -143,6 +163,36 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
 - 若要限制构建产物写在工程内：`$env:CCACHE_DIR='D:\project\ESP-IDFv6.1\ToDoHelper\build\.ccache'`。
 - **`idf.py reconfigure`**：改动 `assets/ui/` 下文件、增删组件、改 `idf_component.yml` 后需要
   （`assets` 镜像的依赖是 configure 期求值的 `GLOB_RECURSE`）。
+
+#### 4.2.1 从 MSYS 驱动 `idf.py` 的三个坑（都会**静默失败**：空日志 + 退出码 0）
+
+v1.3.0 加 `tools/build.sh` 时踩出来的。三个坑的共同症状是
+**日志文件是空的、退出码却是 0** —— 看起来像"构建成功且没输出"，实际什么都没跑。
+这类失败最难查，因为唯一的证据（退出码）在撒谎。
+
+1. **`idf.py` 在 MSYS 下被明确拒绝**：ESP-IDF 的 python wrapper 检测到 MSYS 环境直接退出，
+   打印 `MSys/Mingw is no longer supported`。所以必须经过原生 `powershell.exe`。
+2. **profile 里的 `idf.py` 是函数，不是命令**：IDF 的 PowerShell profile 把 `idf.py` 定义成
+   `Invoke-idfpy` 的**函数**，用 `@args` 转发参数。**这个简写不绑定**当调用方是
+   `powershell -Command` / `-File` 时 —— 于是 `idf.py build` **静默什么都不做**。
+   → 必须显式调用解释器：`& $python $idfPy @idfArgs`，其中
+   `$python = C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe`、
+   `$idfPy = D:\ESP-IDF\v6.1\esp-idf\tools\idf.py`。
+3. **原生 exe 不能接进 cmdlet 管道，`env -i` 会杀掉一切输出**：
+   - `& $python ... | Tee-Object -FilePath x.log` 报
+     `Cannot run a document in the middle of a pipeline: ...python.exe`。
+     → 用普通重定向（`*>`）落盘，再把内容读回来打印。
+   - 曾经为了"隔离环境"用 `env -i` 起 powershell：powershell 正常启动并打印横幅，
+     但**原生 python 子进程一点输出都没有**，且 `$LASTEXITCODE` 保持 `$null`
+     → **空日志 + 脚本仍然 exit 0**。
+     → **保留 bash 继承的环境**，隔离靠上面的 `Remove-Item Env:MSYSTEM` 就够了。
+4. **`MSYSTEM` 必须在 PowerShell 里删**：在 bash 里 `unset MSYSTEM` **毫无用处** ——
+   MSYS 运行时会把它（连同 `OSTYPE` 等）**重新注入每一个原生子进程**，
+   所以 `powershell.exe` 永远继承得到。只有 Windows 侧删除才真的生效。
+   注意 profile 要在删除**之后**加载，这样它设的 IDF 环境不受影响。
+
+> **判据**：如果 `bash tools/build.sh build` 的日志是空的，几乎必然是上面四条之一，
+> 而不是"构建太快没输出"。`bash tools/build.sh --version` 是最快的调用链自检。
 
 ### 4.3 只烧录 / 只擦除 / 清理
 
@@ -164,6 +214,16 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
 # 加 --level2 得到 6763 字（约 3.8 MB）。改完字体必须 idf.py build 重新嵌入。
 ```
 
+**脚本末尾会自动跑 `validate_font()`**（v1.3.0 新增）：重新打开保存后的文件，逐表核对
+`hmtx` / `vmtx` 的条目数与 `maxp.numGlyphs`、`numberOf*Metrics` 是否越界、以及必需的内容
+字符是否都在 cmap 里。**校验不过就直接让构建失败**，不再出现"生成成功但字体是坏的"。
+动机见 §9.0.4.1。
+
+> **注意：正式部署字体的路径是"拷文件"，不是重新烧录。** 字体在运行期从
+> `<storage>/todohelper/fonts/ui_cjk.ttf` 加载（§9.2），**没有烘进固件镜像** ——
+> 所以改完字库只要把新文件拷到卡上覆盖同名文件、重启即可生效。
+> 重新烧录只在你想更新内嵌的兜底副本时需要。
+
 ---
 
 ## 5. 关键文件
@@ -177,10 +237,12 @@ ToDoHelper/
 ├─ sdkconfig.defaults          # 真正的默认配置来源（**含两条不可删的必需项**，见 §9）
 ├─ sdkconfig                   # 生成物，不要手改
 ├─ dependencies.lock           # 组件管理器锁文件（target: esp32s31）
-├─ main/app_main.c             # 模块编排表（9 个模块，全部 after_ui）
+├─ build_last.log              # tools/build.sh 的构建日志（生成物，已 gitignore）
+├─ main/app_main.c             # 模块编排表（10 个模块，全部 after_ui）
 ├─ components/                 # 见 §2
 ├─ assets/ui/                  # 扁平 PNG（w_*.png）；**不能有子目录**
-├─ tools/gen_cjk_font.py       # CJK 子集字体生成脚本
+├─ tools/gen_cjk_font.py       # CJK 子集字体生成脚本（含 IPA 合并与产物校验）
+├─ tools/build.sh / build.ps1  # Git-Bash → idf.py 的包装器（见 §4.2）
 ├─ managed_components/         # 托管依赖；除 §7 补丁外勿手改
 ├─ patches/                    # esp_lvgl_adapter IDF6.1 支持补丁（必需）
 ├─ docs/                       # 需求 / 框架 / API / 交接（HANDOVER.md）
@@ -281,14 +343,18 @@ Project build complete.
 
 **ToDoHelper 当前基线**（可作回归对比基准）：
 
+> **v1.3.0 注意**：下表的 `todohelper.bin` 是**离线构建产物**的尺寸 ——
+> 本轮**只构建、没有烧录**（详见 `CHANGELOG.md` 1.3.0 的 `### Verified（真机）`）。
+> 表中的内部 RAM 数字仍是 **v1.2.0 真机实测**的，v1.3.0 未在设备上复核。
+
 | 项 | 值 |
 |---|---|
-| app bin | `build/todohelper.bin`，`0x2db470` 字节（约 2.86 MB，含 `1.1.0` 版本号；字库已移出到 SD/`storage`，见 §9.7） |
+| app bin | `build/todohelper.bin`，`0x2e4fd0` 字节（约 2.90 MB，含 `1.3.0` 版本号；字库已移出到 SD/`storage`，见 §9.7） |
 | app 分区余量 | `0x800000` 分区，剩 **64%** |
 | bootloader | `build/bootloader/bootloader.bin`，`0x5a80`，余 6% |
 | 编译警告 | 0（`-Werror` 全开） |
 | 资源分区 | `build/mmap_build/ui/assets/assets.bin`（8 个 PNG，约 8.9 KB） |
-| 组件数 | 16 个自有组件 + 1 个本地覆盖组件（`esp_cam_sensor`） |
+| 组件数 | 17 个自有组件 + 1 个本地覆盖组件（`esp_cam_sensor`） |
 
 **内部 RAM 预算（真机实测，插卡 `root=/sdcard`——这是本工程最紧张的资源）**
 
@@ -334,9 +400,9 @@ Project build complete.
 **不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
 改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
 
-- **当前版本：`1.1.0`**
+- **当前版本：`1.3.0`**
 - 版本进 `esp_app_desc_t`，于是**三处可见**：
-  设备「设置」页顶部与开机页「固件 1.1.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
+  设备「设置」页顶部与开机页「固件 1.3.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
   以及 `build/todohelper.bin` 的 app descriptor（离线核对：
   `riscv32-esp-elf-objdump -s -j .flash.appdesc build/todohelper.elf`）。
 - 规则（三段式）：**MAJOR** = 一轮需求全部完成、或有破坏性变更（存储格式 / HTTP API /
@@ -596,6 +662,69 @@ FreeType 子集 --fallback--> Montserrat(同尺寸) --fallback--> 内置 CJK 16p
 
 这样符号、少见的汉字都能显示，且**全局生效**，不用在键盘上写特例。
 
+#### 9.0.4.1 音标（IPA）缺字："字库选字少了"是错的，源字体根本没有这些字形
+
+**现象**：屏上 `/əˈbrʌpt/` 渲染成 `/ br pt/` —— 元音符号整片空白（v1.3.0 修复）。
+
+**根因不在我们这边，而在源字体**：**Noto Sans SC 里一个 IPA 字形都没有**。
+U+0259 ə、U+028C ʌ、U+026A ɪ、U+02D0 ː、U+02C8 ˈ 等**都不在它的 cmap 里**，
+所以无论把字符集写多大都取不出来。**LVGL 内置的 Montserrat 兜底也救不了**：
+它的 cmap 很稀疏，只有 FontAwesome 区段 —— 也就是说 §9.0.4 那条 fallback 链对 IPA 无效。
+
+**修法**（`tools/gen_cjk_font.py` 的 `merge_ipa_glyphs()`）：把 IPA 字形从**一份拉丁字体**
+合并进 CJK 子集。Latin 源按平台挑：Linux 用 DejaVu Sans，Windows 用
+`segoeui.ttf` / `arial.ttf` / `calibri.ttf`。
+
+四个必须记住的细节：
+
+1. **`fontTools.merge` 用不了**。它断言两边的 `unitsPerEm` 相等，而拉丁字体是 **2048**、
+   CJK 子集是 **1000** —— 必然不等。所以只能手写合并，并把坐标与 advance **缩放
+   `1000/2048 = 0.488`**。实测从 `segoeui.ttf` 合入 **203 个字形**。
+2. **字形必须展平成普通轮廓**（`flatten_components()`）。组件（composite glyph）会引用
+   目标字体里**不存在的**字形，编译期直接炸 `KeyError: 'uni02BE'`。
+3. **`hmtx` 与 `vmtx` 必须一起更新**，`hhea` / `vhea` 的计数要夹住 —— 见下一节，
+   这是本次真正阴险的那个 bug。
+4. **这份 CJK 子集带中文竖排度量**（`vmtx` / `vhea` 都在），所以第 3 条不是理论问题。
+
+**验收数值**（v1.3.0）：词书 **1252 个不同字符，0 个缺失**；`/əˈbrʌpt/` 全部有真实轮廓，
+advance 已正确缩放（ə=523 vs b=618 / r=388 / p=620）。
+
+#### 9.0.4.2 合并字形时 `hmtx` / `vmtx` 必须同时写，而**只查 cmap 查不出来**
+
+**这是 v1.3.0 修掉的第二个、潜伏的 bug，也是"检查写错了比没有检查更糟"的教材。**
+
+第一版 `merge_ipa_glyphs()` 更新了 `hmtx` 却**漏了 `vmtx`**。`hmtx` 与 `vmtx` 都以
+**字形名**为键、都**必须每个字形一条记录**，只补一半的文件本身就已经不合法：
+
+```
+not enough 'vmtx' table data: expected 10686 bytes, got 10280
+```
+
+即 **`vmtx` 少了 406 字节 = 2 字节 × 203 个新字形**，fontTools 连**重新解析**这个文件都做不到。
+
+> **为什么它会出厂**：当时的校验只问了一句 **"文件里有没有 ə？"** —— 而坏字体
+> **每一个 cmap 条目都在**，所以检查愉快地通过了。**cmap 只描述"这个码位映射到哪个字形名"，
+> 完全不涉及度量表。** 一个只查 cmap 的检查无法发现任何度量表损坏。
+
+**修法两半**：
+
+1. 给每个合入的字形**同时写 `vmtx` 记录**（拉丁源没有 `vmtx` 时用 `vhea` 的默认
+   advance + tsb 0 兜底），并把 `hhea.numberOfHMetrics` / `vhea.numberOfVMetrics`
+   **夹到字形总数以内**（`min(现值, numGlyphs)`）。
+2. 新增 **`validate_font()`**：在脚本最后**重新打开保存后的文件**，逐项核对
+   - `len(hmtx.metrics) == maxp.numGlyphs`，`vmtx` 同理；
+   - `hhea.numberOfHMetrics` / `vhea.numberOfVMetrics` **不得超过**字形总数；
+   - 必需字符在 cmap 里。
+   任何一条不过 → `sys.exit()`，**构建直接失败**。
+
+**"必需字符"只算内容字符**（词书里的字符 + 有拉丁源时的 IPA），
+**不要求**整个装饰性 Unicode 区段。否则检查会天天报一堆无关缺字，
+最终所有人学会无视它 —— 那等于没有检查。
+
+> **通用教训**：字体这类**多表互相索引**的二进制格式，"改一处"几乎总是"改好几处"。
+> 事后校验必须**重新打开产物**并**按表逐项核对**，而不是在原对象上查一个字段；
+> 而且校验的**覆盖范围要对着 bug 的类型设计**（这里：度量一致性问题，不是覆盖问题）。
+
 ### 9.0.5 启动期 `abort()`：插 SD 卡即重启循环（**已修复并上机验证**）
 
 > **一句话根因**：批量 JSON 解析（cet6 词库 546 KB / 833 词 / 约 7000 个 cJSON 节点）把
@@ -696,6 +825,94 @@ riscv32-esp-elf-addr2line -f -C -e build\todohelper.elf 0x2f00f08f 0x2f00f092
 riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build\nm_all.txt
 ```
 
+### 9.0.6 对接第三方云 API：`maimemo_client` 踩到的四个坑（v1.3.0）
+
+墨墨背单词开放 API 的形态很典型：**请求带 Bearer 令牌、响应统一是
+`{"success":bool,"data":{...},"errors":[...]}` 信封**（多数端点是 POST + JSON body，
+但**读助记/例句是 GET** —— 这正是坑 ③）。四个坑都很有代表性。
+
+#### ① HTTP 200 也可能是失败：**只看状态码会漏掉全部权限/参数错误**
+
+**实测**：权限不足时墨墨**照样返回 HTTP 200**，错误只写在信封里：
+
+```json
+{ "success": false, "data": null,
+  "errors": [ { "code": "common_permission_denied", "msg": "..." } ] }
+```
+
+所以**必须解析信封**，不能拿状态码当判据。本项目在 `mm_classify()` 里统一做：
+含 `permission_denied` → `ESP_ERR_NOT_SUPPORTED`，其余 → 其他错误。
+HTTP 层的映射单独一层：`401`/`403` → `ESP_ERR_INVALID_STATE`、非 200 →
+`ESP_ERR_INVALID_RESPONSE`、响应超限 → `ESP_ERR_INVALID_SIZE`。
+
+- **`ESP_ERR_NOT_SUPPORTED` 的语义要定死**："这个令牌不许做这件事，**别再问了**"，
+  与"网络抖动，稍后再试"**必须能被调用方区分开**。本项目的做法是按词**缓存为不可用**
+  （`words/enrich.json` 里的 `unavailable:true`），于是每个词只会被问一次，
+  而不是每次翻卡都去撞一次墙。
+- **令牌作用域是一等一的正常情况，不是错误**。常见的学习作用域令牌：
+  `/study/*` 与 `/vocabulary` 可用，`/notes`、`/phrases` 返回 `common_permission_denied`。
+  一个"能同步队列但不显示助记"的设备**仍是有用的**，一个"报错"的设备不是 ——
+  所以 UI 只是**不显示**助记块，不弹错误。
+- **校验令牌失败 ≠ 令牌坏**：`POST /api/v1/maimemo/config` 的 `verify` 是**显式请求**
+  （会真的访问一次，5~15 s），且失败只回一个 `verify` 字段，**不否定保存**。
+
+#### ② `advance` 是**必需**属性：漏了它就报 `common_invalid_param`
+
+**实测**：`POST /study/add_words` 漏掉 `advance`，**即使请求其它部分完全合法**也失败：
+
+```
+common_invalid_param: {base} must have required property 'advance'
+```
+
+`advance` 不是可选项，是**必填字段**。→ 本项目**永远发送**它（`false` 也发）。
+`advance: true` 让词进入可立即复习的状态（降低等级门槛）。
+
+请求体形状是 **`{"words":[{"id":<voc_id>},...],"advance":bool}`** —— **按 `id` 加词，不是按拼写**，
+所以设备侧先用 `GET /vocabulary?spelling=` 把拼写解析成 `voc_id`（`mm_resolve_voc_id()`），
+解析不到的词跳过。这与官方 CLI 一致（`advance` + `words[].id`）。
+
+**并且回报服务器自己的 `added_count`，而不是我们发过去的条数** —— 服务器可能只收下一部分，
+报"我发了 10 个"会造成假象。
+
+> **通用教训**：对接第三方 API 时，**"哪些字段必填"只能靠实际打一次来确认**（文档常常
+> 只列字段不讲必填），而且**返回值要以对端自报的为准**。所有"设备侧看起来成功"的结论，
+> 都必须回到**对端的状态**去验证。
+
+#### ③ GET 还是 POST **不是风格问题，是语义问题**
+
+**墨墨的助记/例句读取端点是 `GET`**：
+`GET /api/v1/notes?voc_id=...` 与 `GET /api/v1/phrases?voc_id=...`。
+
+**同一个路径的 `POST /api/v1/notes` 是"创建笔记"**（body `{"note":{voc_id,note_type,note}}`）
+—— 拿 POST 去"读"助记，轻则读到完全不同的东西，**重则改写用户在墨墨里的笔记**。
+所以本组件为此并列了两个函数：`mm_get()` 与 `mm_post()`，而不是图省事全用 POST。
+
+- 已对照官方 CLI 源码核实（`@maimemo/memo-api` v1.2.0：
+  `api("/api/v1/notes", {method:"GET", query:{voc_id}})`，响应按 `res.notes.map(...)` 取）。
+- 响应结构：`{"data":{"notes":[{"note":"..."}]}}` 与 `{"data":{"phrases":[{"phrase":"..."}]}}`
+  （`mm_fetch_field()` 取数组第 0 项的文本字段）。
+- 拼写 → `voc_id` 的解析也是 GET：`GET /vocabulary?spelling=`。
+
+> **通用教训**：REST 里"读用 GET、写用 POST"在第三方 API 上常常**不是**这样。
+> 遇到"同名路径既能读又能写"的接口，**先确认方法的语义再发请求** ——
+> 一个自以为只读的 POST 可能正在改用户的数据。
+
+#### ④ 顺带：TLS 客户端绝不能从 LVGL 任务调用
+
+`maimemo_client` 的所有网络函数都是**阻塞 TLS**，而 LVGL 的控件事件 / `lv_timer` 回调都在
+**适配器锁内**运行（§9.0.1.1）。所以：
+
+- 唯一对 UI 安全的入口是 `maimemo_sync_start()`（起 worker 任务、立刻返回、结果走
+  `MAIMEMO_EVENT_SYNC_DONE` / `_FAILED`）；`maimemo_has_token()` 与
+  `maimemo_get_cached_progress()` 只读内存/NVS，也可以从 UI 调。
+- `page_word.c` 的助记预取用 `lv_async_call` 起一次性任务，结果在 LVGL 任务里应用标签。
+- **与 AI Key 同规则（需求 §8.8）**：令牌存 NVS `mm_token`，**不记日志、任何 API 都不回读**；
+  `GET /api/v1/maimemo/status` 只回 `configured` 与掩码提示（`g_zV****`）。
+- **无令牌静默降级**：`mm_token()` 失败返回 `ESP_ERR_NOT_FOUND`，云端模式无声关闭，
+  本地词库照常工作 —— 可选组件失败不得阻止启动。
+
+组件细节见 `components/maimemo_client/README.md`。
+
 ### 9.1 三条**不可删**的 `sdkconfig.defaults` 配置
 
 1. **`CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y`（且 `LOG_MAXIMUM_EQUALS_DEFAULT=n`）**
@@ -768,6 +985,8 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 ├─ anim/idle_face/       # 预留：位图版待机动画（当前纯程序化绘制，不需要）
 ├─ words/
 │   ├─ cet4.json         # 内置 32 词示例，首次启动写出，可编辑替换
+│   ├─ cet6.json         # 实际使用的 CET-6 精选词库（833 词，来自卡上/仓库 assets）
+│   ├─ enrich.json       # ★ 墨墨助记/例句缓存（方案 B，整文件读进 PSRAM、整文件原子重写）
 │   └─ progress.json     # 复习进度
 ├─ ai/
 │   ├─ rec_<uptime>.pcm  # 录音（16 kHz/16-bit/单声道/无头），Audacity 按 Raw 导入
@@ -862,6 +1081,21 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 > CET4 的复习进度会套到 CET6 的前 32 个词上（且加载时会误报"这本书还没有进度"）。
 > 现已改为 `"<book>#w<id>"`。
 
+**③ 墨墨云端同步的"快乐路径"未在设备上验证（v1.3.0 留下的第一件事）** ——
+代码已实现、接口已用真实令牌对**线上 API** 实测、权限拒绝的处理已验证，但**本轮没有烧录**。
+具体缺口：
+
+- **方案 B（助记/例句）读不到数据**：当前令牌是**学习作用域**的，`/notes` 与 `/phrases` 恒返回
+  `common_permission_denied`，所以"卡片上真的显示出一条助记"**从未被观察到**。
+  要验证需要一个能读 `/notes` 的令牌，或等墨墨放开该作用域。
+- **字库修复未上机目视确认**：字体是运行期从 `<storage>/todohelper/fonts/ui_cjk.ttf` 加载的
+  （**没有烘进镜像**），所以要验证 IPA 修复，**拷文件即可**，不必重新烧录。
+  判据：卡片背面的音标里 `/əˈbrʌpt/` 的 ə、ʌ、ˈ、ː **不再是空白**。
+- **云端模式与本地进度是两套记账**（刻意取舍）：云端词匹配回本地词库后用本地 level / 间隔；
+  匹配不上的词（`WORD_ID_CLOUD`）在设备上评分只留痕在账号侧，本地不记进度。
+  换回本地书时两边数字不会合并。
+- **方案 C 没有反向删除**：接口只负责加词，推上去的词撤不回来（所以默认关闭）。
+
 **其余已知但优先级低的问题**
 
 - **IP 定位在本机网络不可达**：时钟已同步时 `POST /api/v1/weather/locate` 仍失败
@@ -892,6 +1126,12 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 | `mkdir ... failed (errno 22)` | FatFs 用 `FR_INVALID_NAME` 表示"已存在"；改用 `stat()` 判断 |
 | main 任务卡死 / `task_wdt: IDLE0` | 有 LVGL 调用没持锁；见 §9.0.1 |
 | 中文显示成方框 | 内嵌字体没生成/没重新构建；跑 `tools/gen_cjk_font.py` 后 `idf.py build` |
+| **音标/IPA 符号是空白**（如 `/əˈbrʌpt/` → `/ br pt/`） | 源字体（Noto Sans SC）根本没有 IPA 字形，Montserrat 兜底也无效；跑 `tools/gen_cjk_font.py` 合并拉丁字形，见 §9.0.4.1 |
+| `not enough 'vmtx' table data: expected N, got M` | 合并字形时只写了 `hmtx` 没写 `vmtx`；见 §9.0.4.2，跑 `validate_font()` 会先拦住 |
+| 墨墨接口"成功"但数据不对 / 权限不足却看不到错误 | API **权限错误也返回 HTTP 200**，必须读信封的 `success`/`errors[].code`；见 §9.0.6 ① |
+| `common_invalid_param: {base} must have required property 'advance'` | `/study/add_words` 的 `advance` 是**必填**，`false` 也要发；见 §9.0.6 ② |
+| 墨墨助记/例句读不到、或"读"完用户笔记被改了 | 读取端点是 **GET** `/notes?voc_id=`、`/phrases?voc_id=`；**`POST /notes` 是创建笔记**；见 §9.0.6 ③ |
+| `bash tools/build.sh build` 日志是空的但退出码 0 | MSYS 调 `idf.py` 的四个坑（函数不绑定 / 管道 / `env -i` / `MSYSTEM` 重注入）；见 §4.2.1 |
 | 天气图标不显示 | `assets/ui/` 里有子目录，或改了素材没 `idf.py reconfigure` |
 | `idf.py: command not found` | 未加载 IDF 环境，见 §4 |
 | `Could not open COMxx ... busy` | 关掉占用串口的监视器/其它工具；确认用的是 COM34 |

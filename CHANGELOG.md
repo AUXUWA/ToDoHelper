@@ -6,6 +6,151 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.3.0] — 2026-09-27
+
+**单词学习接入墨墨背单词（开放 API）+ 音标字形修复。** 需求条目没有变化，改的是"这个词到底
+从哪来、进度算谁的"这件事。**没有破坏性变更**：HTTP API 只增不改，存储格式向后兼容
+（新增一个可选的 `words/enrich.json`），NVS 只新增 `mm_token` / `mm_mode` / `mm_push` 三个键。
+
+两件事各有一条"根因写在现象之外"的教训：**音标缺失不是字库选字少了，而是 Noto Sans SC
+根本没有 IPA 字形**；**构建失败不是代码错，是 MSYS 下 `idf.py` 根本没法被驱动**。
+
+### Added
+- **新组件 `components/maimemo_client/`（L5，墨墨背单词 OpenAPI）**，实现用户选定的三个方案：
+  - **方案 A —— 学习同步**：今日词队列与账号**真实进度**改从墨墨取，不再只认本地词库。
+    端点 `POST /study/get_study_progress`（finished/total/study_time）、
+    `POST /study/get_today_items`（voc_id / voc_spelling / is_new / is_finished /
+    first_response）、`POST /study/query_study_records`（body `{"as_count":true}` 取计划词数）。
+    **实测（真实令牌）**：10/20 已完成、20 词队列。
+  - **方案 B —— 助记/例句预取**：`/notes`（助记）与 `/phrases`（例句）缓存到
+    `<app_dir>/words/enrich.json`，走 `storage_read_text()` / `storage_write_file()`
+    （**原子写**，tmp + rename），所以卡片离线也能显示助记与例句。
+    **整个文件一次性载入 PSRAM、整文件重写**，不做逐词小文件（这台设备的内部 RAM 只有
+    ~310 KB，批量数据必须显式走 PSRAM，见 `AGENT.md §9.0.5`）。
+  - **方案 C —— 反向推送**：评为「不认识」的词用 `POST /study/add_words` 推回墨墨学习计划。
+    **默认关闭、必须显式开启**（NVS `mm_push`），因为它会**修改用户在云端的学习计划**，
+    不是只读操作。
+- **令牌的作用域被当成一等问题处理**：用户的令牌是**学习作用域**的，`/study/*` 与
+  `/vocabulary` 可用，而 `/notes`、`/phrases` 返回 `common_permission_denied`。
+  这被映射为 `ESP_ERR_NOT_SUPPORTED`（"这个令牌不许做这件事，别再问了"）并**按词缓存为
+  不可用**，而不是当成错误反复重试。
+- **新增 6 条 HTTP 路由**：`GET /api/v1/maimemo/status`、`POST /api/v1/maimemo/config`、
+  `POST /api/v1/maimemo/sync`、`GET /api/v1/maimemo/today`、
+  `GET /api/v1/maimemo/enrich?spelling=`、`POST /api/v1/maimemo/push`。
+- **网页上位机新增「墨墨背单词（开放 API）」面板**（`components/sync_server/web/index.html`）：
+  令牌录入（**只写不读**，已核实回显路径不存在）、推送开关、带轮询的「立即同步」按钮、
+  今日词表查看器。
+- **构建工具 `tools/build.sh`（bash 入口）+ `tools/build.ps1`**：
+  `bash tools/build.sh build`（或 `flash`，或 `-v build`）。
+  MSYS/Git-Bash **无法直接驱动 `idf.py`** —— ESP-IDF 的 python wrapper 会识别 MSYS 环境
+  并拒绝运行（`MSys/Mingw is no longer supported`）。三个坑都会**静默产出空日志 + 退出码 0**，
+  修法见本节 `### Fixed` 与 `AGENT.md §4.2.1`。`build_last.log` 已加入 `.gitignore`。
+- **构建期字库校验 `validate_font()`**（`tools/gen_cjk_font.py`）：重新打开**已保存**的文件，
+  当任一分字形度量表与 `maxp.numGlyphs` 不一致、`numberOf*Metrics` 超过字形数、
+  或必需的内容字符不在 cmap 里时**直接让构建失败**。
+
+### Fixed
+- **音标（IPA）字形缺失：`/əˈbrʌpt/` 在屏上渲染成 `/ br pt/`**（元音符号全是空白）。
+  **根因不是"字库选字少了"，而是 Noto Sans SC（CJK 子集来源）里根本没有 IPA 字形** ——
+  U+0259 ə、U+028C ʌ、U+026A ɪ、U+02D0 ː、U+02C8 ˈ 等**不在它的 cmap 里**；
+  LVGL 内置的 Montserrat 兜底也帮不上（cmap 稀疏，只有 FontAwesome 区段）。
+  修法是在 `tools/gen_cjk_font.py` 新增 `merge_ipa_glyphs()`：把 IPA 字形从一份拉丁字体
+  （Linux 用 DejaVu Sans，Windows 用 segoeui / arial / calibri）**合并进 CJK 子集**，
+  坐标从拉丁 em 方格（2048）**缩放到** CJK 的（1000）。
+  - `fontTools.merge` **不能用** —— 它断言两边 `unitsPerEm` 相等，这里必然不等，于是只能手写。
+  - 字形必须**展平成普通轮廓**：组件（composite）会引用目标字体里不存在的字形，
+    编译期就炸 `KeyError: 'uni02BE'`。
+  - 实测从 `segoeui.ttf` 合入 **203 个字形**，缩放系数 **0.488**。
+- **合并逻辑里还藏着一个潜伏 bug：只更新了 `hmtx`，没更新 `vmtx`。**
+  两张表都以**字形名**为键、都必须**每个字形一条记录**；只补一半的结果是文件本身已经不合法
+  —— `vmtx` 比应有长度**少 406 字节（2 字节 × 203 字形）**，fontTools 连**重新解析**都做不到：
+  `not enough 'vmtx' table data: expected 10686 bytes, got 10280`。
+  这份 CJK 子集**确实带中文竖排度量**（`vmtx` / `vhea` 都在），所以这不是理论问题。
+  修法是给每个合入的字形**同时写 `vmtx` 记录**，并把 `hhea.numberOfHMetrics` /
+  `vhea.numberOfVMetrics` **夹到字形总数以内**。
+  - **这个 bug 是被"cmap 检查通过了"放过去的**：第一版校验只问"文件里有没有 ə？"，
+    而坏字体**每个 cmap 条目都在**，于是检查通过、坏字体照样出厂。
+    这就是新增 `validate_font()` 的动机 —— 必须**重新打开保存后的文件**逐表核对，而不是查 cmap。
+  - `validate_font()` 只要求**内容字符**（词书字符 + 有拉丁源时的 IPA），不要求装饰性
+    Unicode 区段，否则检查会变成人人忽略的噪音。
+- **构建脚本的三个静默失败**（都会产出空日志 + 退出码 0，最难查的一类问题）：
+  1. IDF 的 PowerShell profile 把 `idf.py` 定义成**函数**并用 `@args` 转发参数，而调用方是
+     `powershell -Command` / `-File` 时该简写**不绑定** → `idf.py build` 静默什么都不做。
+     改为显式调用解释器：`& $python $idfPy @idfArgs`。
+  2. **把原生 exe 接进 cmdlet 管道会失败**：`Cannot run a document in the middle of a
+     pipeline: ...python.exe`，所以 `& $python ... | Tee-Object` 用不了；改为重定向到
+     `build_last.log`。
+  3. **用 `env -i` 清空环境是致命一击**：powershell 能起来并打印横幅，但原生 python 子进程
+     **一点输出都没有**，且 `$LASTEXITCODE` 保持 `$null`。可行做法是**保留 bash 继承的环境**，
+     在 PowerShell **内部**删掉 MSYS 标记（`Remove-Item Env:MSYSTEM`）—— 在 bash 里 unset
+     `MSYSTEM` 毫无用处，因为 MSYS 运行时会把它**重新注入到每一个原生子进程**。
+
+### Changed
+- **`page_word.c` 在云端模式下显示账号真实进度**：「墨墨今日 10/20 · 已用 59 秒 · 计划 20 词」，
+  否则回退本地词库计数器。**小于 1 分钟时显示秒**，因为把 59 秒四舍五入成「0 分」
+  读起来就是"你今天没学过"。
+- **助记/例句显示在答案下方**（方案 B），拿不到时**整块隐藏**（不是显示空标签）。
+- **评「不认识」时把词推回账号**（方案 C 开启时）。
+- **线程规则在 `maimemo_client.h` 里写明**：所有做 TLS 的函数都是阻塞的，
+  **绝不允许从 LVGL 任务调用**（LVGL 回调持有适配器锁，见 `AGENT.md §9.0.1`）。
+  UI 路径把抓取交给 worker 任务，结果经 `lv_async_call` / 事件应用回界面。
+- **`word_service` 新增云端队列**：`word_cloud_mode()`、`word_set_cloud_mode()`、
+  `word_cloud_refresh()`、`word_cloud_count()`（NVS `mm_mode`）。云端词会用 `voc_spelling`
+  匹配回本地词库，匹配不上也要能在设备上评分（`WORD_ID_CLOUD`）。
+- **`main/app_main.c` 的模块表多一项** `maimemo_client`（`optional = true`，排在
+  `word_service` **之前** —— 云端队列要先能读到令牌）；开机时若处于云端模式则自动发起一次同步。
+- **`tools/gen_cjk_font.py` 现在会真正校验产物**，所以"字库生成成功"不再等于
+  "字库能用"。数值：词书 **1252 个不同字符，0 个缺失**；`/əˈbrʌpt/` 全部有真实轮廓且
+  advance 正确缩放（ə=523 vs b=618 / r=388 / p=620）。
+- **令牌处理与 AI Key 同规则**（需求 §8.8）：存 NVS 用 `sys_config_set_str`，从网页控制台写入，
+  **从不记日志、任何 API 都不回读**。`GET /api/v1/maimemo/status` 只返回 `configured`
+  与掩码提示（形如 `g_zV****`）。
+- **无令牌时静默降级**：云端模式无声关闭，本地词库照常工作（不报错、不弹窗）。
+
+### Verified（真机）
+- ⚠️ **本轮没有烧录到设备，所以以下几项都不是真机验证**，请按"已验证 / 未验证"分别理解：
+  - **离线构建（已验证）**：`todohelper.bin` **0x2e4fd0 字节**，app 分区剩 **64%**；
+    构建 **0 错误 0 警告**。
+  - **字体产物（已验证）**：`validate_font()` 通过，词书 1252 字符 **0 缺失**，
+    合入 203 个 IPA 字形，advance 缩放正确。
+  - **墨墨接口（已验证，对线上 API 实测）**：用真实令牌 —— `get_study_progress` 返回 10/20、
+    `get_today_items` 返回 20 词队列、`add_words` 成功（服务器自报 `added_count`）。
+  - **令牌作用域（已验证）**：`/study/*` 正常、`/notes` 与 `/phrases` 返回
+    `common_permission_denied`，设备侧正确映射为 `ESP_ERR_NOT_SUPPORTED` 并按词缓存为不可用。
+  - **错误模型（已验证）**：确认 API **即使权限错误也返回 HTTP 200**，设备读的是信封里的
+    `success:false` + `errors[].code`，不是状态码。
+  - **`advance` 必填（已验证）**：漏掉它即使请求其它部分完全合法也会失败 ——
+    `common_invalid_param: {base} must have required property 'advance'`。
+    现在**永远发送**（含 `false`），并回报服务器自己的 `added_count` 而不是发送条数。
+    请求体形状是 `{"words":[{"id":<voc_id>},...],"advance":bool}` ——
+    **按 id 加词而非拼写**，设备侧先用 `GET /vocabulary?spelling=` 解析
+    （与官方 CLI `@maimemo/memo-api` v1.2.0 的 `advance` + `words[].id` 一致）。
+  - **助记/例句的读取端点是 `GET`，不是 `POST`（已验证）**：
+    `GET /api/v1/notes?voc_id=...`、`GET /api/v1/phrases?voc_id=...`。
+    同路径的 `POST /api/v1/notes` 是**创建**笔记（body `{"note":{voc_id,note_type,note}}`），
+    用 POST 去读会拿到完全不同的东西（甚至可能改写用户的笔记），所以本组件为其单独实现了
+    `mm_get()`。响应结构 `{"data":{"notes":[{"note":"..."}]}}` /
+    `{"data":{"phrases":[{"phrase":"..."}]}}`，已对照官方 CLI 源码核实。
+  - **网页面板令牌只写不读（已验证）**：已核实没有任何回显路径。
+  - **未验证（需上机）**：字库在屏上的实际观感、设备端云端队列、方案 B 的助记显示、
+    方案 C 的推送落地、无令牌降级的实机行为。
+
+### Known gaps
+- **方案 B 的"快乐路径"没有在设备上被观察到**：当前令牌是学习作用域的，`/notes` 与
+  `/phrases` 恒返回 `common_permission_denied`。**代码路径已实现、权限拒绝的处理已验证**，
+  但"卡片上真的显示出一条助记"这件事**尚未在设备上看到过**。
+  要验证需要换一个能读 `/notes` 的令牌，或等墨墨放开该作用域。
+- **本轮所有功能都没有上机**：字库是运行时从 `<storage>/todohelper/fonts/ui_cjk.ttf`
+  加载的（**没有烘进固件镜像**），所以部署新字库是**拷文件而不是重新烧录** ——
+  但也因此，"拷上去之后屏幕上真的没有方框了"这件事仍待目视确认。
+- 墨墨云端模式与本地进度是**两套记账**：云端词匹配回本地词库后，本地的
+  level / 复习间隔照常生效；匹配不上的词（`WORD_ID_CLOUD`）在设备上一评分就只留痕在账号侧，
+  本地不记进度。这是刻意的取舍（不把云端 id 硬塞进本地进度键），但换回本地书时两边的数字
+  不会合并。
+- 方案 C 一旦开启就无法"撤销"已经推上去的词：接口只负责加词，没有反向删除。
+
+---
+
 ## [1.2.0] — 2026-09-24
 
 **系统流畅度优化（第一轮：消除锁内阻塞 I/O + 高频无效重绘）。** 需求条目没有变化，

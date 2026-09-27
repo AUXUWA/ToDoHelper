@@ -48,8 +48,10 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
   原因：`assets` 分区由 `components/ui_assets/CMakeLists.txt` 的 `spiffs_create_partition_assets()`
   生成，其 `DEPENDS` 依赖 **configure 期求值的 `GLOB_RECURSE`**；不重跑 configure 时镜像不会更新，
   表现为"换了 PNG 但屏幕上还是旧图"（`docs/TODOHELPER_FRAMEWORK.md` §8）。
-- 未加载 profile 时报 `idf.py: command not found`；Git Bash 下直接跑 `idf.py` 会打印
-  `MSys/Mingw is no longer supported`（无害警告，先 `Remove-Item Env:MSYSTEM` 可去掉）。
+- 未加载 profile 时报 `idf.py: command not found`；Git Bash 下直接跑 `idf.py` 会被**拒绝执行**
+  （`MSys/Mingw is no longer supported`）。**Git-Bash / 自动化里请用 `bash tools/build.sh build`**
+  （1.3.0 新增的包装器，会把活交给原生 powershell 并原样回传退出码；`flash` / `-v build` 同理）。
+  三个会**静默产出空日志 + 退出码 0** 的坑见 `AGENT.md` §4.2.1。
 
 ---
 
@@ -70,11 +72,13 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
 | L3 | `todo_manager` | `components/todo_manager/` | `sys_utils` `storage_manager` `http_router` `cjson` |
 | L3 | `calendar_service` | `components/calendar_service/` | `sys_utils` `esp_netif` `http_router` `lwip` `cjson` |
 | L3 | `weather_service` | `components/weather_service/` | `sys_utils` `storage_manager` `http_router` `cjson` `esp_http_client` `esp-tls` `mbedtls` `esp_timer` |
-| L3 | `word_service` | `components/word_service/` | `sys_utils` `storage_manager` `http_router` `cjson` |
+| L3 | `word_service` | `components/word_service/` | `sys_utils` `storage_manager` `http_router` `cjson` `maimemo_client` |
 | L4 | `sync_server` | `components/sync_server/` | `sys_utils` `http_router` `cjson` `wifi_manager` `storage_manager` `esp_app_format` `esp_timer` `esp_hw_support` `esp_system` `heap`（私有 `mdns`） |
 | L4 | `idle_face` | `components/idle_face/` | `sys_utils` `bsp` `ui_core` `lvgl` |
-| L4 | `ui_pages` | `components/ui_pages/` | `ui_core` `ui_assets` `sys_utils` `storage_manager` `wifi_manager` `todo_manager` `calendar_service` `weather_service` `word_service` `sync_server` `lvgl` |
+| L4 | `ui_pages` | `components/ui_pages/` | `ui_core` `ui_assets` `sys_utils` `storage_manager` `wifi_manager` `todo_manager` `calendar_service` `weather_service` `word_service` `sync_server` `maimemo_client` `lvgl` |
 | L5 | `ai_service` ⚠️ | `components/ai_service/` | `sys_utils` `storage_manager` `http_router` `idle_face` `cjson` `esp_http_client` `esp-tls` `mbedtls` `esp_timer` |
+| L5 | `voice_service` | `components/voice_service/` | `sys_utils` `bsp` `storage_manager` `http_router` `cjson` `esp_http_client` `esp-tls` `mbedtls` |
+| L5 | `maimemo_client` | `components/maimemo_client/` | `sys_utils` `storage_manager` `http_router` `cjson` `esp_http_client` `esp-tls` `mbedtls` |
 | — | `main`（编排，非组件） | `main/` | `REQUIRES` 上述除 `ai_service` 外的全部组件 |
 
 **规则（框架文档 §2.1）**
@@ -86,6 +90,14 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
 - `ui_pages` / `idle_face` 不被任何组件依赖，只有 `main` 依赖它们。
 - ⚠️ `ai_service`(L5) 的 `REQUIRES` 里含 `idle_face`(L4)，且它**未接入** `main/app_main.c` 的模块表
   （`main/CMakeLists.txt` 也没有 `REQUIRES ai_service`）——详见 §5。
+- ⚠️ **`word_service`(L3) 的 `REQUIRES` 里含 `maimemo_client`(L5)** —— 这是**由下向上的依赖**，
+  与上面第一条规则相悖。1.3.0 的实现选择是"`word_service` 直接调用 `maimemo_fetch_today()`"
+  （`word_cloud_refresh()`），而不是让 `maimemo_client` 订阅事件后回注，理由是云端队列要在
+  `word_service_init()` 之前就绪、且 `maimemo_client` 因此被排到模块表里 `word_service`
+  **之前**。**这是已知的架构债**：若以后 `maimemo_client` 再依赖别的 L4 组件，
+  就会形成真正的循环。要走"干净"路线需把云端队列的上游改成事件 + `main` 注入回调
+  （真要做，改动面在 `word_service.c` 的 `word_cloud_refresh()` 与 `app_main.c` 的模块顺序）。
+  `ui_pages`(L4) 也 `REQUIRES maimemo_client`(L5)，同样属向下例外。
 
 ---
 
@@ -1046,12 +1058,152 @@ I (xxx) TH:idle_face: idle face attached (WxH eyes, gap G)      # 待机页首�
 
 ---
 
+### maimemo_client（L5，1.3.0 新增）
+
+- **组件目录**：`components/maimemo_client/`
+- **头文件**：`components/maimemo_client/include/maimemo_client.h`
+- **依赖**：`sys_utils`、`storage_manager`、`http_router`、`cjson`、`esp_http_client`、`esp-tls`、`mbedtls`
+- **用途**：墨墨背单词（MaiMemo）开放 API 客户端。三件事（用户选定的三个方案）：
+  **A 学习同步**（今日队列与账号真实进度）、**B 助记/例句预取**（缓存到 SD 卡，离线可看）、
+  **C 反向推送**（把「不认识」的词加回学习计划）。
+- **可选组件**：默认**不配令牌就静默降级** —— 云端模式关闭，`word_service` 继续用本地词库，
+  UI 与 HTTP 都不报错。这也是它只做 `SYS_LOGW` 不做 `ESP_LOGE` 的原因。
+- **不变量**：`maimemo_client` 只与墨墨通信；本地词库/进度仍归 `word_service`
+  （云端词由 `word_service` 用 `voc_spelling` 匹配回本地条目，见 §2.1 与 `word_service` 一节）。
+
+外部端点基址 `https://open.maimemo.com/open/api/v1`（`MM_BASE`）；响应上限 **24 KB**
+（`MM_MAX_RESPONSE`，64 词的今日队列约 8 KB）；单次请求超时 **15 s**（`MM_TIMEOUT_MS`）。
+
+#### 公开函数
+
+| 分组 | 签名 | 说明 |
+|---|---|---|
+| 生命周期 | `esp_err_t maimemo_client_init(void);` | 初始化配置/缓存/同步任务；内部会调 `maimemo_register_http()` |
+| 令牌 | `bool maimemo_has_token(void);` | **只读 NVS，不碰网络，可从 UI 任务调用** |
+| 令牌 | `esp_err_t maimemo_set_token(const char *token);` | 写 NVS `mm_token`（`NULL`/`""` 清除）；**永不写日志** |
+| 令牌 | `esp_err_t maimemo_verify_token(void);` | 用一次 `/study/get_study_progress` 做连通性校验；会阻塞 |
+| 方案 A | `esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count);` | 今日词表；阻塞 |
+| 方案 A | `esp_err_t maimemo_fetch_progress(maimemo_progress_t *out);` | 账号进度（finished/total/study_time_ms/due_count）；阻塞 |
+| 方案 A | `esp_err_t maimemo_sync_start(void);` | **异步**刷新今日队列（worker 任务 + 事件）；**唯一对 UI 安全的入口** |
+| 方案 A | `esp_err_t maimemo_get_cached_progress(maimemo_progress_t *out);` | 上次同步结果，**不碰网络** |
+| 方案 B | `esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out);` | 助记/例句；命中缓存则不联网；作用域不足 → `ESP_ERR_NOT_SUPPORTED` 并按词缓存 |
+| 方案 C | `esp_err_t maimemo_push_words(const char **spellings, size_t count, bool advance, int *accepted);` | 批量加词（≤1000/次）；`accepted` = **服务器自报**条数 |
+| 方案 C | `esp_err_t maimemo_push_unknown(const char *spelling);` | 单张卡评分路径用；未开启方案 C 时**不碰网络**直接返回 `ESP_ERR_NOT_SUPPORTED` |
+| 方案 C | `bool maimemo_push_enabled(void);` | 方案 C 是否开启 |
+| 方案 C | `esp_err_t maimemo_set_push_enabled(bool enabled);` | 持久化到 NVS `mm_push` |
+| HTTP | `esp_err_t maimemo_register_http(void);` | 注册 6 条 `/api/v1/maimemo/*` 路由；由 `init()` 自动调用 |
+
+类型与常量：`maimemo_item_t {char voc_id[80]; char spelling[64]; bool is_new; bool is_finished;
+char first_response[24];}`（`first_response` = `"FORGET"` / `"FAMILIAR"` / `"UNSPECIFIED"`）、
+`maimemo_progress_t {int finished; int total; int study_time_ms; int due_count;}`、
+`maimemo_enrich_t {char mnemonic[256]; char example[256]; bool from_cache;}`、
+`MAIMEMO_SPELLING_MAX`=64、`MAIMEMO_VOC_ID_MAX`=80、`MAIMEMO_MAX_TODAY`=64、
+`MM_MAX_RESPONSE`=24 KB、`MM_MAX_CACHE_FILE`=256 KB、`MM_TOKEN_MAX`=192。
+
+#### ⚠️ 线程规则（**最重要的一条**）
+
+**本组件所有会做 TLS 的函数都是阻塞的，绝不允许从 LVGL 任务调用。**
+LVGL 的控件事件回调与 `lv_timer` 回调都在**适配器锁内**运行（`AGENT.md` §9.0.1.1），
+在回调里调 `maimemo_fetch_today()` 就是**持锁等一次 HTTPS 往返 → 整个 UI 冻结**。
+
+对 UI 安全的只有三个：`maimemo_sync_start()`（起 worker、立刻返回、结果走事件）、
+`maimemo_has_token()` 与 `maimemo_get_cached_progress()`（只读 NVS/内存）。
+`page_word.c` 的助记预取用 `lv_async_call` 起一次性任务，结果再回到 LVGL 任务里写标签。
+
+#### 令牌与作用域模型
+
+- 令牌存 NVS **`mm_token`**，经 `sys_config_set_str()` 写入，由网页控制台录入。
+  **与 AI Key 同规则（需求 §8.8）：不硬编码、不写日志、任何接口都不回读。**
+  `GET /api/v1/maimemo/status` 只回 `configured` 与掩码提示（`token_hint`，形如 `g_zV****`）。
+- **令牌作用域决定哪些方案能用，且这是正常情况不是错误。** 常见的学习作用域令牌：
+  `/study/*` 与 `/vocabulary` 可用，`/notes`、`/phrases` 返回 `common_permission_denied`。
+  处理方式：映射为 **`ESP_ERR_NOT_SUPPORTED`**（语义 "这个令牌不许做这件事，别再问了"）
+  并**按词缓存为不可用**，所以每个词只会被问一次。理由：一个"能同步队列但不显示助记"的
+  设备仍是有用的，一个"报错"的设备不是。
+
+#### 错误模型（**HTTP 200 也可能是失败**）
+
+墨墨的接口**即使权限错误也返回 HTTP 200**，错误写在信封里：
+
+```json
+{ "success": false, "data": null,
+  "errors": [ { "code": "common_permission_denied", "msg": "..." } ] }
+```
+
+所以**只看状态码会漏掉全部权限/参数错误**。`mm_classify()` 统一检查 `success` 与
+`errors[].code`：含 `permission_denied` → `ESP_ERR_NOT_SUPPORTED`，其余 → 其他错误。
+HTTP 层的映射单独一层：`401`/`403` → `ESP_ERR_INVALID_STATE`（令牌过期/不被允许）、
+非 200 → `ESP_ERR_INVALID_RESPONSE`、响应超限 → `ESP_ERR_INVALID_SIZE`。
+无令牌时 `mm_token()` 失败 → `ESP_ERR_NOT_FOUND`（调用方据此**安静降级**）。
+
+**两个已实测的接口坑**（都写进了代码注释，改这里前先读）：
+
+1. **`advance` 是 `POST /study/add_words` 的必需属性**，不是可选：
+   漏掉它**即使 `words` 数组完全合法**也会失败 ——
+   `common_invalid_param: {base} must have required property 'advance'`。
+   因此**永远发送**（`false` 也发）；且回报**服务器自己的 `added_count`**而不是发送条数
+   （服务器会拒掉已在计划里的词）。
+   `add_words` 的请求体是 `{"words":[{"id":<voc_id>},...],"advance":bool}` ——
+   **按 id 加词，不是按拼写**，所以设备侧先用 `GET /vocabulary?spelling=` 把拼写解析成
+   `voc_id`（`mm_resolve_voc_id()`），解析不到的词跳过并 `SYS_LOGD`。
+2. **助记/例句的读取端点是 `GET`，不是 `POST`** ——
+   `GET /api/v1/notes?voc_id=...` 与 `GET /api/v1/phrases?voc_id=...`。
+   `POST /api/v1/notes` **也存在，但它是"创建笔记"**（body `{"note":{voc_id,note_type,note}}`），
+   拿 POST 去读会得到完全不同的东西。已对照官方 CLI 源码
+   （`@maimemo/memo-api` v1.2.0：`api("/api/v1/notes", {method:"GET", query:{voc_id}})`，
+   响应按 `res.notes.map(...)` 取）核实。
+   解析出的结构是 `{"data":{"notes":[{"note":"..."}]}}` 与
+   `{"data":{"phrases":[{"phrase":"..."}]}}`（`mm_fetch_field()` 取数组第 0 项的文本字段）。
+
+#### 事件
+
+| 基址 `MAIMEMO_EVENT` | payload |
+|---|---|
+| `MAIMEMO_EVENT_SYNC_STARTED`(0) | 无 |
+| `MAIMEMO_EVENT_SYNC_DONE` | `maimemo_progress_t` |
+| `MAIMEMO_EVENT_SYNC_FAILED` | `esp_err_t` |
+| `MAIMEMO_EVENT_PUSH_DONE` | `int`（服务器接受的词数） |
+
+#### 最小测试步骤
+
+```powershell
+# 1) 存入令牌并当场校验（verify 会真的访问墨墨，5~15 s）
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/config -H "Content-Type: application/json" -d "{\"token\":\"g_zV...\",\"verify\":true}"
+# 2) 状态（不含明文令牌）
+curl.exe http://todohelper.local/api/v1/maimemo/status
+# 3) 同步今日队列，再回读
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/sync
+curl.exe http://todohelper.local/api/v1/maimemo/today
+# 4) 助记/例句（学习作用域令牌会得到 unavailable:true）
+curl.exe "http://todohelper.local/api/v1/maimemo/enrich?spelling=abrupt"
+```
+
+期望串口日志：
+
+```
+I (xxx) TH:maimemo: ready (token=set, push=off)
+I (xxx) TH:maimemo: token OK: 10/20 finished today
+I (xxx) TH:word: cloud queue: 20 words (12 also in the local book)
+I (xxx) TH:maimemo: pushed to the study plan: 1 accepted of 1 resolved (advance=0)
+```
+
+- **无令牌时 `ready (token=unset, push=off)` 也算成功**（`optional=true`，
+  不得因为没有令牌而中断启动）。
+- **验证状态（诚实说明）**：以上端点**已用真实令牌对线上 API 实测**（`get_study_progress`
+  返回 10/20、`get_today_items` 返回 20 词、`add_words` 成功并回报 `added_count`；
+  `/notes`、`/phrases` 确认返回 `common_permission_denied` 并被正确映射）。
+  **但这些都没有在真机上跑过** —— 1.3.0 只构建、未烧录。
+  **方案 B 的"快乐路径"（真的在卡片上显示出一条助记）尚未被观察到**，
+  因为当前令牌读不了 `/notes`。
+
+---
+
 ### main（编排层，非组件）
 
 - **目录 / 入口**：`main/app_main.c`（`void app_main(void)`）；没有公开头文件
 - **依赖**：`main/CMakeLists.txt` 的 `REQUIRES` = `sys_utils` `storage_manager` `bsp` `ui_assets`
   `http_router` `ui_core` `ui_pages` `wifi_manager` `todo_manager` `calendar_service`
-  `weather_service` `word_service` `sync_server` `idle_face`
+  `weather_service` `maimemo_client` `word_service` `sync_server` `idle_face`
 
 启动顺序（`app_main()` 实际代码）：
 
@@ -1063,8 +1215,13 @@ I (xxx) TH:idle_face: idle face attached (WxH eyes, gap G)      # 待机页首�
 6. `ESP_ERROR_CHECK(ui_core_init())`、`ESP_ERROR_CHECK(ui_pages_init())`，切到 `UI_PAGE_SPLASH`；
 7. 跑 `after_ui=false` 的模块（当前表里没有），延时 400 ms 后切 `UI_PAGE_HOME`；
 8. 跑 `after_ui=true` 的模块表（顺序）：`wifi_manager` → `todo_manager` → `weather_service` →
-   `calendar_service` → `word_service` → `sync_server` → `idle_face`（**全部 `optional=true`**）；
-9. `ui_statusbar_refresh()`，发 `SYS_EVENT_READY`，打印 `ready (storage=<root>)`。
+   `calendar_service` → `maimemo_client` → `word_service` → `sync_server` → `idle_face` →
+   `ai_service` → `voice_service`（**全部 `optional=true`**）；
+9. `ui_statusbar_refresh()`，发 `SYS_EVENT_READY`，打印 `ready (storage=<root>)`；
+   若处于云端模式（`word_cloud_mode()`）则顺手发起一次 `maimemo_sync_start()`。
+
+> **`maimemo_client` 必须排在 `word_service` 之前**（1.3.0）：`word_service` 的云端队列
+> （`word_cloud_refresh()`）初始化时就要读令牌与同步结果。模块表当前共 **10** 项。
 
 模块表结构（新增功能组件 = 加一行）：
 
@@ -1099,7 +1256,7 @@ I (xxx) TH:app: ready (storage=/sdcard)
 ```
 
 - 若某可选模块不可用，应看到 `TH:app: module 'xxx' unavailable: ESP_ERR_...`，而**不是**启动中断。
-- 端到端冒烟：`curl.exe http://todohelper.local/api/v1/device/status` 的 `routes`(29) / `time_synced` / `free_heap`。
+- 端到端冒烟：`curl.exe http://todohelper.local/api/v1/device/status` 的 `routes`(51) / `time_synced` / `free_heap`。
 
 ---
 
@@ -1113,9 +1270,11 @@ I (xxx) TH:app: ready (storage=/sdcard)
 
 下表是**实际注册**的全部路由（来源：`components/*/src/*.c` 中的
 `http_router_register()` / `http_router_register_not_implemented()` 路由表）。
-当前注册 **45** 条：`sync_server` 8 + `todo_manager` 7 + `weather_service` 5 +
-`calendar_service` 5 + `word_service` 5 + `wifi_manager` 7 + `ai_service` 6 + `voice_service` 2，
-与 `GET /api/v1/device/status` 的 `routes` 字段一致（1.0.0 真机实测 45）。
+当前注册 **51** 条：`sync_server` 8 + `todo_manager` 7 + `weather_service` 5 +
+`calendar_service` 5 + `word_service` 5 + `wifi_manager` 7 + `ai_service` 6 + `voice_service` 2 +
+`maimemo_client` 6 = 51。
+（1.0.0 真机实测 45 条 = 上表去掉 `maimemo_client` 的 6 条；**1.3.0 的 6 条尚未上机复核
+`routes` 字段**，预期为 51 —— 见 `docs/HANDOVER.md` §4 第 7 组。）
 
 > **1.0.0 更正**：旧版这张表把 `/api/v1/wifi/*` 记为"组件里没有任何 `http_router_register()`
 > 调用 → 404"、把 `ai_service` 记为"不在 `app_main` 模块表里 → 运行时 404"。**两条都是错的**，
@@ -1171,6 +1330,12 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | POST | `/api/v1/ai/abort` | ai_service | 中断正在进行的流式回答 | ✅ 200 |
 | GET | `/api/v1/voice/status` | voice_service | 录音/回放可用性与 ASR/TTS 端点配置状态（音频按需打开） | ✅ 200 |
 | POST | `/api/v1/voice/config` | voice_service | 配置 ASR/TTS HTTP 端点（选型未定，见需求 FR7） | ✅ 200 |
+| GET | `/api/v1/maimemo/status` | maimemo_client | 墨墨令牌**掩码**与上次同步进度；**不碰网络**（可安全轮询）。见 §2.5 | ✅ 200 |
+| POST | `/api/v1/maimemo/config` | maimemo_client | body `{"token","push","verify","clear"}`；**令牌只写不读**。见 §2.5 | ✅ 200（写方法→需 token） |
+| POST | `/api/v1/maimemo/sync` | maimemo_client | 异步发起一次方案 A 同步；已有同步在跑 → 400。见 §2.5 | ✅ 200/400 |
+| GET | `/api/v1/maimemo/today` | maimemo_client | **实时**拉取今日词表（阻塞一次 HTTPS 往返）。见 §2.5 | ✅ 200/400 |
+| GET | `/api/v1/maimemo/enrich` | maimemo_client | `?spelling=` 取助记/例句；作用域不足 → `unavailable:true` 而非报错。见 §2.5 | ✅ 200/400 |
+| POST | `/api/v1/maimemo/push` | maimemo_client | body `{"spellings":[...],"advance":bool}`，把词加回学习计划。见 §2.5 | ✅ 200/400 |
 
 > **路径参数写法**：路由器只支持**一个** `*`，所以单项接口注册为 `/api/v1/todos/*`、动作为 `/api/v1/todos/*/done`。
 > `*` 必须至少吞掉一个字符，因此 `/api/v1/todos/`（尾斜杠）**不**匹配 `/api/v1/todos/*`，会落到 404。
@@ -1243,8 +1408,9 @@ curl.exe -X POST http://todohelper.local/api/v1/device/reboot -H "X-Auth-Token: 
    鉴权不过 → **401**；
 6. 通过后执行 handler。
 
-其它实现细节：路由表为定长静态数组（`HTTP_ROUTER_MAX_ROUTES`=48，当前用 29），路径缓冲 64 B；
-同 `path+method` 重复注册 = **替换 handler**（因此各组件 `init()` 是幂等的）；
+其它实现细节：路由表为定长静态数组（`HTTP_ROUTER_MAX_ROUTES`=48，**1.0.0 文档写"当前用 29"已过期**；
+按 §2.1 的 51 条注册数，**表已接近上限**，加路由前先确认是否要抬高该常量）；
+路径缓冲 64 B；同 `path+method` 重复注册 = **替换 handler**（因此各组件 `init()` 是幂等的）；
 表满返回 `ESP_ERR_NO_MEM` 并 `SYS_LOGE("route table full (48)")`；
 `http_router_attach()` 重复调用遇到 `ESP_ERR_HTTPD_HANDLER_EXISTS` 返回 `ESP_OK`。
 
@@ -1258,6 +1424,51 @@ curl.exe -i -X OPTIONS http://todohelper.local/api/v1/todos   # 204 + CORS 头
 curl.exe -i http://todohelper.local/ws/events                 # 501 + data.hint
 curl.exe -i http://todohelper.local/api/v1/wifi/status        # 404（WiFi API 未实现）
 ```
+
+### 2.5 墨墨背单词接口（`/api/v1/maimemo/*`，1.3.0）
+
+**六个端点封装的是设备侧对墨墨开放 API 的代理**，不是墨墨 API 本身。
+设备不把令牌交给浏览器；浏览器只能通过这 6 条路由使用令牌，且**永远读不回令牌明文**。
+
+> **状态码语义（重要，别按常见约定猜）**：
+> **HTTP 200 只表示"设备这一层传输成功"**，它**不代表墨墨那边成功**。
+> 墨墨的响应始终是信封 `{"success":bool,"data":{...},"errors":[{"code","msg"}]}`，
+> 而且**权限/参数错误时墨墨仍然返回 HTTP 200**。
+> 所以真正的结果要看 `success:false` + `errors[].code`；
+> 其中 `common_permission_denied` 在设备侧被映射为 **`ESP_ERR_NOT_SUPPORTED`**，
+> 语义是"这个令牌没这个权限，别再重试了"（与"网络抖动，稍后再试"区分开）。
+> 设备**自己的**错误（无令牌、body 非法、上游网络失败）才用 4xx/5xx。
+
+| 方法 | 路径 | 鉴权 | 请求 | 响应 |
+|---|---|---|---|---|
+| GET | `/api/v1/maimemo/status` | 无（只读） | — | `configured`(bool)、`token_hint`(掩码，如 `g_zV****`)、`push_enabled`(bool)、`synced`(bool)；已同步时另有嵌套 `progress`：`finished`/`total`/`remaining`/`study_time_ms`/`study_time_min`/`plan_count`。**不碰网络**（用上次同步结果），可安全轮询 |
+| POST | `/api/v1/maimemo/config` | **需要 `X-Auth-Token`**（写方法） | body `{"token":"...","push":bool,"verify":bool,"clear":bool}`，全部可选 | 与 `status` 同结构；另在请求了 `verify` 时多一个 `verify` 字段（`"ok"` 或 `esp_err_to_name()` 值）。**校验失败不等于令牌坏** |
+| POST | `/api/v1/maimemo/sync` | **需要 `X-Auth-Token`**（写方法） | — | `{"started":true}`；已有同步在跑 → **400** `"a sync is already running"`；无令牌 → **400**。结果靠轮询 `status` |
+| GET | `/api/v1/maimemo/today` | 无（只读） | — | `items[]`（每项 `spelling`/`is_new`/`is_finished`/`first_response`）+ `count`；无令牌 → **400**。**实时拉取，阻塞一次 HTTPS 往返** |
+| GET | `/api/v1/maimemo/enrich` | 无（只读） | query **`?spelling=`**（必填，缺失/空 → **400**） | `spelling`、`mnemonic`、`example`、`from_cache`(bool)、`unavailable`(bool)。作用域不足 → `unavailable:true` 且**仍返回 200**（不是错误） |
+| POST | `/api/v1/maimemo/push` | **需要 `X-Auth-Token`**（写方法） | body `{"spellings":["a","b"],"advance":bool}`；`spellings` 必须是数组、1–1000 条，否则 **400** | `{"accepted":N}`，N 是**服务器自报**的接受条数。无令牌 → **400** |
+
+**关于 `X-Auth-Token`**：这 6 条**都不在** `sync_server.c` 的 `s_always_auth[]` 里
+（那份名单只有 `device/reboot`、`device/auth`、`ai/config`、`ai/history`）。
+因此生效的是 §2.3 的**通用规则**：**`POST` 无条件鉴权**（`is_write_method()`），
+`GET` 默认不鉴权。即 `auth_enabled=true` 时，三个 POST 必须带 `X-Auth-Token`，三个 GET 不需要。
+（`verify` 会真的访问墨墨，5~15 s，所以它是**显式请求**而不是保存就校验。）
+
+```powershell
+# 写操作带 token（设备鉴权开启时）
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/config -H "Content-Type: application/json" -H "X-Auth-Token: my-secret" -d "{\"token\":\"g_zV...\",\"verify\":true}"
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/sync -H "X-Auth-Token: my-secret"
+# 只读操作不需要 token
+curl.exe http://todohelper.local/api/v1/maimemo/status
+curl.exe "http://todohelper.local/api/v1/maimemo/enrich?spelling=abrupt"
+```
+
+**`enrich` 的 `unavailable` 与"没有助记"是两件事**：
+`unavailable:true` = 令牌作用域不够（不重试）；`unavailable:false` + 空 `mnemonic` = 问过了、
+这个词确实没有助记。UI 只在前者/后者都为空时**整块隐藏**，不显示空标签。
+
+**组件细节、三个方案的完整语义、线程规则与实测记录见
+`components/maimemo_client/README.md` 与 `AGENT.md` §9.0.6。**
 
 ---
 
@@ -1302,6 +1513,9 @@ curl.exe -i http://todohelper.local/api/v1/wifi/status        # 404（WiFi API �
 | `SYS_KEY_AI_SAVE_HIST` | `ai_save_hist` | bool | 是否保存聊天记录（P2；Kconfig 默认 `n`） | `ai_service`（未接入） |
 | `SYS_KEY_VOICE_WAKE` | `voice_wake` | i32 | 语音唤醒方式（P2） | ⚠️ 已登记，**当前无组件读写**（无 `voice_service`） |
 | `SYS_KEY_TTS_ENABLED` | `tts_enabled` | i32 | TTS 播报开关（P2） | ⚠️ 已登记，**当前无组件读写** |
+| `SYS_KEY_MAIMEMO_TOKEN` | `mm_token` | str | 墨墨开放 API 令牌 🔒（≤191 字符；空/缺省 = 云端模式关闭）。**与 `ai_api_key` 同规则：不写日志、任何接口都不回读（只回掩码）** | `maimemo_client` |
+| `SYS_KEY_MAIMEMO_MODE` | `mm_mode` | str | 单词队列来源：`"cloud"` / `"local"`；缺省 `"local"`。`word_cloud_mode()` 要求**它等于 `cloud` 且有令牌** | `maimemo_client`、`word_service` |
+| `SYS_KEY_MAIMEMO_PUSH` | `mm_push` | str | 方案 C 反向推词开关：`"1"` / `"0"`；缺省关（`"1"` 才开启）。**会改动用户在云端的学习计划，所以刻意默认关闭** | `maimemo_client` |
 
 验证命令：
 
@@ -1325,7 +1539,7 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
   fonts/                            # ui.ttf 等字体（ui_core 字体链第 1 顺位）
   images/weather/                   # 预留：SD 天气图标（当前图标走 assets 分区）
   anim/idle_face/                   # 预留：SD 帧动画（当前为程序化绘制，不用）
-  words/                            # <book>.json 词库 + progress.json 进度
+  words/                            # <book>.json 词库 + progress.json 进度 + enrich.json 墨墨缓存
   ai/                               # 预留：chat_history.json（P2）
   tts/                              # 预留：reply_*.pcm（P2）
   cache/                            # todos.json / weather.json 等缓存
@@ -1341,6 +1555,7 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 | `cache/weather.json` | `weather_service` | 字段 `city/lat/lon/temp/feels_like/humidity/condition/icon/weather_code/update_ts/provider`；**绝不写入 API Key**；断网时页面靠它显示上次读数 |
 | `words/progress.json` | `word_service` | 结构 `{"items":{"w<id>":{level,n,last,next,at}},"version":1,"book","daily_count","known_total","fuzzy_total","unknown_total"}`；`review_count == 0` 的词不写入；原子写 |
 | `words/<book>.json` | `word_service` | 当前词库（默认 `cet4.json`）。缺失时：若 `CONFIG_TODOHELPER_WORD_EXPORT_TEMPLATE`（默认 y）把内置 32 词示例写到该路径，然后无论写成功与否都用固件内置词库兜底 |
+| `words/enrich.json` | `maimemo_client` | **1.3.0 新增**。墨墨助记/例句缓存（方案 B），路径常量 `MM_CACHE_REL` = `"words/enrich.json"`（**相对**应用目录，经 `storage_read_text()` / `storage_write_file()` 读写，**原子写**）。结构是 `{"entries":[{"spelling":"...","mnemonic":"...","example":"...","unavailable":true?}]}` —— 注意是**数组**（`entries`），不是按拼写做键的对象；`mnemonic`/`example`/`unavailable` 为空/false 时**该字段整体不写**（省体积）。`unavailable:true` 表示**令牌作用域不够、不要再问**（缓存这个结论正是为了让每个词只被问一次）。**整个文件一次性读进 PSRAM（上限 `MM_MAX_CACHE_FILE` = 256 KB）、改动后整文件重写**，不做逐词小文件 —— 内部 RAM 只有约 310 KB，批量数据必须显式走 PSRAM（`AGENT.md` §9.0.5）。文件不存在 / JSON 非法时只 `SYS_LOGW` 并**从空缓存开始**，功能照常（只是每次都要联网） |
 | `fonts/ui.ttf` | `ui_core`（字体链） | 路径来自 `CONFIG_TODOHELPER_FONT_PATH`（默认 `fonts/ui.ttf`，相对 `storage_app_dir()`）。放这里即可**免重烧**换字体；整条 FreeType 通路受 `CONFIG_TODOHELPER_FONT_FREETYPE`（默认 n）门控，关闭时回落到 LVGL 内置 Source Han Sans SC CJK |
 | `backup/todos_*.json` | — | 需求 §9.2 规划项。⚠️ 目录会被创建，Kconfig `CONFIG_TODOHELPER_TODO_BACKUP_KEEP`（默认 7）已声明，但**当前没有任何代码写备份** |
 | `logs/app.log` | — | 需求 §9.2 规划项，**当前未实现**（日志只在串口） |
@@ -1388,36 +1603,52 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 
 ### 5.3 未实现 / 未接入的能力
 
+> **本节 1.0.0 版本的若干条目已过期**（`voice_service` 存在、WiFi API 已注册、`ai_service`
+> 已接入、FreeType 与子集字体都已启用）。下表已按 1.3.0 的实际状态更正；
+> 保留的"⚠️ 1.0.0 旧记录"行是为了让读者知道曾经的判断是怎么错的。
+
 | 项 | 现状 |
 |---|---|
 | **`/ws/events`（WebSocket）** | 本 IDF 构建**没有 WebSocket 组件**，故用 **SSE**：`GET /api/v1/events`（`text/event-stream`，最多 3 客户端，15 s keepalive）。`/ws/events` 仍**注册为 501 占位**并给出 `hint`，让客户端能区分"没做"与"URL 写错"（需求 §8.7） |
-| **WiFi HTTP API（5 条）** | `GET /api/v1/wifi/status`、`POST\|GET /api/v1/wifi/scan`、`POST /api/v1/wifi/connect`、`POST /api/v1/wifi/disconnect` 在需求 §8.3 里要求，但 `components/wifi_manager/` 里**没有任何 `http_router_register()` 调用**，也没有注册 501 占位 → 客户端拿到的是 **404**。这是 §2 表格里唯一"既没做也没占位"的一组接口，**建议补 `http_router_register_not_implemented()`** |
-| **FreeType CJK 字体通路** | 代码路径完整（`ui_fonts.c` 的三级回退），但默认构建**不启用**：`CONFIG_TODOHELPER_FONT_FREETYPE` 默认 `n` 且依赖 `CONFIG_ESP_LVGL_ADAPTER_ENABLE_FREETYPE`（`sdkconfig.defaults` 里未开）。此外**子集 TTF 尚未生成**：`components/ui_core/fonts/ui_cjk.ttf` 当前**不存在**，`CMakeLists.txt` 的 `if(EXISTS ...)` 因此跳过 `EMBED_FILES`。要用需先跑 `tools/gen_cjk_font.py` 生成子集，再打开上述 Kconfig（`ui_core/README.md`）。**默认路径靠 LVGL 内置 Source Han Sans SC 16/14 CJK，串口打 `TH:ui_fonts: FreeType disabled, using built-in fonts`** |
-| `ai_service`（P2，FR7） | 组件目录、头文件、`ai_service_http.c`（6 条 `/api/v1/ai/*` 路由）都在，但：① `main/CMakeLists.txt` 未 `REQUIRES ai_service`；② `main/app_main.c` 的模块表里**没有** `ai_service` 一行，`ai_service_init()` 从不被调用 → 运行时那 6 条路由是 **404**，`ai_api_key` 等 NVS 键也不会被读写。另注意其 `REQUIRES` 含 `idle_face`（L4），若接入需一并核对分层方向 |
-| `voice_service`（P2，FR7） | **组件目录不存在**（`components/voice_service/` 缺失）。`SYS_KEY_VOICE_WAKE` / `SYS_KEY_TTS_ENABLED` 已登记但无人读写 |
-| 待机表情联动 | `idle_face` **不订阅任何系统事件**：`HAPPY/SLEEPY/ERROR/SYNCING/THINKING/LOOK_*` 都只是"支持"，没有任何组件在 WiFi 失败、Todo 完成、同步中等场景下调用 `idle_face_express()`。当前唯一调用方是 `ai_service`（未接入），所以实际只出现 `NORMAL` / `BLINK`（`ui_core` 的待机策略会切到待机页并调暗） |
+| ~~**WiFi HTTP API（5 条）**~~ | ⚠️ **1.0.0 旧记录已作废**：`wifi_manager_http.c` **有** 7 条路由且真机实测 200（见 §2.1 与 §2.3 的更正说明）。原文"没有任何 `http_router_register()` 调用 → 404"来自未核实的子 agent 自述 |
+| **FreeType CJK 字体通路** | **已启用**：`components/ui_core/fonts/ui_cjk.ttf` 已生成（含 **1.3.0 合并的 203 个 IPA 字形**，`tools/gen_cjk_font.py` 生成后会跑 `validate_font()`），运行期从 `<storage>/todohelper/fonts/ui_cjk.ttf` 加载。**字体没有烘进 app**，所以**换字体是拷文件、不是重新烧录**（`AGENT.md` §4.4 / §9.2） |
+| ~~`ai_service`（P2，FR7）~~ | ⚠️ **1.0.0 旧记录已作废**：`ai_service_init()` **就在** `main/app_main.c` 的模块表里（开机日志 `module 'ai_service' ready`），6 条 `/api/v1/ai/*` 路由运行时**可达**。⚠️ 但其中 `/api/v1/ai/chat` 与 `/api/v1/ai/chat/stream` 仍是**同步 handler**，一次 AI 回复期间会堵住整台设备的 HTTP（用户明确决定暂不修），详见 §2.1 表内注释与 `AGENT.md` §9.0.1 最后一条 |
+| **`voice_service`（P2，FR7）** | ⚠️ **1.0.0 旧记录"组件目录不存在"已作废**：组件在 `components/voice_service/`，2 条路由已注册（`GET /api/v1/voice/status`、`POST /api/v1/voice/config`）。录音回放真实可用；**ASR/TTS 端点选型未定**（走可配置 HTTP 端点），属半成品 |
+| **待机表情联动** | ⚠️ **1.0.0 旧记录"不订阅任何系统事件"已改善但仍有缺口**：`ai_service` 已接入会驱动表情。1.1/1.2 又加了自发表情 / 困倦度 / 瞳孔缩放 / 慢动作三层（`idle_face`）。**但 WiFi 失败、待办完成、同步中等业务场景仍未触发 `idle_face_express()`** |
 | `backup/todos_*.json` 每日备份 | 目录已建、`CONFIG_TODOHELPER_TODO_BACKUP_KEEP` 已声明，**无实现**（需求 §16/§9.2 的滚动备份策略待定） |
-| `logs/app.log` | **无实现**，日志只走串口（`SYS_LOGx`） |
-| IP 定位（P1） | 未实现；`city_lat` / `city_lon` 只由 geocode 结果回填（诊断用） |
-| AI/语音/TTS/MQTT/OTA/多用户 | P2 及以后，均未实现 |
+| `logs/app.log` | **无实现**，日志只走串口（`SYS_LOGx`）。⚠️ 开机页的滚动日志是内存环形缓冲（`sys_log.c`），**不落盘** |
+| IP 定位（P1） | ⚠️ **1.0.0 旧记录"未实现"已作废**：`POST /api/v1/weather/locate` 已实现（纯 IP 定位，`geo_url` 可经 NVS 换服务商）；但**本机网络实测到 `ipapi.co` 不通** → 502（语义正确，见 §2.1） |
+| **墨墨方案 B 的"快乐路径"** | **1.3.0 已知缺口**：代码路径完整、权限拒绝的处理已验证，但当前令牌是**学习作用域**（`/notes`、`/phrases` 恒返回 `common_permission_denied`），所以"卡片上真的显示出一条助记"**从未在设备上被观察到**。要验证需换一个能读 `/notes` 的令牌 |
+| **墨墨云端与本地是两套记账** | **1.3.0 刻意取舍**：云端词按 `voc_spelling` 匹配回本地词库后，本地 level/复习间隔照常生效；匹配不上的词（`WORD_ID_CLOUD`）在设备上评分只留痕在账号侧，**本地不记进度**。换回本地书时两边数字不会合并 |
+| **墨墨方案 C 没有反向删除** | `/study/add_words` 只负责加词，推上去的词**撤不回来**——这也是它默认关闭的原因 |
+| **1.3.0 全部未上机** | 本轮**只构建、未烧录**。墨墨 6 条路由、音标修复、网页面板的实机行为均待验证（清单见 `docs/HANDOVER.md` §4 第 7 组） |
+| AI/语音/TTS/MQTT/OTA/多用户 | P2 及以后，多数未实现（`ai_service`/`voice_service` 已接入，其余未做） |
 
 ### 5.4 文档与代码不一致处（**请维护者核对**）
 
-这几处是本次写文档时对照代码发现的，**不属于功能缺陷**，但会误导后续开发者：
+这几处是写文档时对照代码发现的，**不属于功能缺陷**，但会误导后续开发者。
+**1.3.0 复核结论**：第 1、2 条**已修复**；第 3~6 条仍待处理。
 
-1. **`components/ui_pages/CMakeLists.txt` 的 `SRCS` 与目录内容不匹配**：
-   列出了 `src/page_placeholders.c`，但该文件**已不存在**（其 `page_placeholder_create()` 现位于 `src/page_common.c`）；
-   同时**新增的 `src/page_ai_chat.c` 未列入 `SRCS`**。按现状 configure 期应会报
-   "Cannot find source file: src/page_placeholders.c"。请核对并修正（本文件只做记录，未改动任何代码）。
-2. **`components/ui_pages/README.md` 的页面表已过期**：它写 WiFi/待办/天气/日历/单词/AI/设置均为"占位"，
-   实际 `page_wifi.c` / `page_todo.c` / `page_weather.c` / `page_calendar.c` / `page_word.c` /
-   `page_settings.c` / `page_ai_chat.c` **都已实现**（各自导出 `const ui_page_t`）。
+1. ~~**`components/ui_pages/CMakeLists.txt` 的 `SRCS` 与目录内容不匹配**~~ ——
+   ✅ **已修复**：`page_placeholders.c` 已移出 `SRCS`，`page_ai_chat.c` 已列入；
+   当前 `SRCS` 与实际文件一一对应。
+2. ~~**`components/ui_pages/README.md` 的页面表已过期**~~ —— ✅ **已修复**：页面表已更新为
+   实现状态（`page_wifi` / `page_todo` / `page_weather` / `page_calendar` / `page_word` /
+   `page_settings` / `page_ai_chat` 均已实现并各自导出 `const ui_page_t`）。
 3. **`docs/TODOHELPER_FRAMEWORK.md` §6 的事件名**：写的是 `SYS_EVENT_BRIGHTNESS_CHANGED`，
    实际枚举是 `SYS_EVENT_BRIGHTNESS`，且实际还多了 `STORAGE_READY` / `CONNECTIVITY` / `STATUS_CHANGED`。
+   **仍待处理。**
 4. **`SYNC_EVENT_CLIENT_CONNECTED`** 在头文件里声明了，但代码里**没有任何投递点**；
    客户端连接数只能看 `/api/v1/device/status` 的 `sse_clients`（SSE，不是 WebSocket 连接数）。
+   **仍待处理。**
 5. **`SYS_KEY_WIFI_AUTO` 的类型**：需求 §9.1 记为 i32，实现按 **bool** 读写（`sys_config_get_bool_or`）。
-6. **`docs/TODOHELPER_REQUIREMENTS.md` 里 `docs/API.md` 的"尚不存在"**（§16 末与 §6 目录注释）在本文件创建后即失效。
+   **仍待处理**（§3 表内已标注）。
+6. **`docs/TODOHELPER_REQUIREMENTS.md` 里 `docs/API.md` 的"尚不存在"**（§16 末与 §6 目录注释）
+   在本文件创建后即失效。**仍待处理。**
+7. **本文件 §2.1 的"45 条路由"曾被 1.0.0 记录为与 `device/status.routes` 一致，但同文件
+   §2.4 又写"当前用 29"** —— 两处自相矛盾（29 是更早的中间状态）。
+   1.3.0 已把两处统一为**按注册表推算的 51 条**，并注明 **51 尚未上机复核**。
+   下次上机时请用 `GET /api/v1/device/status` 的 `routes` 字段校准这个数字。
 
 ---
 
@@ -1425,3 +1656,7 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 > 新路由 → 更新 §2 并标注状态；新 NVS 键 → 更新 §3；新文件路径 → 更新 §4。
 > 修改任何公共接口后，同步回改 `docs/TODOHELPER_REQUIREMENTS.md` §7（需求文档）与
 > `docs/TODOHELPER_FRAMEWORK.md` §5（框架文档）。
+>
+> **1.3.0 已补**：`maimemo_client` 组件一节、§2.1 的 6 条路由、§2.5 接口详解、
+> §3 的 `mm_token`/`mm_mode`/`mm_push`、§4.2 的 `words/enrich.json`，
+> 并更正 §1/§2.4/§5.3/§5.4 若干 1.0.0 时代的过期记录。
