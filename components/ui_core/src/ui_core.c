@@ -402,129 +402,57 @@ static lv_obj_t *page_container_create(lv_obj_t *parent)
 }
 
 /**
- * Page switch animation.
+ * Page containers and the switch.
  *
- * esp-brookesia's launcher feels responsive because apps slide in rather than
- * appearing instantly; the same trick costs almost nothing here. Both properties
- * are applied through *styles* rather than lv_obj_set_x(): page containers are
- * flex children, so the next layout pass would immediately overwrite a plain
- * position.
+ * A switch is a plain swap: the incoming container is shown and every other one
+ * is hidden in the same frame.
  *
- * A switch is a **cross-fade**, not a cut: the incoming page is moved to the
- * foreground and slides+fades in while the outgoing page fades out and drifts up
- * underneath it, and the outgoing container is hidden only when its animation
- * finishes. This used to hide it in the same frame, which (a) made the boot-log
- * -> home hand-off an abrupt swap between two full-screen pages and (b) cut every
- * exit animation off before its first frame - the idle face's wake-up widening
- * (idle_face_standby_exit()) was never visible at all.
+ * There used to be a slide + cross-fade here (220/240 ms of translate_x /
+ * translate_y plus a full-screen `opa` animation on *both* containers). It was
+ * removed for two reasons:
+ *
+ *   1. **Correctness.** Both containers are the same size and opaque, so any
+ *      frame in which they only partially overlap renders the previous page
+ *      through the gap; and if the exit animation was cancelled (switching away
+ *      again before it finished, or re-entering that page), its completion
+ *      callback - the only thing that hid the page - was deleted with it, leaving
+ *      the old page visible for good. That is the "ghost of the previous page"
+ *      the user reported.
+ *   2. **Cost.** A full-screen alpha animation pushes every pixel of an 800x480
+ *      tree through the software blend path for a dozen frames, which is the most
+ *      expensive thing LVGL can be asked to do on this board.
+ *
+ * The idle face still gets its exit animation: it is driven by its own lv_timer
+ * and by on_hide(), not by the container staying visible (see
+ * idle_face_standby_exit()).
  */
-#define UI_PAGE_ANIM_MS         220
-#define UI_PAGE_ANIM_OFFSET     28
-#define UI_PAGE_ANIM_OUT_MS     240
-#define UI_PAGE_ANIM_OUT_OFFSET (-16)
 
-static void page_anim_translate_cb(void *obj, int32_t value)
+/** Reset any leftover transform/opacity on @p page and hide it. */
+static void page_reset_and_hide(lv_obj_t *page)
 {
-    lv_obj_set_style_translate_x((lv_obj_t *)obj, value, 0);
-}
-
-static void page_anim_drift_cb(void *obj, int32_t value)
-{
-    lv_obj_set_style_translate_y((lv_obj_t *)obj, value, 0);
-}
-
-static void page_anim_opa_cb(void *obj, int32_t value)
-{
-    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
-}
-
-/**
- * Hide a page once its exit animation is done, and put it back to its neutral
- * look so that showing it again starts from a clean slate.
- *
- * Deliberately only touches styles: it runs from inside LVGL's animation handler,
- * where deleting animation objects would be a structural change mid-iteration.
- */
-static void page_anim_out_done(lv_anim_t *anim)
-{
-    lv_obj_t *page = (lv_obj_t *)anim->var;
     if (page == NULL) {
         return;
     }
-    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_translate_y(page, 0, 0);
-    lv_obj_set_style_opa(page, LV_OPA_COVER, 0);
-}
-
-/** Drop whatever animation is on @p page and reset it to the neutral look. */
-static void page_anim_reset(lv_obj_t *page)
-{
-    lv_anim_delete(page, page_anim_translate_cb);
-    lv_anim_delete(page, page_anim_drift_cb);
-    lv_anim_delete(page, page_anim_opa_cb);
     lv_obj_set_style_translate_x(page, 0, 0);
     lv_obj_set_style_translate_y(page, 0, 0);
     lv_obj_set_style_opa(page, LV_OPA_COVER, 0);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
 }
 
 /**
- * Bring the incoming page in.
+ * Make @p keep the only visible page container.
  *
- * Deliberately **translate only, fully opaque**. Animating `opa` on a full-screen
- * 800x480 container forces every pixel of the page through the alpha-blended
- * path for 12-15 frames, which is the single most expensive thing the software
- * renderer can be asked to do (smoothness audit: "整屏 alpha 淡入"). Position is
- * cheap - LVGL only has to redraw the union of the old and new areas.
- *
- * The cross-fade impression is kept by the *outgoing* page fading out underneath
- * (see page_animate_out): the new page slides over a page that is dissolving,
- * which reads as a transition without ever blending the incoming tree.
+ * The invariant this enforces - exactly one page container is visible, and it is
+ * the current one - is the one the animated version kept failing to hold.
  */
-static void page_animate_in(lv_obj_t *page)
+static void pages_show_only(ui_page_id_t keep)
 {
-    /* Re-entering a page quickly must not stack animations on it (and must cancel
-     * an exit animation that would otherwise hide it again behind our back). */
-    page_anim_reset(page);
-
-    lv_anim_t anim;
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, page);
-    lv_anim_set_duration(&anim, UI_PAGE_ANIM_MS);
-    lv_anim_set_path_cb(&anim, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&anim, page_anim_translate_cb);
-    lv_anim_set_values(&anim, UI_PAGE_ANIM_OFFSET, 0);
-    lv_anim_start(&anim);
-}
-
-/**
- * Move the page we are leaving aside and hide it when the window closes.
- *
- * The container keeps rendering for UI_PAGE_ANIM_OUT_MS, which is the window a
- * page gets to finish an exit animation: the idle face widens its eyes in it
- * (idle_face_standby_exit()), the boot log simply drifts away. The window itself
- * is load-bearing - do not shorten it without checking the idle face.
- *
- * This used to also animate `opa` to transparent. Since the incoming page is now
- * opaque and slides over the top, that fade was mostly invisible yet still sent a
- * full 800x480 tree through the alpha-blend path every frame. It keeps the drift
- * (cheap: only the moved strip is redrawn) and drops the fade.
- */
-static void page_animate_out(lv_obj_t *page)
-{
-    lv_anim_delete(page, page_anim_drift_cb);
-    lv_anim_delete(page, page_anim_opa_cb);
-
-    lv_anim_t anim;
-    lv_anim_init(&anim);
-    lv_anim_set_var(&anim, page);
-    lv_anim_set_duration(&anim, UI_PAGE_ANIM_OUT_MS);
-    lv_anim_set_path_cb(&anim, lv_anim_path_ease_in);
-    lv_anim_set_exec_cb(&anim, page_anim_drift_cb);
-    lv_anim_set_values(&anim, 0, UI_PAGE_ANIM_OUT_OFFSET);
-    /* The exit window ends by hiding the page; this is the only animation whose
-     * completion matters, so it carries the callback. */
-    lv_anim_set_completed_cb(&anim, page_anim_out_done);
-    lv_anim_start(&anim);
+    for (size_t i = 0; i < UI_PAGE_MAX; i++) {
+        if ((ui_page_id_t)i == keep) {
+            continue;
+        }
+        page_reset_and_hide(s_slots[i].container);
+    }
 }
 
 static esp_err_t page_switch_locked(ui_page_id_t id)
@@ -549,11 +477,6 @@ static esp_err_t page_switch_locked(ui_page_id_t id)
         ui_slot_t *cur = &s_slots[s_current];
         if (cur->desc != NULL && cur->desc->on_hide != NULL) {
             cur->desc->on_hide();
-        }
-        if (cur->container != NULL) {
-            /* Fades out under the incoming page and hides itself when done, so the
-             * switch is a cross-fade and exit animations get their 240 ms. */
-            page_animate_out(cur->container);
         }
         if (cur->tick != NULL) {
             lv_timer_pause(cur->tick);
@@ -581,13 +504,13 @@ static esp_err_t page_switch_locked(ui_page_id_t id)
         }
     }
 
-    lv_obj_remove_flag(slot->container, LV_OBJ_FLAG_HIDDEN);
-    /* Foreground first: the cross-fade draws the incoming page *over* the one that
-     * is leaving, so the new content is never dimmed by the old. */
+    /* Show exactly this page, on top, with no leftover transform or opacity. */
     lv_obj_move_foreground(slot->container);
-    /* Resets the visual state (a page may still carry the transform/opacity of an
-     * exit animation) and then slides + fades it in. */
-    page_animate_in(slot->container);
+    lv_obj_set_style_translate_x(slot->container, 0, 0);
+    lv_obj_set_style_translate_y(slot->container, 0, 0);
+    lv_obj_set_style_opa(slot->container, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(slot->container, LV_OBJ_FLAG_HIDDEN);
+    pages_show_only(id);
 
     s_current = id;
 
@@ -706,8 +629,18 @@ static esp_err_t enter_idle(void)
         lv_obj_add_flag(s_statusbar, LV_OBJ_FLAG_HIDDEN);
     }
 
-    int32_t dim = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 20);
-    if (dim < 0) {
+    /*
+     * Standby brightness.
+     *
+     * Defaults to 100 (no dimming): the idle face is pure white on pure black, and
+     * lowering the backlight turns those eyes grey, which the owner explicitly did
+     * not want. A device that has never touched the slider therefore shows pure
+     * white eyes.
+     *
+     * The settings slider still stores a value and it is honoured when present, so
+     * dimming stays available as an opt-in.
+     */
+    int32_t dim = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 100);    if (dim < 0) {
         dim = 0;
     }
     if (dim > 100) {
@@ -763,6 +696,18 @@ static void clock_tick_cb(lv_timer_t *timer)
     (void)timer;
     /* Runs in the LVGL task, so touching the status bar is safe. */
     (void)ui_statusbar_refresh();
+
+#if CONFIG_TODOHELPER_FPS_PROBE
+    /* Temporary diagnostic: report the measured refresh rate once a second so
+     * smoothness work can be judged from data instead of impression. Enable with
+     * CONFIG_TODOHELPER_FPS_PROBE; it is off in normal builds. */
+    if (th_bsp_display() != NULL) {
+        uint32_t fps = 0;
+        if (esp_lv_adapter_get_fps(th_bsp_display(), &fps) == ESP_OK) {
+            SYS_LOGI(TAG, "fps %u", (unsigned)fps);
+        }
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------------- */
@@ -813,6 +758,12 @@ esp_err_t ui_core_init(void)
     if (s_event_timer == NULL) {
         SYS_LOGW(TAG, "event drain timer unavailable, UI notifications will stall");
     }
+
+#if CONFIG_TODOHELPER_FPS_PROBE
+    /* Diagnostic build: start the adapter's FPS counter (clock_tick_cb logs it). */
+    (void)esp_lv_adapter_fps_stats_enable(th_bsp_display(), true);
+    SYS_LOGI(TAG, "FPS probe enabled");
+#endif
 
     ui_unlock();
 

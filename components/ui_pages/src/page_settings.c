@@ -404,6 +404,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
         .on_change = brightness_changed,
     };
     static setting_slider_t s_idle_bright = {
+        /* 100 = the idle face keeps its pure white eyes; lower to dim the panel
+         * while idle (also the default in ui_core.c). */
         .title = "待机亮度",
         .min = 0,
         .max = 100,
@@ -417,7 +419,7 @@ static esp_err_t settings_create(lv_obj_t *parent)
     };
 
     s_brightness.value = sys_config_get_i32_or(SYS_KEY_BRIGHTNESS, 100);
-    s_idle_bright.value = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 20);
+    s_idle_bright.value = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 100);
     s_idle_timeout.value = sys_config_get_i32_or(SYS_KEY_IDLE_TIMEOUT, 30);
 
     setting_slider_t *defs[] = { &s_brightness, &s_idle_bright, &s_idle_timeout };

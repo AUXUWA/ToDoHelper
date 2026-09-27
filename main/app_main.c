@@ -158,6 +158,24 @@ void app_main(void)
     ESP_ERROR_CHECK(sys_config_init(NULL));
     ESP_ERROR_CHECK(sys_events_init());
 
+    /*
+     * TEMPORARY migration (remove in the next release).
+     *
+     * The standby brightness default changed from 20 to 100 so the idle eyes stay
+     * pure white, but a value saved before that change wins over the new default.
+     * Clear that stale key exactly once.
+     *
+     * Guarded by a marker key on purpose: nvs_erase_key() returns ESP_OK even when
+     * the key does not exist, so an unguarded erase would log every boot *and*
+     * would delete a value the user later set with the settings slider.
+     */
+    bool migrated = false;
+    if (sys_config_get_bool(SYS_KEY_BRIGHT_MIGRATED, &migrated) != ESP_OK) {
+        (void)sys_config_erase("idle_bright");
+        (void)sys_config_set_bool(SYS_KEY_BRIGHT_MIGRATED, true);
+        SYS_LOGI(TAG, "migrated: cleared stale 'idle_bright' (standby keeps full brightness)");
+    }
+
     log_reset_reason();
     sys_heap_log("startup");
 

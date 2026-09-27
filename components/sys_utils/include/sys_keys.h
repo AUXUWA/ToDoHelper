@@ -48,6 +48,15 @@ extern "C" {
 #define SYS_KEY_BRIGHTNESS     "brightness"
 #define SYS_KEY_IDLE_TIMEOUT   "idle_timeout"
 #define SYS_KEY_IDLE_BRIGHT    "idle_bright"
+/**
+ * One-shot migration marker for the idle-brightness default change (v1.2.0).
+ *
+ * The default went 20 -> 100 so the idle eyes stay pure white. A previously saved
+ * value would win over the new default, so app_main clears the old key once and
+ * sets this flag; the settings slider writes `idle_bright` again if the user wants
+ * dimming. Remove together with the migration block in main/app_main.c.
+ */
+#define SYS_KEY_BRIGHT_MIGRATED "brt_migr"
 #define SYS_KEY_FIRST_BOOT     "first_boot"
 #define SYS_KEY_LANGUAGE       "language"
 
