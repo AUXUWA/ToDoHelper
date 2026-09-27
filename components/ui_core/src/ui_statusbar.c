@@ -17,6 +17,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include "ui_core.h"
@@ -27,6 +28,23 @@ static lv_obj_t *s_wifi_label;
 static lv_obj_t *s_time_label;
 static lv_obj_t *s_sync_label;
 static lv_obj_t *s_storage_label;
+
+/**
+ * Last text painted into each label, so ui_statusbar_refresh() can skip writes
+ * that would not change anything.
+ *
+ * lv_label_set_text() invalidates the object even when the string is identical,
+ * and this runs at 1 Hz forever, so without these the whole status bar was
+ * repainted every second for nothing (smoothness audit P1).
+ */
+static char s_wifi_text[32];
+static char s_storage_text[16];
+static char s_sync_text[32];
+/** Clock: whether the label shows a real time, plus the fields it last showed. */
+static bool s_clock_synced;
+static int s_last_sec = -1;
+static int s_last_min = -1;
+static int s_last_hour = -1;
 
 static lv_obj_t *make_group(lv_obj_t *parent, lv_obj_t **out_label)
 {
@@ -119,31 +137,54 @@ esp_err_t ui_statusbar_refresh(void)
         return ESP_ERR_TIMEOUT;
     }
 
+    /*
+     * Every branch below only writes when the *rendered* value changed.
+     *
+     * This runs at 1 Hz forever (ui_core's clock_tick_cb) and used to rewrite
+     * all four labels plus four colours unconditionally. lv_label_set_text()
+     * invalidates the label's area even when the text is byte-identical, so the
+     * full-width status bar was being repainted once a second with nothing on it
+     * changing - a permanent tax on every other animation (smoothness audit P1).
+     */
+
     /* ---- WiFi ---- */
     if (s_wifi_label != NULL) {
+        const int rssi = (int)st.wifi_rssi;
+        char text[32];
+        lv_color_t color;
         if (st.wifi_connected) {
-            lv_label_set_text_fmt(s_wifi_label, "WiFi %d dBm", (int)st.wifi_rssi);
-            lv_obj_set_style_text_color(s_wifi_label, UI_COLOR_SUCCESS, 0);
+            snprintf(text, sizeof(text), "WiFi %d dBm", rssi);
+            color = UI_COLOR_SUCCESS;
         } else if (st.wifi_connecting) {
-            lv_label_set_text(s_wifi_label, "WiFi 连接中");
-            lv_obj_set_style_text_color(s_wifi_label, UI_COLOR_WARNING, 0);
+            strlcpy(text, "WiFi 连接中", sizeof(text));
+            color = UI_COLOR_WARNING;
         } else {
-            lv_label_set_text(s_wifi_label, "WiFi 未连接");
-            lv_obj_set_style_text_color(s_wifi_label, UI_COLOR_TEXT_MUTED, 0);
+            strlcpy(text, "WiFi 未连接", sizeof(text));
+            color = UI_COLOR_TEXT_MUTED;
+        }
+        if (strcmp(text, s_wifi_text) != 0) {
+            strlcpy(s_wifi_text, text, sizeof(s_wifi_text));
+            lv_label_set_text(s_wifi_label, s_wifi_text);
+            lv_obj_set_style_text_color(s_wifi_label, color, 0);
         }
     }
 
     /* ---- Storage ---- */
     if (s_storage_label != NULL) {
+        const char *text;
+        lv_color_t color = UI_COLOR_TEXT_MUTED;
         if (st.sd_available) {
-            lv_label_set_text(s_storage_label, "SD");
-            lv_obj_set_style_text_color(s_storage_label, UI_COLOR_TEXT_MUTED, 0);
+            text = "SD";
         } else if (st.storage_available) {
-            lv_label_set_text(s_storage_label, "内置存储");
-            lv_obj_set_style_text_color(s_storage_label, UI_COLOR_TEXT_MUTED, 0);
+            text = "内置存储";
         } else {
-            lv_label_set_text(s_storage_label, "无存储");
-            lv_obj_set_style_text_color(s_storage_label, UI_COLOR_DANGER, 0);
+            text = "无存储";
+            color = UI_COLOR_DANGER;
+        }
+        if (strcmp(text, s_storage_text) != 0) {
+            strlcpy(s_storage_text, text, sizeof(s_storage_text));
+            lv_label_set_text(s_storage_label, s_storage_text);
+            lv_obj_set_style_text_color(s_storage_label, color, 0);
         }
     }
 
@@ -151,34 +192,57 @@ esp_err_t ui_statusbar_refresh(void)
     if (s_time_label != NULL) {
         if (!sys_time_synced() || st.now_ts <= 0) {
             /* Never show 1970 (requirement FR4). */
-            lv_label_set_text(s_time_label, UI_STATUS_TIME_UNSYNCED);
-            lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT_MUTED, 0);
+            if (s_clock_synced) {
+                s_clock_synced = false;
+                lv_label_set_text(s_time_label, UI_STATUS_TIME_UNSYNCED);
+                lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT_MUTED, 0);
+            }
         } else {
-            time_t now = (time_t)st.now_ts;
+            const time_t now = (time_t)st.now_ts;
             struct tm tm_local;
             if (localtime_r(&now, &tm_local) != NULL) {
-                lv_label_set_text_fmt(s_time_label, "%02d:%02d:%02d",
-                                      tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
-            } else {
+                /* Only the seconds field changes at this cadence. */
+                if (!s_clock_synced || tm_local.tm_sec != s_last_sec ||
+                    tm_local.tm_min != s_last_min || tm_local.tm_hour != s_last_hour) {
+                    lv_label_set_text_fmt(s_time_label, "%02d:%02d:%02d",
+                                          tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+                    s_last_sec = tm_local.tm_sec;
+                    s_last_min = tm_local.tm_min;
+                    s_last_hour = tm_local.tm_hour;
+                    if (!s_clock_synced) {
+                        s_clock_synced = true;
+                        lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT, 0);
+                    }
+                }
+            } else if (s_clock_synced) {
+                s_clock_synced = false;
                 lv_label_set_text(s_time_label, UI_STATUS_TIME_UNSYNCED);
+                lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT_MUTED, 0);
             }
-            lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT, 0);
         }
     }
 
     /* ---- Sync ---- */
     if (s_sync_label != NULL) {
+        char text[32];
+        lv_color_t color;
         if (st.syncing) {
-            lv_label_set_text(s_sync_label, "同步中");
-            lv_obj_set_style_text_color(s_sync_label, UI_COLOR_PRIMARY, 0);
+            strlcpy(text, "同步中", sizeof(text));
+            color = UI_COLOR_PRIMARY;
         } else if (st.todo_pending > 0) {
-            lv_label_set_text_fmt(s_sync_label, "待同步 %ld", (long)st.todo_pending);
-            lv_obj_set_style_text_color(s_sync_label, UI_COLOR_WARNING, 0);
+            snprintf(text, sizeof(text), "待同步 %ld", (long)st.todo_pending);
+            color = UI_COLOR_WARNING;
         } else if (st.todo_total > 0) {
-            lv_label_set_text(s_sync_label, "已同步");
-            lv_obj_set_style_text_color(s_sync_label, UI_COLOR_SUCCESS, 0);
+            strlcpy(text, "已同步", sizeof(text));
+            color = UI_COLOR_SUCCESS;
         } else {
-            lv_label_set_text(s_sync_label, "");
+            text[0] = '\0';
+            color = UI_COLOR_TEXT_MUTED;
+        }
+        if (strcmp(text, s_sync_text) != 0) {
+            strlcpy(s_sync_text, text, sizeof(s_sync_text));
+            lv_label_set_text(s_sync_label, s_sync_text);
+            lv_obj_set_style_text_color(s_sync_label, color, 0);
         }
     }
 

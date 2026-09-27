@@ -334,6 +334,17 @@ static lv_obj_t *add_row(lv_obj_t *parent)
 /* Refresh                                                                   */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Last rendered info block.
+ *
+ * The label is a six-line LV_LABEL_LONG_MODE_WRAP at 100% width, so re-setting
+ * it forces a full re-wrap and height re-measure of the card. Almost nothing in
+ * it changes at the 5 s tick cadence (the firmware version never does), and
+ * building it calls storage_free_bytes() - a statvfs on the SD card - so the
+ * text is compared before the label is touched (smoothness audit P1-10).
+ */
+static char s_info_text[320];
+
 static void refresh_info(void)
 {
     if (s_info_label == NULL) {
@@ -349,20 +360,27 @@ static void refresh_info(void)
      * quickest way to tell which firmware is actually flashed on the board. */
     const esp_app_desc_t *app = esp_app_get_description();
 
-    lv_label_set_text_fmt(s_info_label,
-                          "固件 %s · IDF %s\nIP %s · %s\n存储 %s（%s）\n剩余 %llu KB · 时区 %s\n"
-                          "天气源 %s · 城市 %s\n单词 %u/日 · 词库 %s",
-                          (app != NULL) ? app->version : "?",
-                          (app != NULL) ? app->idf_ver : "?",
-                          ip, mac,
-                          storage_root() ? storage_root() : "不可用",
-                          storage_sd_available() ? "SD 卡" : "内置",
-                          (unsigned long long)(storage_free_bytes() / 1024),
-                          calendar_get_timezone(),
-                          weather_get_provider(),
-                          weather_get_city()[0] ? weather_get_city() : "未设置",
-                          (unsigned)word_get_daily_count(),
-                          word_get_book());
+    char text[sizeof(s_info_text)];
+    snprintf(text, sizeof(text),
+             "固件 %s · IDF %s\nIP %s · %s\n存储 %s（%s）\n剩余 %llu KB · 时区 %s\n"
+             "天气源 %s · 城市 %s\n单词 %u/日 · 词库 %s",
+             (app != NULL) ? app->version : "?",
+             (app != NULL) ? app->idf_ver : "?",
+             ip, mac,
+             storage_root() ? storage_root() : "不可用",
+             storage_sd_available() ? "SD 卡" : "内置",
+             (unsigned long long)(storage_free_bytes() / 1024),
+             calendar_get_timezone(),
+             weather_get_provider(),
+             weather_get_city()[0] ? weather_get_city() : "未设置",
+             (unsigned)word_get_daily_count(),
+             word_get_book());
+
+    if (strcmp(text, s_info_text) == 0) {
+        return;
+    }
+    strlcpy(s_info_text, text, sizeof(s_info_text));
+    lv_label_set_text(s_info_label, s_info_text);
 }
 
 /* ------------------------------------------------------------------------ */

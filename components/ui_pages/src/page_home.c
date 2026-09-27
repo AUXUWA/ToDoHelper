@@ -33,6 +33,27 @@ static const home_tile_def_t s_tiles[] = {
     { "设置",   "亮度 · 时区 · 密钥",     UI_PAGE_SETTINGS },
 };
 
+/**
+ * Last values painted into the two labels.
+ *
+ * home_refresh() runs at 1 Hz (tick_period_ms = 1000) but the summary changes
+ * only when a todo is synced or the storage medium appears/disappears, and the
+ * clock only needs a repaint when its *displayed* fields change (it shows
+ * HH:MM, so the seconds field is irrelevant). Writing identical text still
+ * invalidates the label and re-lays-out the flex head above the tile grid, which
+ * is what made the home page re-render every second for nothing
+ * (smoothness audit P1-7).
+ */
+static long s_summary_total = -1;
+static long s_summary_pending = -1;
+static int s_summary_storage = -1;   /**< 0 = unavailable, 1 = internal, 2 = SD */
+static bool s_clock_shown;           /**< label currently shows a real time */
+static int s_last_min = -1;
+static int s_last_hour = -1;
+static int s_last_mday = -1;
+static int s_last_mon = -1;
+static int s_last_year = -1;
+
 static void home_refresh(void)
 {
     sys_status_t st;
@@ -41,10 +62,17 @@ static void home_refresh(void)
     }
 
     if (s_summary_label != NULL) {
-        lv_label_set_text_fmt(s_summary_label, "待办 %ld 项 · 待同步 %ld 项 · 存储 %s",
-                              (long)st.todo_total, (long)st.todo_pending,
-                              st.sd_available ? "SD 卡"
-                                              : (st.storage_available ? "内置" : "不可用"));
+        const int storage = st.sd_available ? 2 : (st.storage_available ? 1 : 0);
+        if (st.todo_total != s_summary_total || st.todo_pending != s_summary_pending ||
+            storage != s_summary_storage) {
+            s_summary_total = st.todo_total;
+            s_summary_pending = st.todo_pending;
+            s_summary_storage = storage;
+            lv_label_set_text_fmt(s_summary_label, "待办 %ld 项 · 待同步 %ld 项 · 存储 %s",
+                                  (long)st.todo_total, (long)st.todo_pending,
+                                  (storage == 2) ? "SD 卡"
+                                                 : ((storage == 1) ? "内置" : "不可用"));
+        }
     }
 
     if (s_clock_label == NULL) {
@@ -53,14 +81,27 @@ static void home_refresh(void)
 
     if (!sys_time_synced() || st.now_ts <= 0) {
         /* Requirement FR4: never render an epoch date before NTP succeeds. */
-        lv_label_set_text(s_clock_label, UI_STATUS_TIME_UNSYNCED);
+        if (s_clock_shown) {
+            s_clock_shown = false;
+            lv_label_set_text(s_clock_label, UI_STATUS_TIME_UNSYNCED);
+        }
         return;
     }
 
     const time_t now = (time_t)st.now_ts;
     struct tm tm_local;
     if (localtime_r(&now, &tm_local) == NULL) {
-        lv_label_set_text(s_clock_label, UI_STATUS_TIME_UNSYNCED);
+        if (s_clock_shown) {
+            s_clock_shown = false;
+            lv_label_set_text(s_clock_label, UI_STATUS_TIME_UNSYNCED);
+        }
+        return;
+    }
+
+    /* The label shows date + 星期 + HH:MM: repaint only when one of those moved. */
+    if (s_clock_shown && tm_local.tm_min == s_last_min && tm_local.tm_hour == s_last_hour &&
+        tm_local.tm_mday == s_last_mday && tm_local.tm_mon == s_last_mon &&
+        tm_local.tm_year == s_last_year) {
         return;
     }
 
@@ -69,6 +110,12 @@ static void home_refresh(void)
     lv_label_set_text_fmt(s_clock_label, "%04d-%02d-%02d 星期%s  %02d:%02d",
                           tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday, wd,
                           tm_local.tm_hour, tm_local.tm_min);
+    s_clock_shown = true;
+    s_last_min = tm_local.tm_min;
+    s_last_hour = tm_local.tm_hour;
+    s_last_mday = tm_local.tm_mday;
+    s_last_mon = tm_local.tm_mon;
+    s_last_year = tm_local.tm_year;
 }
 
 static esp_err_t home_create(lv_obj_t *parent)

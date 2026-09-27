@@ -358,6 +358,17 @@ static esp_err_t wifi_create_status_view(lv_obj_t *parent)
 /* Refresh                                                                   */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Last rendered status text.
+ *
+ * refresh_status() runs on the 3 s tick *and* on every WiFi event, but the
+ * six-line block it writes only changes when the link state, SSID, IP or host
+ * name changes - RSSI is the one field that moves on its own. Writing identical
+ * text still invalidates the wrapping label and re-measures six lines, so this
+ * comparison keeps the 3 s tick nearly free (smoothness audit P1-10).
+ */
+static char s_status_text[256];
+
 static void refresh_status(void)
 {
     if (s_status_detail == NULL) {
@@ -374,14 +385,21 @@ static void refresh_status(void)
     (void)wifi_manager_get_mac(mac, sizeof(mac));
     (void)wifi_manager_get_ssid(ssid, sizeof(ssid));
 
-    lv_label_set_text_fmt(s_status_detail,
-                          "状态：%s\n网络：%s\nIP：%s\n信号：%d dBm\nMAC：%s\n主机名：%s",
-                          wifi_manager_state_name(state),
-                          ssid[0] ? ssid : "（未连接）",
-                          ip,
-                          (int)wifi_manager_get_rssi(),
-                          mac,
-                          WIFI_MANAGER_HOSTNAME);
+    char text[sizeof(s_status_text)];
+    snprintf(text, sizeof(text),
+             "状态：%s\n网络：%s\nIP：%s\n信号：%d dBm\nMAC：%s\n主机名：%s",
+             wifi_manager_state_name(state),
+             ssid[0] ? ssid : "（未连接）",
+             ip,
+             (int)wifi_manager_get_rssi(),
+             mac,
+             WIFI_MANAGER_HOSTNAME);
+
+    if (strcmp(text, s_status_text) == 0) {
+        return;
+    }
+    strlcpy(s_status_text, text, sizeof(s_status_text));
+    lv_label_set_text(s_status_detail, s_status_text);
 }
 
 static void refresh_scan_hint(void)
