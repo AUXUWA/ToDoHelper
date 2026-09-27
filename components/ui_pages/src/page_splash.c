@@ -62,6 +62,10 @@ static char *s_text;
 static lv_timer_t *s_timer;
 /** sys_log_recent_seq() the label currently shows. */
 static uint32_t s_rendered_seq;
+/** Bytes of s_text currently in use (so a new line can be appended, not rebuilt). */
+static size_t s_text_used;
+/** A tail scroll is owed once the label finishes re-measuring. */
+static bool s_tail_pending;
 
 /* Status line state: the ellipsis animates even when no new line arrives, so the
  * page never looks frozen while the (slow) modules come up. */
@@ -137,11 +141,24 @@ static void splash_update_status(const sys_log_recent_info_t *newest)
 }
 
 /**
- * Rebuild the log label from the ring buffer and tail the newest line.
+ * Append whatever arrived since the last pass, or rebuild when we cannot.
  *
  * Runs with the LVGL lock held (on_show() or the lv_timer), which is what makes
  * rewriting @c s_text in place safe: LVGL only reads it while drawing, and this
  * same task does the drawing.
+ *
+ * Almost every pass is a pure *append*: sys_log_recent_seq() is monotonic, lines
+ * are retained in order, and the ring only ever drops the oldest once it is full.
+ * Rebuilding all 64 lines (a >5 KB buffer, re-wrapped by a
+ * LV_LABEL_LONG_MODE_WRAP label) on every 100 ms tick was the single most
+ * expensive thing on the boot screen - it also forced lv_obj_update_layout() to
+ * run synchronously inside the timer, stealing time from frame composition
+ * (smoothness audit P2).
+ *
+ * A full rebuild is still needed in two cases, and both are handled below:
+ *   - the first ever pass (nothing rendered yet);
+ *   - the ring overflowed and recycled slots, so the oldest retained line is no
+ *     longer the oldest line we have rendered.
  */
 static void splash_refresh_log(void)
 {
@@ -159,49 +176,95 @@ static void splash_refresh_log(void)
     const bool was_at_end = lv_obj_get_scroll_bottom(s_log_box) <= SPLASH_TAIL_SLACK;
     const size_t count = sys_log_recent_count();
 
-    size_t used = 0;
-    size_t lines = 0;
+    /*
+     * How many lines are new? seq counts lines ever emitted; we have rendered up
+     * to s_rendered_seq. If everything since then is still retained (the gap is
+     * no larger than the ring), an append keeps the buffer valid. Otherwise
+     * start over.
+     */
+    const uint32_t new_lines = seq - s_rendered_seq;
+    const bool can_append =
+        (s_rendered_seq != 0u) && (new_lines <= count) && (s_text_used != 0u);
+
+    size_t used = can_append ? s_text_used : 0u;
+    size_t lines = 0u;
     bool complete = true;
     sys_log_recent_info_t newest = { 0 };
     bool have_newest = false;
 
-    /* Oldest retained line first, newest last - the order a serial monitor prints
-     * them in, and it puts the newest line at the bottom of the view. */
-    for (size_t age = count; age > 0u; age--) {
-        char line[SYS_LOG_RECENT_LINE_LEN];
-        sys_log_recent_info_t info;
+    if (can_append) {
+        /* Only the newest `new_lines` entries, oldest first. */
+        for (size_t age = (size_t)new_lines; age > 0u; age--) {
+            char line[SYS_LOG_RECENT_LINE_LEN];
+            sys_log_recent_info_t info;
 
-        if (!sys_log_recent_get(age - 1u, line, sizeof(line), &info)) {
-            /* Claimed by a writer that has not published yet (microseconds), or the
-             * slot was reused: show what we have and rebuild on the next tick. */
-            complete = false;
-            continue;
+            if (!sys_log_recent_get(age - 1u, line, sizeof(line), &info)) {
+                /* Not published yet (microseconds): stop here and catch it next
+                 * tick rather than leaving a hole in the middle of the buffer. */
+                complete = false;
+                break;
+            }
+
+            used = text_put_char(s_text, SPLASH_TEXT_LEN, used, level_letter(info.level));
+            used = text_put_char(s_text, SPLASH_TEXT_LEN, used, ' ');
+            used = text_put(s_text, SPLASH_TEXT_LEN, used, line);
+            used = text_put_char(s_text, SPLASH_TEXT_LEN, used, '\n');
+            lines++;
+
+            if (age == 1u) {
+                newest = info;
+                have_newest = true;
+            }
         }
+    } else {
+        /* Full rebuild: oldest retained line first, newest last - the order a
+         * serial monitor prints them in, and it puts the newest line at the
+         * bottom of the view. */
+        for (size_t age = count; age > 0u; age--) {
+            char line[SYS_LOG_RECENT_LINE_LEN];
+            sys_log_recent_info_t info;
 
-        used = text_put_char(s_text, SPLASH_TEXT_LEN, used, level_letter(info.level));
-        used = text_put_char(s_text, SPLASH_TEXT_LEN, used, ' ');
-        used = text_put(s_text, SPLASH_TEXT_LEN, used, line);
-        used = text_put_char(s_text, SPLASH_TEXT_LEN, used, '\n');
-        lines++;
+            if (!sys_log_recent_get(age - 1u, line, sizeof(line), &info)) {
+                /* Claimed by a writer that has not published yet (microseconds), or
+                 * the slot was reused: show what we have and rebuild on the next
+                 * tick. */
+                complete = false;
+                continue;
+            }
 
-        if (age == 1u) {
-            newest = info;
-            have_newest = true;
+            used = text_put_char(s_text, SPLASH_TEXT_LEN, used, level_letter(info.level));
+            used = text_put_char(s_text, SPLASH_TEXT_LEN, used, ' ');
+            used = text_put(s_text, SPLASH_TEXT_LEN, used, line);
+            used = text_put_char(s_text, SPLASH_TEXT_LEN, used, '\n');
+            lines++;
+
+            if (age == 1u) {
+                newest = info;
+                have_newest = true;
+            }
         }
     }
 
-    if (lines == 0u) {
+    if (!can_append && lines == 0u) {
         return; /* nothing published yet: keep the placeholder and retry */
     }
+    if (can_append && lines == 0u) {
+        /* Nothing could be appended this pass; try again next tick. */
+        return;
+    }
 
+    s_text_used = used;
     lv_label_set_text_static(s_log_label, s_text);
-    /* The label measures its new text during the next layout pass (LVGL defers it
-     * to LV_EVENT_UPDATE_LAYOUT_COMPLETED), so the scroll range below is only
-     * correct after one is forced. */
-    lv_obj_update_layout(s_log_box);
 
-    /* Tail -f: follow the newest line unless the user scrolled up to read
-     * something older. Their position wins until they scroll back down. */
+    /*
+     * Scroll to the newest line. The label defers its re-measure to the next
+     * layout pass, so the scroll range is only correct afterwards - but that pass
+     * is triggered by the text change itself and runs as part of the normal
+     * update. Calling lv_obj_update_layout() here forced it *synchronously inside
+     * the timer*, which is what made this page cost so much; instead the tail
+     * scroll is re-applied from the layout-completed event below.
+     */
+    s_tail_pending = was_at_end;
     if (was_at_end) {
         lv_obj_scroll_to_y(s_log_box, LV_COORD_MAX, LV_ANIM_OFF);
     }
@@ -220,6 +283,23 @@ static void splash_refresh_log(void)
     /* Keep the newest line around for the ellipsis ticks, which run when no new
      * line arrives and therefore have nothing else to render. */
     splash_update_status(s_have_newest ? &s_newest : NULL);
+}
+
+/**
+ * Re-apply the tail scroll once the label has actually re-measured.
+ *
+ * This replaces the old synchronous lv_obj_update_layout() call: LVGL raises this
+ * event after the deferred layout completes, which is exactly when the scroll
+ * range becomes valid.
+ */
+static void splash_layout_done_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_tail_pending || s_log_box == NULL) {
+        return;
+    }
+    s_tail_pending = false;
+    lv_obj_scroll_to_y(s_log_box, LV_COORD_MAX, LV_ANIM_OFF);
 }
 
 static void splash_tick(lv_timer_t *timer)
@@ -325,6 +405,9 @@ static esp_err_t splash_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(s_log_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_log_label, UI_COLOR_TEXT_MUTED, 0);
     lv_label_set_text(s_log_label, "正在读取启动日志…");
+    /* The label re-measures its text during a deferred layout pass; this is where
+     * the tail scroll is applied instead of forcing the layout synchronously. */
+    lv_obj_add_event_cb(s_log_label, splash_layout_done_cb, LV_EVENT_SIZE_CHANGED, NULL);
 
     s_status_label = lv_label_create(box);
     if (s_status_label == NULL) {

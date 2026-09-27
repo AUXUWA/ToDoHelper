@@ -37,21 +37,31 @@ static bool s_waiting_reply;
 /* Bubbles                                                                   */
 /* ------------------------------------------------------------------------ */
 
-static void add_bubble(const char *text, bool from_user)
+/**
+ * Bubbles are reused for streamed replies.
+ *
+ * A streaming answer arrives as many AI_EVENT_REPLY_CHUNK events. Creating one
+ * bubble per chunk (the old behaviour) built dozens of widget trees for a single
+ * answer, and each one started its own `LV_ANIM_ON` scroll - overlapping
+ * animations on the same container, plus a new object every few words
+ * (smoothness audit P2).
+ *
+ * Now chunks are appended into one bubble, and the follow-the-text scroll is
+ * throttled so a fast stream cannot queue up animations.
+ */
+#define AI_CHAT_SCROLL_MS 120
+/** Accumulation buffer for the bubble currently being streamed into. */
+#define AI_CHAT_STREAM_MAX 2048
+
+static lv_obj_t *s_stream_bubble;      /**< bubble currently receiving chunks */
+static lv_obj_t *s_stream_label;
+static char s_stream_text[AI_CHAT_STREAM_MAX];
+static size_t s_stream_len;
+static uint32_t s_last_scroll_ms;
+
+/** Create one empty bubble; *out_label receives its label. */
+static lv_obj_t *bubble_create(bool from_user, lv_obj_t **out_label)
 {
-    if (s_scroll == NULL || text == NULL) {
-        return;
-    }
-
-    /* Keep the transcript bounded: an idle device running for days must not
-     * grow this list without limit. */
-    if (lv_obj_get_child_count(s_scroll) >= AI_CHAT_MAX_BUBBLES) {
-        lv_obj_t *oldest = lv_obj_get_child(s_scroll, 0);
-        if (oldest != NULL) {
-            lv_obj_delete(oldest);
-        }
-    }
-
     lv_obj_t *bubble = lv_obj_create(s_scroll);
     lv_obj_remove_style_all(bubble);
     lv_obj_set_width(bubble, LV_PCT(78));
@@ -65,13 +75,107 @@ static void add_bubble(const char *text, bool from_user)
     lv_obj_set_style_align(bubble, from_user ? LV_ALIGN_TOP_RIGHT : LV_ALIGN_TOP_LEFT, 0);
 
     lv_obj_t *label = lv_label_create(bubble);
-    lv_label_set_text(label, text);
+    lv_label_set_text(label, "");
     lv_obj_set_width(label, LV_PCT(100));
     lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
     lv_obj_set_style_text_color(label, from_user ? UI_COLOR_ON_PRIMARY : UI_COLOR_TEXT, 0);
 
-    lv_obj_scroll_to_view(bubble, LV_ANIM_ON);
+    if (out_label != NULL) {
+        *out_label = label;
+    }
+    return bubble;
+}
+
+/** Throttled follow-the-text scroll: at most one animation per AI_CHAT_SCROLL_MS. */
+static void bubble_scroll_to(lv_obj_t *bubble, bool animate)
+{
+    if (bubble == NULL) {
+        return;
+    }
+    const uint32_t now = (uint32_t)sys_time_ms();
+    if (animate && (now - s_last_scroll_ms) < AI_CHAT_SCROLL_MS) {
+        return;
+    }
+    s_last_scroll_ms = now;
+    lv_obj_scroll_to_view(bubble, animate ? LV_ANIM_ON : LV_ANIM_OFF);
+}
+
+/** Keep the transcript bounded: an idle device running for days must not grow. */
+static void bubble_trim(void)
+{
+    while (lv_obj_get_child_count(s_scroll) > AI_CHAT_MAX_BUBBLES) {
+        lv_obj_t *oldest = lv_obj_get_child(s_scroll, 0);
+        if (oldest == NULL || oldest == s_stream_bubble) {
+            break;   /* never delete the bubble still being streamed into */
+        }
+        lv_obj_delete(oldest);
+    }
+}
+
+static void add_bubble(const char *text, bool from_user)
+{
+    if (s_scroll == NULL || text == NULL) {
+        return;
+    }
+
+    lv_obj_t *label = NULL;
+    lv_obj_t *bubble = bubble_create(from_user, &label);
+    lv_label_set_text(label, text);
+    bubble_trim();
+    bubble_scroll_to(bubble, true);
+}
+
+/**
+ * Append a streamed chunk to the reply bubble, creating it on the first chunk.
+ *
+ * The label is re-pointed at s_stream_text, which grows one chunk at a time, so a
+ * long answer costs one widget tree instead of one per chunk.
+ */
+static void stream_chunk(const char *chunk)
+{
+    if (s_scroll == NULL || chunk == NULL) {
+        return;
+    }
+
+    if (s_stream_bubble == NULL) {
+        s_stream_len = 0;
+        s_stream_text[0] = '\0';
+        s_stream_bubble = bubble_create(false, &s_stream_label);
+    }
+
+    size_t n = strlen(chunk);
+    if (n > sizeof(s_stream_text) - 1u - s_stream_len) {
+        n = sizeof(s_stream_text) - 1u - s_stream_len;
+        if (n == 0u) {
+            /* Buffer full: start a fresh bubble so the tail is not lost. */
+            s_stream_bubble = bubble_create(false, &s_stream_label);
+            s_stream_len = 0;
+            s_stream_text[0] = '\0';
+            n = strlen(chunk);
+            if (n > sizeof(s_stream_text) - 1u) {
+                n = sizeof(s_stream_text) - 1u;
+            }
+        }
+    }
+    memcpy(&s_stream_text[s_stream_len], chunk, n);
+    s_stream_len += n;
+    s_stream_text[s_stream_len] = '\0';
+
+    /* set_text_static: the label borrows our buffer, so a growing answer does not
+     * re-allocate on every chunk. */
+    lv_label_set_text_static(s_stream_label, s_stream_text);
+    bubble_trim();
+    bubble_scroll_to(s_stream_bubble, true);
+}
+
+/** End the current streamed bubble (reply finished, failed, or a new question). */
+static void stream_finish(void)
+{
+    s_stream_bubble = NULL;
+    s_stream_label = NULL;
+    s_stream_len = 0;
+    s_stream_text[0] = '\0';
 }
 
 static void render_state(void)
@@ -132,6 +236,9 @@ static void input_submit_cb(lv_event_t *e)
     }
 
     add_bubble(text, true);
+    /* A new turn starts a new reply bubble, so the previous stream cannot be
+     * appended into. */
+    stream_finish();
 
     esp_err_t err = ai_service_chat_async(text);
     input_close();
@@ -331,7 +438,8 @@ static esp_err_t ai_chat_on_event(int32_t event_id, void *data)
     switch (event_id) {
     case AI_EVENT_REPLY_CHUNK:
         if (data != NULL) {
-            add_bubble((const char *)data, false);
+            /* Chunks accumulate into one bubble instead of one bubble each. */
+            stream_chunk((const char *)data);
         }
         break;
     case AI_EVENT_REPLY_DONE: {
@@ -339,6 +447,11 @@ static esp_err_t ai_chat_on_event(int32_t event_id, void *data)
         /* The chunk event already printed the text for the non-streaming path;
          * for the streaming path chunks were emitted incrementally, so only
          * announce completion. */
+        if (s_stream_bubble == NULL && reply != NULL) {
+            /* Non-streaming answer: it arrives whole on REPLY_DONE. */
+            add_bubble(reply, false);
+        }
+        stream_finish();
         if (s_waiting_reply) {
             s_waiting_reply = false;
             if (reply != NULL) {
