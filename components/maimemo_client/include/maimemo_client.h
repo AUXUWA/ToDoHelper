@@ -164,8 +164,28 @@ esp_err_t maimemo_push_words(const char **spellings, size_t count, bool advance,
  * Honours `SYS_KEY_MAIMEMO_PUSH`: when the user has not opted in this returns
  * ESP_ERR_NOT_SUPPORTED without touching the network, because pushing mutates
  * the user's cloud study plan.
+ *
+ * @warning **Blocking TLS.** Call maimemo_push_unknown_async() from a UI event;
+ *          this synchronous form is for worker/HTTP contexts that must know the
+ *          outcome.
  */
 esp_err_t maimemo_push_unknown(const char *spelling);
+
+/**
+ * @brief Plan C from a UI callback: queue the push on a worker task.
+ *
+ * Returns immediately without touching the network, so it is safe to call from
+ * an LVGL event handler (AGENT.md 9.0.1.1 - those run with the adapter lock
+ * held). The synchronous maimemo_push_unknown() was called there before, which
+ * blocked rendering for the whole TLS handshake and, worse, allocated a task
+ * while the LVGL lock was held.
+ *
+ * Silently does nothing when plan C is disabled or no token is configured, so a
+ * missing optional feature never surfaces as a UI error.
+ *
+ * @param spelling Word to push; copied, so the caller may free it.
+ */
+esp_err_t maimemo_push_unknown_async(const char *spelling);
 
 /** @brief Whether plan C is enabled in configuration. */
 bool maimemo_push_enabled(void);

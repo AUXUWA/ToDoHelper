@@ -53,6 +53,29 @@
 - `ui_card_create(parent, title, &body)` — 圆角卡片 + 可选标题，返回 `body` 供放内容。
 - `ui_toast(fmt, ...)` — 底部提示，2 秒自动消失，可从任意任务调用。
 - `ui_dialog(title, text, ok_text, on_close, user_data)` — 模态框。
+- `ui_dialog_secret(title, lead_in, secret, note, ok_text)` — 弹一个**长机密串**
+  （HTTP 鉴权 token）。**两列横排**：左边 `lead_in`、右边高亮 `secret` 框。
+
+### 对话框的三条硬规则（v1.3.1 修 bug 时定下）
+
+1. **关闭回调不要把"按钮"当成"消息框"。**
+   `lv_msgbox_add_footer_button()` 返回的是 **footer 里的按钮**，回调也注册在它上面，
+   所以 `lv_event_get_current_target()` 拿到的是按钮 —— `lv_msgbox_close(按钮)`
+   是**静默 no-op**（这正是"点「知道了」关不掉"的原因）。
+   `ui_dialog_secret()` / `ui_dialog()` 现在把消息框作为 **event user data** 显式传入。
+2. **面板是 800×480 横屏，内容该横着排。**
+   `lv_msgbox` 默认 `LV_FLEX_FLOW_COLUMN`（标题/正文/footer 一路往下），480 px 高很快用完
+   就被"挤压"。需要并排的内容自己放进一个 `LV_FLEX_FLOW_ROW` 容器。
+   实测几何：对话框 `94%×800 = 752 px`，内宽 720 px，两列各 ~353 px，
+   32 字符 token 一行约需 320 px → **正好一行**。
+3. **样式必须走 `dialog_style()` / `dialog_style_button()`。**
+   LVGL 默认 msgbox 是浅色皮肤，与本工程深色卡片完全不是一个东西。这两个函数套上
+   `UI_COLOR_SURFACE`/`_ALT`/`_PRIMARY`、`UI_CARD_RADIUS` 与正文/标题字体。
+   **新弹窗直接复用它们**，不要手写色值。
+
+另外：**`lv_msgbox_create(lv_layer_top())` 不会创建独立遮罩**（传 `NULL` 才会）。
+所以 `lv_obj_get_parent(mbox)` 是 `lv_layer_top()` 本身，而 `ui_toast()` 也挂在那里——
+给它上色会**连 toast 一起压暗**。现在靠消息框自己的 shadow + 不透明底色区分。
 
 ## 主题与字体
 

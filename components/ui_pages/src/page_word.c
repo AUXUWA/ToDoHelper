@@ -141,10 +141,16 @@ static void enrich_start(const char *spelling)
         return;
     }
     s_enrich_pending = true;
-    /* 5 KB: TLS handshake plus JSON parsing, and paging after a 24 KB body. */
+    /* 5 KB: TLS handshake plus JSON parsing, and paging after a 24 KB body.
+     * The stack must be internal RAM and one is created per card shown, so this
+     * is also the allocation that competes with the flash writer's task for the
+     * board's ~13 KB of contiguous internal heap (see word_save_progress_async).
+     * Failing to start it is harmless - the card simply shows no 助记 - so the
+     * flag is cleared and the page carries on. */
     if (xTaskCreate(enrich_worker, "th_mm_enrich", 5120, copy, 3, NULL) != pdPASS) {
         s_enrich_pending = false;
         free(copy);
+        SYS_LOGD(TAG, "no memory for the enrichment worker; skipping 助记");
     }
 }
 
@@ -279,11 +285,13 @@ static void grade_clicked_cb(lv_event_t *e)
     }
 
     /* Plan C: a word the user does not recognise is exactly the word worth
-     * learning, so send it back to the MaiMemo study plan. maimemo_push_unknown()
-     * runs the TLS call on its own task and is a silent no-op unless the user
-     * opted in, because it mutates the account. */
+     * learning, so send it back to the MaiMemo study plan. The *_async variant
+     * only queues the work on a worker task, which is what an LVGL callback
+     * needs: the synchronous form did the whole TLS round trip (and a task
+     * creation) with the adapter lock held, and on this board that is where the
+     * "记录失败：ESP_ERR_NO_MEM" on grading came from. */
     if (grade == WORD_REVIEW_UNKNOWN && maimemo_push_enabled()) {
-        (void)maimemo_push_unknown(s_word.spelling);
+        (void)maimemo_push_unknown_async(s_word.spelling);
     }
 
     esp_err_t err = word_review(s_word.id, grade);

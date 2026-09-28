@@ -51,6 +51,14 @@ static const char *TAG = "maimemo";
 /** Response cap. `/study/get_today_items` for 64 words is ~8 KB; 24 KB is ample
  *  and bounded, which is what matters on this board. */
 #define MM_MAX_RESPONSE   (24 * 1024)
+/**
+ * Cap on records requested by the study-records fallback.
+ *
+ * A study record is ~350 bytes of JSON, so this keeps the response comfortably
+ * inside MM_MAX_RESPONSE. Requesting more would overflow the body buffer and
+ * turn "long plan" into a hard failure (see mm_fetch_today_from_records).
+ */
+#define MM_RECORDS_MAX    56
 /** Cap on the enrichment cache read from disk (see enrich_cache_load()). */
 #define MM_MAX_CACHE_FILE (256 * 1024)
 #define MM_TOKEN_MAX      192
@@ -494,26 +502,14 @@ esp_err_t maimemo_fetch_progress(maimemo_progress_t *out)
     return ESP_OK;
 }
 
-esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
+/**
+ * Copy a `today_items` array into @p out. Returns how many entries landed.
+ *
+ * Split out because the same parsing is needed for the primary call and for the
+ * fallback in maimemo_fetch_today().
+ */
+static size_t mm_parse_today_items(const cJSON *items, maimemo_item_t *out, size_t max)
 {
-    if (out == NULL || count == NULL || max == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *count = 0;
-
-    cJSON *root = NULL;
-    const esp_err_t err = mm_post("study/get_today_items", "{}", &root);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const cJSON *data = mm_data(root);
-    const cJSON *items = data ? cJSON_GetObjectItemCaseSensitive(data, "today_items") : NULL;
-    if (!cJSON_IsArray(items)) {
-        cJSON_Delete(root);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
     size_t index = 0;
     const cJSON *entry = NULL;
     cJSON_ArrayForEach(entry, items) {
@@ -536,8 +532,145 @@ esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
             index++;
         }
     }
+    return index;
+}
+
+/**
+ * Fallback: reconstruct a queue from `/study/query_study_records`.
+ *
+ * ## Why this exists (v1.3.1)
+ *
+ * `/study/get_today_items` is a **beta** endpoint and it only returns rows once
+ * the user has opened the phone app that day to initialise the plan ("如果当日未
+ * 打开 App 进行初始化则无法准确计算"). Observed against a live account:
+ *
+ *   POST /study/get_today_items  {}                        -> {"today_items":[]}
+ *   POST /study/get_today_items  {"is_finished":false,...} -> 51 real words
+ *   POST /study/query_study_records {}                     -> 58 records
+ *
+ * So an empty `today_items` does **not** mean "the account has no words" - it
+ * means the beta endpoint has nothing to say right now, and the device showed an
+ * empty queue for an account that plainly had 58 words in its plan.
+ *
+ * `/study/query_study_records` is not beta and is the authoritative list of what
+ * is in the plan, so it is used to fill the queue when the beta call comes back
+ * empty. Records carry `last_response`/`next_study_date` rather than the
+ * today-item flags; `first_response` is mapped from `last_response` so the card
+ * can still show "this word was forgotten last time".
+ *
+ * @return number of entries written; 0 when the plan is genuinely empty.
+ */
+static size_t mm_fetch_today_from_records(maimemo_item_t *out, size_t max)
+{
+    /*
+     * One record is ~350 bytes of JSON (a ~60-char voc_id dominates), so the
+     * 24 KB response cap holds roughly 60 records. Ask for at most that: a larger
+     * `limit` would make the *response* overflow and fail the whole call, which
+     * is worse than a shorter queue. The panel shows one card at a time anyway.
+     */
+    const size_t request = (max > MM_RECORDS_MAX) ? MM_RECORDS_MAX : max;
+    char body[160];
+    snprintf(body, sizeof(body),
+             "{\"limit\":%u,\"next_study_date\":{\"end\":\"%s\"}}",
+             (unsigned)request, "2100-01-01T00:00:00+08:00");
+
+    cJSON *root = NULL;
+    if (mm_post("study/query_study_records", body, &root) != ESP_OK) {
+        return 0;
+    }
+
+    const cJSON *data = mm_data(root);
+    const cJSON *records = data ? cJSON_GetObjectItemCaseSensitive(data, "records") : NULL;
+    if (!cJSON_IsArray(records)) {
+        cJSON_Delete(root);
+        return 0;
+    }
+
+    size_t index = 0;
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, records) {
+        if (index >= max) {
+            break;
+        }
+        if (!cJSON_IsObject(entry)) {
+            continue;
+        }
+        maimemo_item_t *dst = &out[index];
+        memset(dst, 0, sizeof(*dst));
+        mm_copy(dst->voc_id, sizeof(dst->voc_id), entry, "voc_id");
+        mm_copy(dst->spelling, sizeof(dst->spelling), entry, "voc_spelling");
+        /* A record with no study history is a word the user has never graded:
+         * that is exactly what "new" means to the UI. */
+        const cJSON *study_count = cJSON_GetObjectItemCaseSensitive(entry, "study_count");
+        dst->is_new = !cJSON_IsNumber(study_count) || study_count->valuedouble <= 0;
+        const cJSON *last_response = cJSON_GetObjectItemCaseSensitive(entry, "last_response");
+        if (cJSON_IsString(last_response)) {
+            strlcpy(dst->first_response, last_response->valuestring,
+                    sizeof(dst->first_response));
+        }
+        /* study_count 0 means never studied -> not finished. Anything else has
+         * been seen at least once, but "finished" in MaiMemo terms means done
+         * *today*, which a record cannot tell us; false keeps the card actionable
+         * instead of hiding it. */
+        dst->is_finished = false;
+        if (dst->spelling[0] != '\0') {
+            index++;
+        }
+    }
 
     cJSON_Delete(root);
+    return index;
+}
+
+esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
+{
+    if (out == NULL || count == NULL || max == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+
+    /*
+     * Ask for the unfinished words explicitly.
+     *
+     * The previous request body was `{}`, which the beta endpoint answers with an
+     * **empty array** (verified against the live API - see the note on
+     * mm_fetch_today_from_records). The documented way to get the queue is to
+     * pass the filter, and `limit` above the panel's 64-card cap so the cap is
+     * ours, not the server's default of 50.
+     */
+    char body[64];
+    snprintf(body, sizeof(body), "{\"is_finished\":false,\"limit\":%u}",
+             (unsigned)((max > 1000) ? 1000 : max));
+
+    cJSON *root = NULL;
+    const esp_err_t err = mm_post("study/get_today_items", body, &root);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const cJSON *data = mm_data(root);
+    const cJSON *items = data ? cJSON_GetObjectItemCaseSensitive(data, "today_items") : NULL;
+    if (!cJSON_IsArray(items)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    size_t index = mm_parse_today_items(items, out, max);
+    cJSON_Delete(root);
+
+    if (index == 0) {
+        /* Beta endpoint has nothing today: fall back to the study records so an
+         * account with words in its plan never shows an empty page. */
+        SYS_LOGI(TAG, "today_items was empty; falling back to study records");
+        index = mm_fetch_today_from_records(out, max);
+        if (index > 0) {
+            SYS_LOGI(TAG, "today: %u words from study records (fallback)",
+                     (unsigned)index);
+            *count = index;
+            return ESP_OK;
+        }
+    }
+
     *count = index;
     SYS_LOGI(TAG, "today: %u words from the study plan", (unsigned)index);
     return ESP_OK;
@@ -1023,6 +1156,51 @@ esp_err_t maimemo_push_unknown(const char *spelling)
                                 &accepted, sizeof(accepted));
     }
     return err;
+}
+
+/** One-shot worker for maimemo_push_unknown_async(). */
+static void mm_push_worker(void *arg)
+{
+    char *spelling = (char *)arg;
+    (void)maimemo_push_unknown(spelling);
+    free(spelling);
+    vTaskDelete(NULL);
+}
+
+/**
+ * UI-safe wrapper around maimemo_push_unknown().
+ *
+ * The card's grade button used to call the synchronous version directly, i.e.
+ * a full TLS round trip *inside an LVGL callback* - which also tried to spawn
+ * the progress-writer task while the adapter lock was held, and on this board
+ * (largest contiguous internal block ~18 KB at boot) that is exactly where
+ * ESP_ERR_NO_MEM came from.
+ *
+ * Everything cheap (the opt-in check) happens here so the common "push disabled"
+ * case costs nothing; the network call is handed to a worker.
+ */
+esp_err_t maimemo_push_unknown_async(const char *spelling)
+{
+    if (spelling == NULL || spelling[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Cheap pre-checks on the caller's task: no thread and no allocation if the
+     * feature is off, which is the default. */
+    if (!maimemo_push_enabled() || !maimemo_has_token()) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    char *copy = strdup(spelling);
+    if (copy == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    /* 5 KB: TLS handshake plus the JSON bodies this path builds. */
+    if (xTaskCreate(mm_push_worker, "th_mm_push", 5120, copy, 3, NULL) != pdPASS) {
+        free(copy);
+        SYS_LOGW(TAG, "cannot start the push worker");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------------ */

@@ -270,15 +270,22 @@ static void auth_enable_cb(lv_event_t *e)
 
     esp_err_t err = sync_server_set_auth_token(token);
     if (err == ESP_OK) {
-        /* The token is the whole point of this dialog, so it is rendered as a
+        /*
+         * The token is the whole point of this dialog, so it is rendered as a
          * highlighted, wrapped value rather than described in prose. The earlier
          * version told the user to copy "the token below" while showing only
          * explanatory text - and the text was long enough to push the box off
-         * the screen. */
+         * the screen.
+         *
+         * Strings are kept short on purpose: ui_dialog_secret() lays the lead-in
+         * and the token out side by side (the panel is 800x480 landscape), so
+         * long prose in the left column would squeeze the token column instead of
+         * merely making the box taller.
+         */
         ui_dialog_secret("HTTP 鉴权已开启",
-                         "把下面的 token 填进网页控制台的「访问令牌」，只需一次。",
+                         "把下面的 token 填进网页控制台的「访问令牌」。",
                          token,
-                         "也可从串口日志读到；随时可在这里重新生成。",
+                         "串口日志里也有；随时可在这里重新生成。",
                          "知道了");
         /* Logged once on purpose: this is the only way to read it off the
          * device, and requirement 8.8 only forbids it appearing in backups and

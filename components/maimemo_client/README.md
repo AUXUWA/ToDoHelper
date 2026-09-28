@@ -30,6 +30,16 @@
 - `maimemo_fetch_today()` → `POST /study/get_today_items`，每条含 `voc_id`、`voc_spelling`、
   `is_new`、`is_finished`、`first_response`（`FORGET` / `FAMILIAR` / `UNSPECIFIED`）。
   队列上限 `MAIMEMO_MAX_TODAY = 64`（面板一次只显示一张卡）。
+  - **请求体必须是 `{"is_finished":false,"limit":N}`，不能是 `{}`**（v1.3.1 修）。
+    实测同一个令牌：发 `{}` 得到 `{"today_items":[]}`，发带过滤的 body 得到 **51 个词**。
+    该端点是 **Beta**，官方文档写明"如果当日未打开 App 进行初始化则无法准确计算"，
+    且 body 参数**全部可选**——所以**空数组不代表账号没有词**。
+  - **为空时有兜底**：`mm_fetch_today_from_records()` 改用非 beta 的
+    `POST /study/query_study_records`（`limit` + `next_study_date.end`）重建队列，
+    `last_response` → `first_response`，`study_count == 0` → 新词。
+  - 兜底的**请求条数上限是 `MM_RECORDS_MAX = 56`**：一条 record ≈ 350 B（60+ 字符的
+    voc_id 占大头），24 KB 的 `MM_MAX_RESPONSE` 只装得下约 60 条；请求更多会让**响应**
+    溢出、整次调用失败，**比队列短更糟**。实测 56 条 = 19656 B。
 - 结果由 `word_service` 接住：`word_cloud_refresh()` 把云端词用 `voc_spelling` **匹配回本地
   词库**，匹配得上就继续用本地的 level / 复习间隔；匹配不上的词标成 `WORD_ID_CLOUD`，
   仍可在设备上评分，只是本地不记进度。
@@ -61,10 +71,15 @@
 
 ### 方案 C：反向推送
 
-- `maimemo_push_unknown()`（单张卡评分路径用）与 `maimemo_push_words()`（HTTP 用，
+- `maimemo_push_unknown()`（需要知道结果时用）与 `maimemo_push_words()`（HTTP 用，
   一次最多 1000 条）。
+- **`maimemo_push_unknown_async()` 才是给 UI 用的那个**（v1.3.1 新增）：
+  廉价检查（开关 / 令牌）留在调用方，**阻塞 TLS 交给 worker 任务**。
+  `page_word.c` 的评分回调以前直接调同步版，等于"在持 LVGL 锁的回调里做完整 TLS 往返 +
+  建任务"，那正是评分报 `ESP_ERR_NO_MEM` 的触发窗口（见本文件"线程模型"一节与
+  `AGENT.md §9.0.7 ③`）。
 - **必须显式开启**（`maimemo_push_enabled()` / `mm_push`）：它会**修改用户在云端的学习计划**，
-  不是只读操作，所以默认是关的。没开启时 `maimemo_push_unknown()` 直接返回
+  不是只读操作，所以默认是关的。没开启时两个版本都直接返回
   `ESP_ERR_NOT_SUPPORTED` 且**不碰网络**。
 - 回报的是**服务器自己的 `added_count`**，不是我们发过去的条数（见下面的坑）。
 

@@ -435,8 +435,24 @@ esp_err_t word_save_progress_async(void)
         if (ok != pdPASS) {
             s_save_task = NULL;
             xSemaphoreGive(s_save_lock);
-            SYS_LOGE(TAG, "cannot create the progress writer");
-            return ESP_ERR_NO_MEM;
+            /*
+             * Could not start the writer.
+             *
+             * This used to be a hard ESP_ERR_NO_MEM, and because a task stack
+             * must come from **internal** RAM (AGENT.md 9.0.1) while this board
+             * runs with as little as ~13 KB of contiguous internal heap after
+             * boot (measured v1.3.1), grading a card intermittently failed with
+             * "记录失败：ESP_ERR_NO_MEM" - the grade itself was applied, only the
+             * persistence was refused, which reads as "the button is broken".
+             *
+             * So: fall back to writing inline. That is the slow path the async
+             * design exists to avoid, but a rare slow write beats losing the
+             * grade, and the write is what the user's tap was meant to cause.
+             * The WARN stays because a failure here means the board is under
+             * real internal-RAM pressure, which is worth seeing in the log.
+             */
+            SYS_LOGW(TAG, "no memory for the progress writer; saving inline");
+            return word_save_progress();
         }
     }
     TaskHandle_t task = s_save_task;

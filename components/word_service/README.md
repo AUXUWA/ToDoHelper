@@ -115,8 +115,25 @@ cJSON 节点）会把内部 RAM 抽干，并连带把当时正在连网的 WiFi 
 | `WORD_REVIEW_UNKNOWN`（不认识） | 归 **0** | `now + 600` 秒（10 分钟后重来） |
 
 即：认识一次间隔翻倍（1→2→4→8→16→32 天），模糊只推迟一天，不认识直接回炉。
-`word_review()` 记录后立即 `word_save_progress()`，并发 `WORD_EVENT_REVIEWED`（payload `uint32_t id`）
-与 `sys_notify("word_reviewed")`。
+`word_review()` 记录后立即 `word_save_progress_async()`（**异步**，见下），
+并发 `WORD_EVENT_REVIEWED`（payload `uint32_t id`）与 `sys_notify("word_reviewed")`。
+
+### 落盘：`word_save_progress_async()` 的降级路径（v1.3.1）
+
+`word_save_progress()` 会把每个已复习的词序列化并**整文件重写** SD 卡上的
+`words/progress.json`，**禁止在 LVGL 任务里调用**（见头文件注释）。所以评分路径走的是
+`word_save_progress_async()`：它按需 `xTaskCreate()` 一个 4 KB 栈的 worker，并用
+600 ms 去抖窗口合并连续评分（`WORD_SAVE_DEBOUNCE_MS`）。
+
+**但任务栈只能来自内部 RAM**（`AGENT.md §9.0.1`），而本板 boot 结束内部 RAM 实测只剩
+**57 KB 空闲、最大连续块 13 KB**——`xTaskCreate` 会失败。
+
+**以前失败就直接 `return ESP_ERR_NO_MEM`**，UI 把它弹成"记录失败：ESP_ERR_NO_MEM"，
+**看起来像按钮坏了，其实评分早就生效了，只是没落盘**（v1.3.1 用户报告的 bug ②）。
+
+现在**建任务失败时回退为就地同步写盘**（并打 WARN）：慢一点，但绝不丢评分。
+优先级是 **丢数据 > 卡 UI > 报错弹窗**——报错弹窗是最差的一种，
+因为它让用户以为功能坏了，而数据其实还在。
 
 ## 今日队列的构建顺序
 

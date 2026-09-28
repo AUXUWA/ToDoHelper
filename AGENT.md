@@ -10,7 +10,7 @@
 > 变更历史见 `CHANGELOG.md`。
 > 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
 >
-> **当前版本 `1.1.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
+> **当前版本 `1.3.1`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
 
 ---
 
@@ -400,7 +400,7 @@ Project build complete.
 **不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
 改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
 
-- **当前版本：`1.3.0`**
+- **当前版本：`1.3.1`**
 - 版本进 `esp_app_desc_t`，于是**三处可见**：
   设备「设置」页顶部与开机页「固件 1.3.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
   以及 `build/todohelper.bin` 的 app descriptor（离线核对：
@@ -825,6 +825,129 @@ riscv32-esp-elf-addr2line -f -C -e build\todohelper.elf 0x2f00f08f 0x2f00f092
 riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build\nm_all.txt
 ```
 
+### 9.0.7 三个上机 bug 的共同教训：**根因一律不在报错的地方**（v1.3.1）
+
+用户报了三个 bug，三个的"现象"与"根因"都不在同一处。这一节按"现象 → 真根因"写，
+因为这三个坑的共同点就是**顺着报错看会看错方向**。
+
+#### ① LVGL：事件回调里 `lv_event_get_current_target()` 是**回调注册的那个对象**
+
+**现象**：设置页生成 token 的弹窗**关不掉**（点「知道了」没反应）。
+
+**根因**：关闭回调是这样写的（v1.3.0 及以前）：
+
+```c
+static void dialog_close_cb(lv_event_t *e) {
+    lv_obj_t *mbox = lv_event_get_current_target(e);  /* ← 这是"按钮"，不是消息框 */
+    lv_msgbox_close(mbox);                            /* 对按钮调用 = 静默 no-op */
+}
+...
+lv_obj_t *btn = lv_msgbox_add_footer_button(mbox, "知道了");   /* 返回的是按钮 */
+lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, NULL);
+```
+
+`lv_msgbox_add_footer_button()` 返回 **footer 里的按钮**，回调也注册在它上面，所以
+`lv_event_get_current_target()` 拿到的是按钮。`lv_msgbox_close()` 对一个按钮什么都不做，
+**不报错、不警告**。所有"点了没反应"的控件回调都值得先查这一条。
+
+**修法**：把消息框作为 **event user data** 显式传入：
+
+```c
+lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, mbox);
+/* 回调里：lv_obj_t *mbox = lv_event_get_user_data(e); */
+```
+
+**并额外加一个 LVGL 自带的关闭按钮**：`lv_msgbox_add_close_button()` 内部装的
+`msgbox_close_click_event_cb` 本来就把回调绑在消息框上，是天生的正确实现 ——
+与其手写，不如复用它。两条路（「知道了」+「×」）都能关。
+
+> 记法：`lv_event_get_target()` = 触发事件的对象（可能是子对象）；
+> `lv_event_get_current_target()` = **回调被注册到的**对象；`lv_event_get_user_data()` = 注册时传的。
+> 想关"容器"就**别**靠从按钮反推容器。
+
+#### ② 弹窗"竖着被挤压"：面板是 800×480 **横屏**，弹窗也该横着排
+
+`lv_msgbox` 默认**纵向堆叠**（`LV_FLEX_FLOW_COLUMN`）：标题 / 正文 / 内容 / footer 一层层往下。
+480 px 高减去状态栏，装不下"说明 + 32 字符 token + 备注"，于是被挤。
+（用户原话："面板挤压太长了，应该是横着的而不是竖着"。）
+
+**修法**：把"说明 + token"放进一个 `LV_FLEX_FLOW_ROW` 的容器里两列并排。
+实测几何（`ui_widgets.c`）：对话框 `94% × 800 = 752 px`，内宽 720 px，
+减去列间距 14 → 两列各 **~353 px**；32 字符 token 在 BODY 字号下一行约需 **320 px**，
+**正好一行放下**。定宽算式比"看着差不多"可靠，改字号时按同样的算式复核。
+
+**样式统一**：LVGL 默认 msgbox 是浅色皮肤，和本工程的深色卡片完全不是一个东西。
+`dialog_style()` / `dialog_style_button()` 把 `UI_COLOR_SURFACE`/`_ALT`/`_PRIMARY`、
+`UI_CARD_RADIUS`、正文/标题字体一次性套上，**新弹窗直接复用这两个函数**。
+
+> **`lv_msgbox_create(lv_layer_top())` 不会创建独立遮罩** —— 传 `NULL` 才会
+> （`lv_msgbox.c` 里 `auto_parent` 分支）。所以此时 `lv_obj_get_parent(mbox)` 拿到的是
+> `lv_layer_top()` 本身，而 `ui_toast()` 也挂在那里：给它上色会**把 toast 一起压暗**。
+> 现在靠消息框自己的 `shadow` + 不透明底色和页面区分。
+
+#### ③ `ESP_ERR_NO_MEM` ≠ 内存用光了：**是"任务栈只能来自内部 RAM"**
+
+**现象**：单词背诵页点「认识 / 模糊 / 不认识」弹 `记录失败：ESP_ERR_NO_MEM`。
+
+**真根因链**（每一步都有真机数字）：
+
+1. `word_review()` → `word_save_progress_async()`，后者 `xTaskCreate(..., 4096, ...)`
+   起一个落盘 worker；
+2. **FreeRTOS 任务栈只能从内部 RAM 分配**（§9.0.1，且这个栈还要能碰 flash）；
+3. 本板 boot 结束内部 RAM 实测只有 **57 KB 空闲、最大连续块 13 KB**（v1.3.1 实测，
+   v1.3.0 记录的是 18 KB，可见它是浮动的）；
+4. 于是 `xTaskCreate` 返回 `pdFAIL` → 函数 `return ESP_ERR_NO_MEM` → UI 原样弹出。
+
+**判据**：报 `NO_MEM` 但 PSRAM 还有 10 MB 时，**不要去找"谁吃光了内存"**，
+先问"这个分配是不是必须要内部 RAM / 必须要连续"。这里 4 KB 的落盘 worker 与 4 KB 的
+enrich worker **可能同时存在**，撞上 13 KB 的连续块就是必然。
+
+**修法（两条都做了）**：
+
+- 建不出 worker **不再当作失败**：回退为**就地同步写盘**。慢，但绝不丢评分 ——
+  而且评分其实早就生效了，只是没落盘，"记录失败"的提示本身是误导。
+- **把阻塞 TLS 移出 LVGL 回调**：`grade_clicked_cb` 原来直接调
+  `maimemo_push_unknown()`（阻塞 TLS + 建任务，全在**持 LVGL 锁**的回调里），
+  这正是上面 NO_MEM 的触发窗口。新增 `maimemo_push_unknown_async()`：
+  廉价检查（开关 / 令牌）留在调用方，网络交给 worker。
+
+> **一般化**：凡是"回调里建任务"，都要假设它会失败并给出降级路径。
+> 优先级排序：**丢数据 > 卡 UI > 报错弹窗** —— 报错弹窗是最差的一种，
+> 因为它让用户以为功能坏了，而数据其实还在。
+
+#### ④ 第三方 beta 端点：**空数组不等于"没有数据"，先查文档的请求体**
+
+**现象**：墨墨"无法推送单词和获取今日单词"。
+
+**根因**：`maimemo_fetch_today()` 发的请求体是 **`{}`**。用真实令牌对比实测：
+
+```bash
+POST /study/get_today_items  {}                         # -> {"today_items":[]}
+POST /study/get_today_items  {"is_finished":false,...}  # -> 51 个词
+POST /study/query_study_records {}                      # -> 58 条记录
+```
+
+官方文档（`maimemo/memo-skills` 的 `study-api.md`）写明该端点 **Beta 公测**：
+"需要打开自动同步。**如果当日未打开 App 进行初始化则无法准确计算**"，
+且 `get_today_items` 的 body 参数**全部可选**（`is_finished` / `is_new` / `voc_ids` /
+`spellings` / `limit`）—— 文档给的"取今日队列"写法就是带 `is_finished` 的那条。
+**空数组是"beta 端点今天没话说"，不是"账号没词"**（同一账号 `query_study_records`
+明明有 58 条）。
+
+**修法**：
+
+- 请求体改为 `{"is_finished":false,"limit":<max>}`（官方写法）；
+- **加兜底**：`today_items` 为空时改用**非 beta** 的 `POST /study/query_study_records`
+  重建队列（`mm_fetch_today_from_records()`），`last_response` → `first_response`，
+  `study_count==0` → 新词。这样"账号有计划词"与"屏幕有词可背"不再脱钩；
+- **注意响应体积**：一条 record ≈ 350 B（60+ 字符的 voc_id 占大头），24 KB 的
+  `MM_MAX_RESPONSE` 只装 ~60 条。所以 `MM_RECORDS_MAX=56` —— 请求更多会让**响应**
+  溢出而整次调用失败，**比队列短更糟**。实测 56 条 = 19656 B，在 24 KB 内。
+
+> **一般化**：对接 beta / 第三方 API 时，"我发的请求合法"与"对端会给我数据"是两件事。
+> **要拿到"应当有数据"的那个端点的实测响应**（把文档给的 curl 原样打一遍），
+> 而不是只验证自己的代码没报错。这已经是本组件第二次踩同类坑（见 §9.0.6 ①）。
+
 ### 9.0.6 对接第三方云 API：`maimemo_client` 踩到的四个坑（v1.3.0）
 
 墨墨背单词开放 API 的形态很典型：**请求带 Bearer 令牌、响应统一是
@@ -1131,6 +1254,10 @@ common_invalid_param: {base} must have required property 'advance'
 | 墨墨接口"成功"但数据不对 / 权限不足却看不到错误 | API **权限错误也返回 HTTP 200**，必须读信封的 `success`/`errors[].code`；见 §9.0.6 ① |
 | `common_invalid_param: {base} must have required property 'advance'` | `/study/add_words` 的 `advance` 是**必填**，`false` 也要发；见 §9.0.6 ② |
 | 墨墨助记/例句读不到、或"读"完用户笔记被改了 | 读取端点是 **GET** `/notes?voc_id=`、`/phrases?voc_id=`；**`POST /notes` 是创建笔记**；见 §9.0.6 ③ |
+| **弹窗点按钮关不掉**（没反应、不报错） | 回调里用 `lv_event_get_current_target()` 反推容器拿到的是**按钮**；把容器作 user data 传进去，见 §9.0.7 ① |
+| **弹窗样式不像本工程 / 内容被挤成竖条** | `lv_msgbox` 默认**纵向**堆叠 + 浅色皮肤；面板是 800×480 横屏，应两列横排并套 `dialog_style()`；见 §9.0.7 ② |
+| 点单词评分弹 `记录失败：ESP_ERR_NO_MEM`（PSRAM 还剩 10 MB） | `xTaskCreate` 的**栈只能来自内部 RAM**，此处最大连续块仅 ~13 KB；见 §9.0.7 ③ |
+| 墨墨 `/study/get_today_items` 返回**空数组**但账号明明有计划词 | 该端点 **Beta**，body 全可选；必须发 `{"is_finished":false,"limit":N}`，空时回退 `query_study_records`；见 §9.0.7 ④ |
 | `bash tools/build.sh build` 日志是空的但退出码 0 | MSYS 调 `idf.py` 的四个坑（函数不绑定 / 管道 / `env -i` / `MSYSTEM` 重注入）；见 §4.2.1 |
 | 天气图标不显示 | `assets/ui/` 里有子目录，或改了素材没 `idf.py reconfigure` |
 | `idf.py: command not found` | 未加载 IDF 环境，见 §4 |

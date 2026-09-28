@@ -132,12 +132,116 @@ esp_err_t ui_toast(const char *fmt, ...)
 /* Dialog                                                                    */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * Close handler shared by every dialog button.
+ *
+ * ## Why the target is read from the user data
+ *
+ * This used to do `lv_obj_t *mbox = lv_event_get_current_target(e)` and pass the
+ * result to `lv_msgbox_close()`. The callback is registered **on the footer
+ * button**, so `lv_event_get_current_target()` returns that *button*, never the
+ * message box - and `lv_msgbox_close()` on a button is a silent no-op. That is
+ * why the "HTTP 鉴权已开启" dialog would not close: the OK button was wired to a
+ * handler that could not possibly close anything (lv_msgbox_close_async() has
+ * the same problem - it queues a delete of whatever it is handed).
+ *
+ * The message box is now passed explicitly as event user data, so the handler
+ * does not have to infer it from the widget that fired the event.
+ */
 static void dialog_close_cb(lv_event_t *e)
 {
-    lv_obj_t *mbox = lv_event_get_current_target(e);
+    lv_obj_t *mbox = (lv_obj_t *)lv_event_get_user_data(e);
     if (mbox != NULL) {
         lv_msgbox_close(mbox);
     }
+}
+
+/** Shared geometry so every dialog on the panel looks like the same widget. */
+#define UI_DIALOG_MAX_H_PCT 86
+#define UI_DIALOG_MAX_W_PCT 94
+
+/**
+ * Apply the project theme to a freshly created message box.
+ *
+ * LVGL's default msgbox theme is light-on-light with a 20 px radius, which on
+ * this dark UI reads as "a widget from another application". The card colours
+ * (UI_COLOR_SURFACE / _ALT / _PRIMARY) and UI_CARD_RADIUS are the same ones
+ * ui_card_create() uses, so a dialog is visually a card that floats.
+ */
+static void dialog_style(lv_obj_t *mbox)
+{
+    lv_obj_set_style_bg_color(mbox, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(mbox, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(mbox, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_border_width(mbox, 0, 0);
+    lv_obj_set_style_pad_all(mbox, 16, 0);
+    lv_obj_set_style_pad_row(mbox, 10, 0);
+    lv_obj_set_style_shadow_width(mbox, 24, 0);
+    lv_obj_set_style_shadow_opa(mbox, LV_OPA_50, 0);
+
+    /* The title/header and every label inherit the body font; without this the
+     * Chinese text falls back to the ~2500-glyph built-in face and partially
+     * renders as boxes (AGENT.md 9.0.4). */
+    lv_obj_set_style_text_font(mbox, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(mbox, UI_COLOR_TEXT, 0);
+
+    lv_obj_t *title = lv_msgbox_get_title(mbox);
+    if (title != NULL) {
+        lv_obj_set_style_text_font(title, ui_font(UI_FONT_TITLE), 0);
+        lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
+    }
+
+    /*
+     * Note on the backdrop: lv_msgbox_create(lv_layer_top()) does *not* create a
+     * dedicated backdrop - it only does that when passed NULL. So the parent here
+     * is lv_layer_top() itself, which also hosts ui_toast(); tinting it would dim
+     * the toasts too. The dialog's own shadow plus the opaque surface colour is
+     * what separates it from the page, so no backdrop styling is applied.
+     */
+}
+
+/**
+ * Give a dialog a header "X" as well as its footer button.
+ *
+ * LVGL's own close button is used rather than a hand-rolled one: it is bound to
+ * the message box itself (lv_msgbox_add_close_button installs
+ * msgbox_close_click_event_cb), which is exactly the wiring the old footer
+ * handler got wrong. Two ways out means a user who does not read the button
+ * label still has an obvious exit.
+ */
+static void dialog_add_close_button(lv_obj_t *mbox)
+{
+    lv_obj_t *btn = lv_msgbox_add_close_button(mbox);
+    if (btn == NULL) {
+        return;
+    }
+    lv_obj_set_style_text_font(btn, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(btn, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+}
+
+/**
+ * Lay a footer button out in the project's style.
+ *
+ * The footer is a ROW (LVGL builds it that way), so buttons placed in it are
+ * already side by side - which is the horizontal arrangement a two-button dialog
+ * needs. The previous code only set a minimum height and left the default
+ * (light) button skin in place, which is the "风格不匹配" part of the report.
+ */
+static void dialog_style_button(lv_obj_t *btn, lv_color_t color)
+{
+    if (btn == NULL) {
+        return;
+    }
+    lv_obj_set_style_min_height(btn, UI_TOUCH_MIN, 0);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, UI_CARD_RADIUS - 4, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_pad_hor(btn, 18, 0);
+    lv_obj_set_style_text_color(btn, UI_COLOR_ON_PRIMARY, 0);
+    lv_obj_set_style_text_font(btn, ui_font(UI_FONT_BODY), 0);
 }
 
 /**
@@ -169,11 +273,14 @@ lv_obj_t *ui_dialog(const char *title, const char *text,
     }
 
     /* Leave room for the status bar and a margin at both ends. */
-    lv_obj_set_style_max_height(mbox, LV_PCT(88), 0);
-    lv_obj_set_style_max_width(mbox, LV_PCT(92), 0);
+    lv_obj_set_style_max_height(mbox, LV_PCT(UI_DIALOG_MAX_H_PCT), 0);
+    lv_obj_set_style_max_width(mbox, LV_PCT(UI_DIALOG_MAX_W_PCT), 0);
+    lv_obj_set_width(mbox, LV_PCT(UI_DIALOG_MAX_W_PCT));
+    dialog_style(mbox);
 
     if (title != NULL && title[0] != '\0') {
         lv_msgbox_add_title(mbox, title);
+        dialog_style(mbox);   /* the header was created after the first pass */
     }
     if (text != NULL && text[0] != '\0') {
         lv_obj_t *body = lv_msgbox_add_text(mbox, text);
@@ -182,20 +289,22 @@ lv_obj_t *ui_dialog(const char *title, const char *text,
             lv_obj_set_width(body, LV_PCT(100));
             lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_WRAP);
             lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_style_text_color(body, UI_COLOR_TEXT, 0);
         }
     }
 
     lv_obj_t *btn = lv_msgbox_add_footer_button(mbox, ok_text ? ok_text : "确定");
     if (btn != NULL) {
-        lv_obj_set_style_min_height(btn, UI_TOUCH_MIN, 0);
+        dialog_style_button(btn, UI_COLOR_PRIMARY);
+        /* The box is the user data, not the button: see dialog_close_cb(). */
+        lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, mbox);
         if (on_close != NULL) {
             lv_obj_add_event_cb(btn, on_close, LV_EVENT_CLICKED, user_data);
         }
-        lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, NULL);
     }
 
-    /* Applying the project font to the whole box keeps Chinese glyphs intact. */
-    lv_obj_set_style_text_font(mbox, ui_font(UI_FONT_BODY), 0);
+    /* A second, always-visible way out (see dialog_add_close_button). */
+    dialog_add_close_button(mbox);
 
     ui_unlock();
     return mbox;
@@ -225,42 +334,76 @@ lv_obj_t *ui_dialog_secret(const char *title, const char *lead_in, const char *s
         return NULL;
     }
 
-    lv_obj_set_style_max_height(mbox, LV_PCT(88), 0);
-    lv_obj_set_style_max_width(mbox, LV_PCT(92), 0);
+    /*
+     * Wide and short, not tall and narrow.
+     *
+     * The panel is 800x480 - landscape - so a dialog that stacks prose above the
+     * value it is trying to show runs out of height almost immediately: the
+     * report was "面板挤压太长了，应该是横着的而不是竖着". Taking most of the
+     * width and clamping the height gives the two columns room to sit side by
+     * side, which is also how the token (32 characters) fits without wrapping to
+     * three lines.
+     */
+    lv_obj_set_width(mbox, LV_PCT(UI_DIALOG_MAX_W_PCT));
+    lv_obj_set_style_max_height(mbox, LV_PCT(UI_DIALOG_MAX_H_PCT), 0);
+    lv_obj_set_style_max_width(mbox, LV_PCT(UI_DIALOG_MAX_W_PCT), 0);
+    dialog_style(mbox);
 
     if (title != NULL && title[0] != '\0') {
         lv_msgbox_add_title(mbox, title);
+        dialog_style(mbox);   /* the header was created after the first pass */
     }
 
-    if (lead_in != NULL && lead_in[0] != '\0') {
-        lv_obj_t *lead = lv_msgbox_add_text(mbox, lead_in);
-        if (lead != NULL) {
-            lv_obj_set_width(lead, LV_PCT(100));
+    /*
+     * Body: a two-column row.
+     *
+     * Left  = the short explanation; right = the secret in its own highlighted
+     * box. Both are width-fractioned so the split holds on any panel size, and
+     * the row wraps to a column automatically only if the two cannot fit - which
+     * at 94% of 800 px they always can.
+     */
+    lv_obj_t *row = lv_obj_create(mbox);
+    if (row != NULL) {
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 14, 0);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        if (lead_in != NULL && lead_in[0] != '\0') {
+            lv_obj_t *lead = lv_label_create(row);
+            lv_label_set_text(lead, lead_in);
+            lv_obj_set_flex_grow(lead, 1);
             lv_label_set_long_mode(lead, LV_LABEL_LONG_MODE_WRAP);
+            lv_obj_set_style_text_color(lead, UI_COLOR_TEXT, 0);
         }
-    }
 
-    /* The secret itself: its own box, so it is visually distinct and selectable
-     * at a glance rather than buried in a paragraph. */
-    lv_obj_t *box = lv_obj_create(mbox);
-    if (box != NULL) {
-        lv_obj_remove_style_all(box);
-        lv_obj_set_width(box, LV_PCT(100));
-        lv_obj_set_height(box, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(box, UI_COLOR_SURFACE_ALT, 0);
-        lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(box, UI_CARD_RADIUS, 0);
-        lv_obj_set_style_pad_all(box, 10, 0);
-        lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+        /* The secret itself: its own box, so it is visually distinct and
+         * selectable at a glance rather than buried in a paragraph. */
+        lv_obj_t *box = lv_obj_create(row);
+        if (box != NULL) {
+            lv_obj_remove_style_all(box);
+            lv_obj_set_flex_grow(box, 1);
+            lv_obj_set_height(box, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(box, UI_COLOR_SURFACE_ALT, 0);
+            lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(box, UI_CARD_RADIUS - 4, 0);
+            lv_obj_set_style_pad_all(box, 12, 0);
+            lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *label = lv_label_create(box);
-        lv_label_set_text(label, secret);
-        lv_obj_set_width(label, LV_PCT(100));
-        /* Wrap, because 32 hex characters do not fit on one 480 px line at the
-         * body font; without this the token was cut off mid-string. */
-        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_WRAP);
-        lv_obj_set_style_text_color(label, UI_COLOR_PRIMARY, 0);
-        lv_obj_center(label);
+            lv_obj_t *label = lv_label_create(box);
+            lv_label_set_text(label, secret);
+            lv_obj_set_width(label, LV_PCT(100));
+            /* Wrap is kept as a safety net: if the token ever grows past what
+             * the column holds, it wraps instead of being cut off mid-string
+             * (the original bug this dialog was written to fix). */
+            lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_WRAP);
+            lv_obj_set_style_text_color(label, UI_COLOR_PRIMARY, 0);
+            lv_obj_center(label);
+        }
     }
 
     if (note != NULL && note[0] != '\0') {
@@ -274,11 +417,14 @@ lv_obj_t *ui_dialog_secret(const char *title, const char *lead_in, const char *s
 
     lv_obj_t *btn = lv_msgbox_add_footer_button(mbox, ok_text ? ok_text : "知道了");
     if (btn != NULL) {
-        lv_obj_set_style_min_height(btn, UI_TOUCH_MIN, 0);
-        lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, NULL);
+        dialog_style_button(btn, UI_COLOR_PRIMARY);
+        /* The box is the user data, not the button: see dialog_close_cb(). */
+        lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, mbox);
     }
 
-    lv_obj_set_style_text_font(mbox, ui_font(UI_FONT_BODY), 0);
+    /* The "无法关闭" report: this token dialog had a footer button whose handler
+     * could never close it, and no other exit. Now there is an "X" as well. */
+    dialog_add_close_button(mbox);
 
     ui_unlock();
     return mbox;

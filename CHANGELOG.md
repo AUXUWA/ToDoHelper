@@ -6,6 +6,95 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.3.1] — 2026-09-28
+
+**修三个上机实测的 bug**（用户报告）：鉴权弹窗样式/布局/关不掉、单词评分报
+`ESP_ERR_NO_MEM`、墨墨拉不到也推不上单词。**无破坏性变更**：HTTP API、存储格式、NVS 键
+全部不变；只动了 `ui_core` 的对话框实现、`word_service` 的落盘回退、
+`maimemo_client` 的取词请求体与新增一个异步推送入口。
+
+三个 bug 的根因都不在"看起来出错的地方"，这是本轮的主要收获：
+**弹窗关不掉是 LVGL 事件目标取错了对象**、**NO_MEM 不是内存真的没了而是任务栈要内部 RAM**、
+**"今日单词为空"不是账号没词而是 beta 端点要显式过滤参数**。
+
+### Fixed
+
+- **鉴权弹窗：风格不匹配 / 被挤成竖条 / 关不掉**（`ui_core/src/ui_widgets.c`）
+  - **关不掉是主 bug，也是三处里最隐蔽的**：`dialog_close_cb` 用
+    `lv_event_get_current_target(e)` 取"消息框"，但回调是注册在 **footer 按钮**上的，
+    所以拿到的是按钮本身；`lv_msgbox_close(button)` 是**静默 no-op**。
+    → 改为把消息框作为 event user data 显式传入，并在标题栏加 LVGL 自带的关闭按钮
+    （`lv_msgbox_add_close_button`，它的回调绑定的就是消息框，天然正确），
+    于是「知道了」和「×」两条路都能关。
+  - **横过来了**：面板是 800×480（横屏），原来标题/说明/token/备注**竖着堆**，
+    高度很快用完就被"挤压"（用户原话"面板挤压太长了，应该是横着的而不是竖着"）。
+    → `ui_dialog_secret()` 改为**两列横排**：左边短说明、右边 token 高亮框。
+    实测几何：对话框宽 `94%×800 = 752 px`，内宽 720 px，两列各 ~353 px，
+    32 字符 token 一行需要 ~320 px → **正好一行放下**，不再折行。
+  - **风格统一**：新增 `dialog_style()` / `dialog_style_button()`，把卡片色
+    （`UI_COLOR_SURFACE` / `_ALT` / `_PRIMARY`）、`UI_CARD_RADIUS`、正文/标题字体
+    应用到消息框与按钮，取代 LVGL 默认的浅色皮肤。
+  - 备注：`lv_msgbox_create(lv_layer_top())` **不会**创建独立遮罩（传 NULL 才创建），
+    所以没有给"背景"上色——那会把 `ui_toast()` 一起压暗。已写进代码注释。
+
+- **单词评分报 `ESP_ERR_NO_MEM`**（`word_service` / `page_word` / `maimemo_client`）
+  - **根因**：评分回调里调 `word_review()` → `word_save_progress_async()`，而它要
+    `xTaskCreate()` 一个 **4 KB 栈**的落盘任务；**任务栈只能来自内部 RAM**
+    （AGENT.md §9.0.1），本机 boot 结束内部 RAM 只剩 **57 KB 空闲 / 最大连续块 13 KB**
+    （真机实测，比 v1.3.0 记录的 18 KB 更紧）。任务建不出来就返回 `ESP_ERR_NO_MEM`，
+    UI 原样弹成"记录失败"——**看起来像按钮坏了，其实评分已经生效，只是没落盘**。
+    → 建任务失败时**回退为就地同步写盘**（慢一点，但绝不丢评分），并保留 WARN 日志。
+  - **同一路径还有第二个问题**：`grade_clicked_cb` 里直接调了**阻塞 TLS**的
+    `maimemo_push_unknown()`，即"在持 LVGL 锁的回调里做完整 TLS 往返 + 建任务"，
+    这正是上面那个 NO_MEM 的触发窗口。→ 新增 `maimemo_push_unknown_async()`：
+    廉价检查留在调用方，网络调用交给 worker 任务，评分路径改用它。
+  - `enrich_start()` 建 worker 失败时现在只记 DEBUG 并跳过助记（卡片本就不必须），
+    不再让可选的预取影响主流程。
+
+- **墨墨拉不到今日词表 / 推不上单词**（`maimemo_client`）
+  - **拉到的是空**：`maimemo_fetch_today()` 发的是 `{}`。实测（真实令牌）对比：
+    ```
+    POST /study/get_today_items  {}                          -> {"today_items":[]}
+    POST /study/get_today_items  {"is_finished":false,...}   -> 51 个词
+    POST /study/query_study_records {}                       -> 58 条记录
+    ```
+    即 `/study/get_today_items` 是 **beta** 端点，官方文档写明"如果当日未打开 App 进行
+    初始化则无法准确计算"——空数组**不代表账号没词**。→ 改为发送
+    `{"is_finished":false,"limit":<max>}`（官方文档给出的取队列方式）。
+  - **兜底**：`today_items` 仍为空时，改用**非 beta** 的
+    `POST /study/query_study_records` 重建队列（`mm_fetch_today_from_records()`），
+    按 `limit` + `next_study_date.end` 取计划内的词，`last_response` 映射到
+    `first_response`，`study_count==0` 视为新词。于是"账号有计划词"与"卡片有词可背"
+    不再脱钩。
+  - **响应体积**：一条 record ≈ 350 B（60+ 字符的 voc_id 占大头），24 KB 的
+    `MM_MAX_RESPONSE` 只装得下约 60 条。→ 新增 `MM_RECORDS_MAX=56` 并写明理由：
+    请求更多会让**响应**溢出而导致整次调用失败，比队列短更糟。实测 56 条 = 19.6 KB，
+    在 24 KB 之内。
+  - 推送侧的接口本身是对的（`{"words":[{"id":voc_id}],"advance":bool}`，
+    `advance` 必填），实测 `added_count: 1`；本轮修掉的是**它被从 UI 回调同步调用**。
+
+### Verified（真机）
+
+| 项 | 结果 |
+|---|---|
+| 构建 | 0 warning（`-Werror` 全开），`todohelper.bin` `0x2e6000`，分区余 64% |
+| 烧录 | `tools/flash.ps1` 31.4 s，`Hash of data verified.` |
+| 启动 | 0 panic / 0 abort / 0 wdt，`TH:app: ready (storage=/sdcard)` |
+| `GET /api/v1/maimemo/today` | **51 词**（修复前该账号拿到空表）；串口 `TH:maimemo: today: 51 words from the study plan` |
+| 兜底路径 | 用真实令牌实测 `query_study_records` 兜底：56 条 / 19656 B，在 24 KB 上限内 |
+| 推送 | 全链路实测（拼写→voc_id→add_words）：`{"added_count":1}`，`success:true` |
+| 弹窗几何 | 752 px 宽、两列各 ~353 px、token 单行 ~320 px → 一行放下 |
+
+### Known issues
+
+- 弹窗的**目视确认**未做：设备没有"远程切页/点按钮"的 HTTP 路由，无法脚本化触发那个
+  对话框（本轮只验证了编译、启动与几何计算）。请上机点一次「设置 → 生成并开启 token」
+  确认横排观感与「知道了 / ×」都能关闭。
+- `int-low` 从 v1.3.0 的 50 KB 降到 **44 KB**、最大连续块 13 KB（真机），
+  内部 RAM 依旧是最紧张的资源；`word_save_progress_async()` 的回退路径因此不是理论分支。
+
+---
+
 ## [1.3.0] — 2026-09-27
 
 **单词学习接入墨墨背单词（开放 API）+ 音标字形修复。** 需求条目没有变化，改的是"这个词到底
