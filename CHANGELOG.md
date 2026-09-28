@@ -6,6 +6,61 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.3.3] — 2026-09-28
+
+**修：墨墨推送方向的请求会把整个 Web 服务器冻死。** 无破坏性变更。
+
+### Fixed
+
+- **`POST /api/v1/maimemo/push`（设备 → 墨墨）在设备上不可用**：
+  推词时设备 **ping 得通但所有 TCP 连接都建不上** —— `GET /`、`/api/v1/device/info`
+  全部超时，而且**不会自行恢复**，只能重启板子。真机复现：推 `narwhal` 后 HTTP
+  完全无响应，等 45 s 仍是死的。
+
+  **根因**是 `esp_http_server` 的 handler 在**唯一的 httpd 任务里串行执行**，而
+  `push_post_handler` 在里面做阻塞 TLS：先按词逐个 `GET /vocabulary` 解析 `voc_id`，
+  再 `POST /study/add_words` —— **10 个词就是 11 次 HTTPS 往返**，全程占着 httpd。
+  这就是 `AGENT.md §9.0.1` 最后一条警告的实例（同组件的 SSE 早已按此修过）。
+
+  **同一模式还影响另外三个路由**，一并修掉：
+
+  | 路由 | 阻塞原因 | 最坏耗时 |
+  |---|---|---|
+  | `push` | 每词一次 resolve + 一次 add_words | 词数 × 往返 |
+  | `today` | get_today_items（可能回退 query_study_records）| 1–2 次往返 |
+  | `enrich` | 未命中缓存时 resolve + notes + phrases | 3 次往返 |
+  | `config{verify:true}` | 活体校验 | 5–15 s |
+
+  **修法**：新增 `mm_run_async()`，用 `httpd_req_async_handler_begin()` 把 socket 交给
+  自己的 worker 任务、handler 立即返回；worker 在自己的 req 副本上写响应。
+  `httpd_req_async_handler_complete()` 统一放在 trampoline 里 —— 漏掉它会永久占用
+  会话槽、最终 httpd 连 `accept()` 都不再做（IDF 头文件明确写了），所以不能指望每个
+  worker 自己记得。
+
+  配套：push 的 spellings 要 `strdup`（原同步版本借用 cJSON 指针是安全的，因为一切
+  都在同一函数内），enrich 也要复制查询串（handler 的栈缓冲在 worker 跑起来时已失效）。
+
+### Verified（真机）
+
+| 项 | 结果 |
+|---|---|
+| `POST /maimemo/push {"spellings":["quagga"]}` | `{"accepted":1,"count":1}` |
+| **紧接着** `GET /api/v1/device/info` | 正常返回（**修复前这里必死**）|
+| 墨墨端确认 | `query_study_records?spellings=quagga` → 已在计划内 |
+| `GET /maimemo/today` | count 54，服务器存活 |
+| `GET /maimemo/enrich?spelling=abrupt` | 正常返回 `unavailable:true`（学习作用域令牌读不到助记，属预期）|
+
+### Notes
+
+- **推送方向本身一直是好的**，坏的只是"从设备上触发"这条 HTTP 路径：
+  同一令牌用 curl 直接打墨墨 API（resolve → add_words）实测 `added_count:1` 成功。
+  修好后设备端与 API 端行为一致。
+- 语义上 push 现在**立即返回**（真实结果仍写在同一个 socket 上，所以 `curl` 等响应
+  看到的还是最终 `accepted` 数值）。
+- `ai_service_http.c` 的 `/api/v1/ai/chat`（阻塞版）**仍有同类隐患**，未在本轮修。
+
+---
+
 ## [1.3.2] — 2026-09-28
 
 **新增板载调试 shell（`components/debug_shell/`）+ 两个配套脚本**，把"只能靠看屏幕确认"
