@@ -26,6 +26,77 @@
 
 static const char *TAG = "maimemo_http";
 
+/* ------------------------------------------------------------------------ */
+/* Async handler plumbing                                                    */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Run the blocking part of a handler on its own task.
+ *
+ * ## The rule this enforces
+ *
+ * `esp_http_server` executes handlers **inline on its single httpd task**, so a
+ * handler that blocks on TLS stops serving *every* other request - the device
+ * answers ping while refusing all TCP connections (AGENT.md 9.0.1, last bullet).
+ * Every maimemo route does blocking TLS (`mm_post`/`mm_get`), so every one of
+ * them has to hand its socket off instead of working in the handler.
+ *
+ * `httpd_req_async_handler_complete()` is mandatory afterwards: skipping it
+ * leaks the session slot and httpd eventually stops accepting connections
+ * altogether (the IDF header states this explicitly).
+ *
+ * @param req    The request as received by the handler.
+ * @param work   Runs on the worker task; writes the response through
+ *               http_req->aux (the async duplicate) and must not return early
+ *               without completing the request.
+ * @param arg    Free-form argument owned by @p work (freed by it).
+ * @param stack  Worker stack in bytes. TLS needs several KB.
+ */
+typedef void (*mm_async_work_t)(httpd_req_t *req, void *arg);
+
+/** Carries the async request plus the caller's argument to the worker task. */
+typedef struct {
+    mm_async_work_t work;
+    void *arg;
+    httpd_req_t *req;   /**< async duplicate; owned by the worker */
+} mm_async_job_t;
+
+static void mm_async_trampoline(void *param)
+{
+    mm_async_job_t *job = (mm_async_job_t *)param;
+    job->work(job->req, job->arg);
+    /* Mandatory, and deliberately here rather than in each worker: a worker that
+     * forgets it permanently consumes a session slot (see the header note). */
+    (void)httpd_req_async_handler_complete(job->req);
+    free(job);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t mm_run_async(httpd_req_t *req, mm_async_work_t work, void *arg,
+                              uint32_t stack, const char *task_name)
+{
+    httpd_req_t *async = NULL;
+    if (httpd_req_async_handler_begin(req, &async) != ESP_OK) {
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "async begin");
+    }
+
+    mm_async_job_t *job = calloc(1, sizeof(*job));
+    if (job == NULL) {
+        (void)httpd_req_async_handler_complete(async);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "async job");
+    }
+    job->work = work;
+    job->arg = arg;
+    job->req = async;
+
+    if (xTaskCreate(mm_async_trampoline, task_name, stack, job, 3, NULL) != pdPASS) {
+        free(job);
+        (void)httpd_req_async_handler_complete(async);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "async task");
+    }
+    return ESP_OK;
+}
+
 /**
  * Show at most the first 4 characters of the token.
  *
@@ -106,6 +177,42 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 }
 
 /**
+ * Send the status object, optionally annotated with a `verify` outcome.
+ *
+ * Shared by the synchronous "just store it" path and the async verify worker, so
+ * both answer with exactly the same shape (the console renders one function).
+ */
+static esp_err_t config_reply(httpd_req_t *req, const char *verify_note)
+{
+    cJSON *obj = status_to_json();
+    if (obj == NULL) {
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "maimemo config");
+    }
+    if (verify_note != NULL) {
+        cJSON_AddStringToObject(obj, "verify", verify_note);
+    }
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (json == NULL) {
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "maimemo config");
+    }
+    const esp_err_t err = http_reply_ok(req, json);
+    cJSON_free(json);
+    return err;
+}
+
+/** Worker for the `verify` path: one live call, then the status reply. */
+static void config_verify_worker(httpd_req_t *req, void *arg)
+{
+    (void)arg;
+    const esp_err_t err = maimemo_verify_token();
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "token verification failed: %s", esp_err_to_name(err));
+    }
+    (void)config_reply(req, (err == ESP_OK) ? "ok" : esp_err_to_name(err));
+}
+
+/**
  * Accept `{"token":"...","push":bool,"verify":bool,"clear":bool}`.
  *
  * `verify` runs a live call, which blocks - so it is opt-in from the console
@@ -151,31 +258,19 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         (void)maimemo_set_push_enabled(push_value);
     }
 
-    /* Verification is deliberately separate from storing: a study-scoped token
+    /*
+     * Verification is deliberately separate from storing: a study-scoped token
      * is perfectly usable for plan A even though it cannot read 助记/例句, so a
-     * failed verify must not be reported as "the token is bad". */
-    const char *verify_note = NULL;
+     * failed verify must not be reported as "the token is bad".
+     *
+     * It is also **slow** (one live call, 5-15 s). Doing it here would hold the
+     * httpd task - and therefore every other HTTP request on the device - for the
+     * whole round trip, so it is handed to a worker like the other TLS routes.
+     */
     if (verify_requested && maimemo_has_token()) {
-        const esp_err_t err = maimemo_verify_token();
-        verify_note = (err == ESP_OK) ? "ok" : esp_err_to_name(err);
-        if (err != ESP_OK) {
-            SYS_LOGW(TAG, "token verification failed: %s", esp_err_to_name(err));
-        }
+        return mm_run_async(req, config_verify_worker, NULL, 6144, "th_mm_verify");
     }
-
-    cJSON *obj = status_to_json();
-    if (obj == NULL) {
-        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "maimemo config");
-    }
-    if (verify_note != NULL) {
-        cJSON_AddStringToObject(obj, "verify", verify_note);
-    }
-    char *json = cJSON_PrintUnformatted(obj);
-    cJSON_Delete(obj);
-
-    const esp_err_t err = http_reply_ok(req, json);
-    cJSON_free(json);
-    return err;
+    return config_reply(req, NULL);
 }
 
 static esp_err_t sync_post_handler(httpd_req_t *req)
@@ -205,23 +300,23 @@ static esp_err_t sync_post_handler(httpd_req_t *req)
     return reply;
 }
 
-/** Live fetch of today's words — the console's "拉取今日词表" button. */
-static esp_err_t today_get_handler(httpd_req_t *req)
+/** Worker: fetch today's words (blocking TLS), then answer. */
+static void today_worker(httpd_req_t *req, void *arg)
 {
-    if (!maimemo_has_token()) {
-        return http_reply_bad_request(req, "no token configured");
-    }
+    (void)arg;
 
     maimemo_item_t *items = calloc(MAIMEMO_MAX_TODAY, sizeof(maimemo_item_t));
     if (items == NULL) {
-        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
+        return;
     }
 
     size_t count = 0;
     const esp_err_t err = maimemo_fetch_today(items, MAIMEMO_MAX_TODAY, &count);
     if (err != ESP_OK) {
         free(items);
-        return http_reply_esp_error(req, err, "fetch today items");
+        (void)http_reply_esp_error(req, err, "fetch today items");
+        return;
     }
 
     cJSON *obj = cJSON_CreateObject();
@@ -229,7 +324,8 @@ static esp_err_t today_get_handler(httpd_req_t *req)
     if (obj == NULL || array == NULL) {
         free(items);
         cJSON_Delete(obj);
-        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
+        return;
     }
 
     for (size_t i = 0; i < count; i++) {
@@ -248,10 +344,67 @@ static esp_err_t today_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(obj, "count", (double)count);
     char *json = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
+    if (json == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
+        return;
+    }
 
-    const esp_err_t reply = http_reply_ok(req, json);
+    (void)http_reply_ok(req, json);
     cJSON_free(json);
-    return reply;
+}
+
+/** Live fetch of today's words — the console's "拉取今日词表" button. */
+static esp_err_t today_get_handler(httpd_req_t *req)
+{
+    if (!maimemo_has_token()) {
+        return http_reply_bad_request(req, "no token configured");
+    }
+    /* 6 KB for TLS; the 64-item array itself is PSRAM and lives in the worker. */
+    return mm_run_async(req, today_worker, NULL, 6144, "th_mm_http_today");
+}
+
+/** Worker: enrichment lookup (blocking TLS on a cache miss), then answer. */
+static void enrich_worker(httpd_req_t *req, void *arg)
+{
+    /* Owned by the worker: the handler's query buffer is gone by now. Freed on
+     * every path below, hence the single-exit shape. */
+    char *spelling = (char *)arg;
+
+    maimemo_enrich_t enrich;
+    const esp_err_t err = maimemo_enrich(spelling, &enrich);
+    /* ESP_ERR_NOT_SUPPORTED (token scope) and ESP_ERR_NOT_FOUND (word unknown to
+     * MaiMemo, or it has no mnemonic) are both normal outcomes that still carry a
+     * well-formed body, so they fall through to the reply below. */
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED && err != ESP_ERR_NOT_FOUND) {
+        (void)http_reply_esp_error(req, err, "enrich word");
+        free(spelling);
+        return;
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    if (obj == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "enrich");
+        free(spelling);
+        return;
+    }
+    cJSON_AddStringToObject(obj, "spelling", spelling);
+    cJSON_AddStringToObject(obj, "mnemonic", enrich.mnemonic);
+    cJSON_AddStringToObject(obj, "example", enrich.example);
+    cJSON_AddBoolToObject(obj, "from_cache", enrich.from_cache);
+    /* "unavailable" is distinct from "not found": the token simply may not read
+     * this endpoint, and the console says so rather than "no mnemonic exists". */
+    cJSON_AddBoolToObject(obj, "unavailable", err == ESP_ERR_NOT_SUPPORTED);
+
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+
+    if (json == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "enrich");
+    } else {
+        (void)http_reply_ok(req, json);
+        cJSON_free(json);
+    }
+    free(spelling);
 }
 
 static esp_err_t enrich_get_handler(httpd_req_t *req)
@@ -269,36 +422,92 @@ static esp_err_t enrich_get_handler(httpd_req_t *req)
         return http_reply_bad_request(req, "no token configured");
     }
 
-    maimemo_enrich_t enrich;
-    const esp_err_t err = maimemo_enrich(spelling, &enrich);
-    /* ESP_ERR_NOT_SUPPORTED (token scope) and ESP_ERR_NOT_FOUND (word unknown to
-     * MaiMemo, or it has no mnemonic) are both normal outcomes that still carry a
-     * well-formed body, so they fall through to the reply below. */
-    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED && err != ESP_ERR_NOT_FOUND) {
-        return http_reply_esp_error(req, err, "enrich word");
-    }
-
-    cJSON *obj = cJSON_CreateObject();
-    if (obj == NULL) {
+    /* The worker outlives this handler, so it needs its own copy of the query
+     * value (which lives on this stack). A cache hit still goes async - the
+     * handler must not branch on that without doing the lookup itself. */
+    char *owned = strdup(spelling);
+    if (owned == NULL) {
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "enrich");
     }
-    cJSON_AddStringToObject(obj, "spelling", spelling);
-    cJSON_AddStringToObject(obj, "mnemonic", enrich.mnemonic);
-    cJSON_AddStringToObject(obj, "example", enrich.example);
-    cJSON_AddBoolToObject(obj, "from_cache", enrich.from_cache);
-    /* "unavailable" is distinct from "not found": the token simply may not read
-     * this endpoint, and the console says so rather than "no mnemonic exists". */
-    cJSON_AddBoolToObject(obj, "unavailable", err == ESP_ERR_NOT_SUPPORTED);
 
-    char *json = cJSON_PrintUnformatted(obj);
-    cJSON_Delete(obj);
-
-    const esp_err_t reply = http_reply_ok(req, json);
-    cJSON_free(json);
-    return reply;
+    const esp_err_t err = mm_run_async(req, enrich_worker, owned, 6144, "th_mm_http_enrich");
+    if (err != ESP_OK) {
+        free(owned);
+    }
+    return err;
 }
 
-/** `{"spellings":["a","b"],"advance":bool}` — plan C. */
+/**
+ * Work item for the asynchronous push.
+ *
+ * The socket is handed to a worker task with
+ * httpd_req_async_handler_begin(), so the httpd task returns immediately.
+ */
+typedef struct {
+    char **spellings;      /**< NULL-terminated, each strdup'ed */
+    size_t count;
+    bool advance;
+} push_job_t;
+
+static void push_job_free(push_job_t *job)
+{
+    if (job == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < job->count; i++) {
+        free(job->spellings[i]);
+    }
+    free(job->spellings);
+    free(job);
+}
+
+/**
+ * Push the words, then answer, on a task of our own.
+ *
+ * ## Why this is not done in the handler
+ *
+ * `maimemo_push_words()` is blocking TLS, and it calls `mm_resolve_voc_id()` once
+ * **per word** - so a 10-word push is 11 sequential HTTPS round trips.
+ * `esp_http_server` runs handlers inline on its single httpd task (AGENT.md
+ * 9.0.1), so doing that in the handler froze the entire web server for the whole
+ * duration: the device still answered ping, but **every** TCP connection was
+ * refused, including `GET /` and `/api/v1/device/info`. Observed on the real
+ * board - the API went dead and only a reboot brought it back.
+ *
+ * `httpd_req_async_handler_complete()` is mandatory: without it the session slot
+ * is never released and httpd eventually stops accepting connections at all
+ * (IDF says so explicitly in the header).
+ */
+static void push_worker(httpd_req_t *req, void *arg)
+{
+    push_job_t *job = (push_job_t *)arg;
+    int accepted = 0;
+
+    const esp_err_t err = maimemo_push_words((const char **)job->spellings,
+                                             job->count, job->advance, &accepted);
+
+    char json[128];
+    if (err == ESP_OK) {
+        snprintf(json, sizeof(json), "{\"accepted\":%d,\"count\":%u}", accepted,
+                 (unsigned)job->count);
+        (void)http_reply_ok(req, json);
+    } else {
+        /* Report the reason the way the synchronous version did, so the console's
+         * error handling keeps working. */
+        snprintf(json, sizeof(json),
+                 "{\"code\":500,\"msg\":\"internal error\","
+                 "\"data\":{\"detail\":\"push words\",\"esp_err\":\"%s\"}}",
+                 esp_err_to_name(err));
+        (void)httpd_resp_set_status(req, "500 Internal Server Error");
+        (void)httpd_resp_set_type(req, "application/json");
+        (void)httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        (void)httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    }
+
+    push_job_free(job);
+}
+
+/** `{"spellings":["a","b"],"advance":bool}` — plan C, asynchronous. */
 static esp_err_t push_post_handler(httpd_req_t *req)
 {
     if (!maimemo_has_token()) {
@@ -332,39 +541,58 @@ static esp_err_t push_post_handler(httpd_req_t *req)
         return http_reply_bad_request(req, "at most 1000 words per call");
     }
 
-    const char **list = calloc((size_t)count, sizeof(char *));
-    if (list == NULL) {
+    /*
+     * Copy the spellings out of the cJSON tree: the tree dies with this handler,
+     * but the worker outlives it. (The old synchronous version could borrow the
+     * pointers because everything happened inside this function.)
+     */
+    push_job_t *job = calloc(1, sizeof(*job));
+    if (job == NULL) {
         cJSON_Delete(root);
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "push");
     }
-    int used = 0;
-    for (int i = 0; i < count; i++) {
-        const cJSON *item = cJSON_GetArrayItem(spellings, i);
-        if (cJSON_IsString(item) && item->valuestring[0] != '\0') {
-            list[used++] = item->valuestring;
-        }
-    }
-
-    int accepted = 0;
-    const esp_err_t err = maimemo_push_words(list, (size_t)used, advance, &accepted);
-    free(list);
-    cJSON_Delete(root);
-
-    if (err != ESP_OK) {
-        return http_reply_esp_error(req, err, "push words");
-    }
-
-    cJSON *obj = cJSON_CreateObject();
-    if (obj == NULL) {
+    job->spellings = calloc((size_t)count + 1, sizeof(char *));
+    if (job->spellings == NULL) {
+        cJSON_Delete(root);
+        push_job_free(job);
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "push");
     }
-    cJSON_AddNumberToObject(obj, "accepted", accepted);
-    char *json = cJSON_PrintUnformatted(obj);
-    cJSON_Delete(obj);
+    job->advance = advance;
 
-    const esp_err_t reply = http_reply_ok(req, json);
-    cJSON_free(json);
-    return reply;
+    for (int i = 0; i < count; i++) {
+        const cJSON *item = cJSON_GetArrayItem(spellings, i);
+        if (!cJSON_IsString(item) || item->valuestring[0] == '\0') {
+            continue;
+        }
+        char *copy = strdup(item->valuestring);
+        if (copy == NULL) {
+            continue;   /* skip this one rather than fail the whole batch */
+        }
+        job->spellings[job->count++] = copy;
+    }
+    cJSON_Delete(root);
+
+    if (job->count == 0) {
+        push_job_free(job);
+        return http_reply_bad_request(req, "no usable spellings");
+    }
+
+    /*
+     * Hand the socket to a worker and return immediately.
+     *
+     * This route is the worst offender for the blocking-handler problem: it does
+     * one `GET /vocabulary` per word **plus** the `add_words` call, all on the
+     * httpd task, so a 10-word push used to freeze the whole web server for the
+     * duration of 11 TLS round trips. The reply still arrives on this socket, so
+     * a client watching the HTTP response sees the real result.
+     *
+     * 6 KB: TLS handshake + a 24 KB PSRAM response buffer per resolve.
+     */
+    const esp_err_t err = mm_run_async(req, push_worker, job, 6144, "th_mm_push");
+    if (err != ESP_OK) {
+        push_job_free(job);   /* ownership stays here when the task never starts */
+    }
+    return err;
 }
 
 esp_err_t maimemo_register_http(void)
