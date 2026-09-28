@@ -27,6 +27,7 @@
 
 #include "ai_service.h"
 #include "calendar_service.h"
+#include "debug_shell.h"
 #include "idle_face.h"
 #include "maimemo_client.h"
 #include "storage_manager.h"
@@ -68,6 +69,9 @@ static const app_module_t s_modules[] = {
     { .name = "idle_face",        .init = idle_face_init, .optional = true,  .after_ui = true },
     { .name = "ai_service",       .init = ai_service_init, .optional = true, .after_ui = true },
     { .name = "voice_service",    .init = voice_service_init, .optional = true, .after_ui = true },
+    /* Last, and compiled out unless CONFIG_TODOHELPER_DEBUG_SHELL is set: it is
+     * a development aid (/api/v1/debug/exec), not a product feature. */
+    { .name = "debug_shell",      .init = debug_shell_init, .optional = true, .after_ui = true },
 };
 
 static esp_err_t run_modules(bool after_ui)

@@ -10,7 +10,7 @@
 > 变更历史见 `CHANGELOG.md`。
 > 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
 >
-> **当前版本 `1.3.1`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
+> **当前版本 `1.3.2`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
 
 ---
 
@@ -63,12 +63,15 @@ components/
   ai_service/         L5  FR7 DeepSeek（阻塞/流式/历史/中断）
   voice_service/      L5  FR7 录音回放 + ASR/TTS 端点桥接
   maimemo_client/     L5  墨墨背单词开放 API（方案 A 同步 / B 助记例句 / C 反向推词，可选降级）
+  debug_shell/        L4  **调试 shell**（`/api/v1/debug/exec`，默认关，见 §9.0.8）
   esp_cam_sensor/     —   本地组件，覆盖托管组件（BSP 需要）
 main/
-  app_main.c              表驱动模块编排（10 个模块，全部 after_ui），无可选模块失败阻塞 UI
+  app_main.c              表驱动模块编排（11 个模块，全部 after_ui），无可选模块失败阻塞 UI
 assets/ui/                扁平 PNG 资源（w_*.png），打包进 assets 分区
 tools/gen_cjk_font.py     生成内嵌 CJK 子集字体（含 IPA 字形合并 + `validate_font()` 校验）
 tools/build.sh            从 Git-Bash 驱动 idf.py 的包装器（配 tools/build.ps1，见 §4.2）
+tools/dsh.sh              发一条 debug_shell 命令并打印文本输出（自动处理令牌轮换，见 §9.0.8）
+tools/dsh_debug_probe.sh  取设备当前 HTTP 鉴权令牌（先查日志，再读 NVS）
 docs/                     需求 / 框架 / API / 交接
 ```
 
@@ -400,7 +403,7 @@ Project build complete.
 **不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
 改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
 
-- **当前版本：`1.3.1`**
+- **当前版本：`1.3.2`**
 - 版本进 `esp_app_desc_t`，于是**三处可见**：
   设备「设置」页顶部与开机页「固件 1.3.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
   以及 `build/todohelper.bin` 的 app descriptor（离线核对：
@@ -824,6 +827,82 @@ riscv32-esp-elf-addr2line -f -C -e build\todohelper.elf 0x2f00f08f 0x2f00f092
 # 3) 用符号表核对地址落在哪个函数区间（区分代码 / 数据）
 riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build\nm_all.txt
 ```
+
+### 9.0.8 板子上的调试 shell：让"只能靠看屏幕"的 bug 变成可脚本验证（v1.3.2）
+
+**动机**：v1.3.1 修"鉴权弹窗关不掉"时，验证手段是**"请你在板子上点一下、告诉我看到什么"**。
+板子不在手边就完全没法验证；而且以前**没有办法从脚本切页或按控件**，所以凡是
+"点一下"后面的功能都是不可测的。`components/debug_shell/` 补上这一环：
+一条命令进去、文本输出出来。
+
+```bash
+bash tools/dsh.sh heap                 # 内部 RAM / 最大连续块 / int-low
+bash tools/dsh.sh page settings        # 切页
+bash tools/dsh.sh widgets 生成         # 对象树（按文本过滤）
+bash tools/dsh.sh click 生成并开启      # 按控件，并当场报出弹窗
+bash tools/dsh.sh tap 745 162 click    # 按坐标（能按到没有文字的「×」）
+```
+
+#### ① `click <标签>` 必须自己往上找**可点击祖先**
+
+第一版把事件直接发给匹配到的对象 —— 而按钮的文字在**子 label** 上，于是
+`click 生成并开启` 匹配到 label、对**不可点击**对象发事件、**静默什么都不发生**。
+屏幕上看起来就是"点了没反应"，和它要诊断的那个 bug 一模一样（好在这回是工具的锅）。
+LVGL 真实触摸是路由到最近的可点击祖先的，**shell 必须照做**，否则复现不了"手指点下去会怎样"。
+
+#### ② 弹窗必须在**点击的同一个调用里**同步检查
+
+隔一次 HTTP 请求再看，是**分不清**"没打开"和"已经关掉"的 —— 而那个按钮本身
+**会轮换鉴权令牌**，客户端再取一次令牌早就来不及。所以 `click` 当场报
+`top layer now: N task(s), M msgbox(es)`，并且在有弹窗时顺手打印它的整棵对象树。
+**这一条是让"弹窗关不掉"可无人验证的关键**：一次请求同时证明"点击真的开了弹窗"
+和"弹窗长这样"。
+
+#### ③ `lv_obj_hit_test()` **不搜索**，用 `lv_indev_search_obj()`
+
+前者只回答"这个点在不在这个对象里"。后者才是 LVGL 自己的命中测试，而且要
+**先搜顶层**（顶层画在上面），这正是模态弹窗会吞掉页面点击的原因。
+`tap <x> <y> click` 也是唯一能按到**没有文字的控件**的办法 —— 弹窗的「×」是个 image。
+
+#### ④ UI 命令**必须回到 LVGL 任务**执行
+
+`ui`/`widgets`/`click`/`text`/`page`/`tap` 都走 `ui_run_async()` + 信号量
+"派回 LVGL 任务并等结果"。直接在 httpd 任务里调 LVGL 会破坏对象树（或触发
+`lv_obj_has_class` 断言）；纯异步又会**在结果存在前就回复**。等待是安全的：
+LVGL 任务从不反向阻塞 httpd 任务。
+
+#### ⑤ 工具本身的三个坑（都会伪装成"设备有问题"）
+
+1. **`out_printf` 不能固定 512 字节缓冲**：`help` 一次打印整张表，`vsnprintf`
+   静默截断到 511 字节（输出停在 `"  http-auth "`）。**调试工具的静默截断是最糟的
+   失败模式** —— 看起来像命令本身坏了。现在用 `vsnprintf` 的**返回值**（本应写入的
+   长度）二次分配到堆上。
+2. **`http_reply_ok()` 要的是"已序列化的 JSON"**：第一版把多行文本直接塞进去，
+   得到 `{"code":0,...,"data":project ...\nversion 1.3.1\n}` —— **不是合法 JSON**，
+   所有客户端解析全挂。用 cJSON 编码，且**别再包一层 `data`**（`http_reply_json`
+   自己会包，否则变成 `data.data.out`）。
+3. **读 NVS 会重启板子**：esptool 无法在应用运行时附加（`--no-reset` 报
+   `Failed to connect ... No serial data received`），必须拉进 ROM 下载模式。
+   于是"取一下鉴权令牌"会**在测试序列中间静默重启设备** —— 我因此把"切到设置页后
+   又变回主页"误判成 UI bug，实际是工具在复位。`tools/dsh.sh` 现在**优先查日志**
+   （设备生成令牌时会打一行），NVS 只作兜底，并注明这个副作用。
+
+> **记法**：写调试工具时，"工具没生效"和"被测对象有问题"必须能从输出上区分开。
+> 静默失败（截断、no-op、复位）在两边都最常见。
+
+#### ⑥ 顺带测出来的一件事：首次进单词页吃掉 ~25 KB 内部 RAM
+
+同一轮用 `heap` 前后对比（真机）：
+
+| 时刻 | 内部空闲 | 最大连续块 |
+|---|---|---|
+| 刚启动 | 74 KB | 18 KB |
+| 首次进入单词页后 | 49 KB | **5 KB** |
+
+离开页面**不回收**；反复采样**稳定**（不是持续泄漏）。那个 5 KB 正是
+`page_word.c` 里**每张卡一个、5 KB 栈**的 `th_mm_enrich` worker ——
+和 §9.0.7 ③ 给评分路径做 NO_MEM 降级时的判据完全一致。
+**改单词页时请注意这里**：它是本板最紧的一处。
 
 ### 9.0.7 三个上机 bug 的共同教训：**根因一律不在报错的地方**（v1.3.1）
 
@@ -1264,3 +1343,6 @@ common_invalid_param: {base} must have required property 'advance'
 | `Could not open COMxx ... busy` | 关掉占用串口的监视器/其它工具；确认用的是 COM34 |
 | 组件管理器重新下载依赖 | 打补丁后 `idf.py reconfigure && idf.py build` |
 | 需要从零复现 | `idf.py fullclean` → 应用补丁 → `idf.py build` |
+| **要验证"点一下才出现"的 UI**（弹窗/切页/控件） | 用调试 shell：`bash tools/dsh.sh click <标签>` / `page <名>` / `widgets`；见 §9.0.8 |
+| `tools/dsh.sh` 一直 401 | 令牌被"生成 token"轮换了；脚本会自动重试与记缓存，必要时 `DSH_TOKEN=...`；见 §9.0.8 ⑤ |
+| 切到某页后又"自己回到主页" | 先怀疑工具：读 NVS 取令牌会**复位板子**（§9.0.8 ⑤3）；否则看 `idle-timeout` |

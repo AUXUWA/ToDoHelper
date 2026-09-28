@@ -6,6 +6,69 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.3.2] — 2026-09-28
+
+**新增板载调试 shell（`components/debug_shell/`）+ 两个配套脚本**，把"只能靠看屏幕确认"
+的 UI bug 变成可脚本断言的对象。**无破坏性变更**：HTTP API 只增一个**默认不编译**的
+调试路由，存储格式与 NVS 键都不变。
+
+起因是 v1.3.1 修"鉴权弹窗关不掉"时，验证手段是"请你在板子上点一下、告诉我看到什么" ——
+板子不在手边就没法验证，而且以前**没有办法从脚本切页或按控件**。这次补上了。
+
+### Added
+
+- **`components/debug_shell/`（L4）**：`POST/GET /api/v1/debug/exec`，一条命令进去、
+  文本输出出来。命令分两类：
+  - **只读**：`help` / `version` / `status` / `heap` / `tasks` / `routes` / `pages` /
+    `time` / `storage` / `cfg` / `nvs` / `log`；
+  - **驱动 UI**：`ui` / `widgets [过滤] [深度]` / `click <标签>` / `text` / `page <名>` /
+    `tap <x> <y> [click]` / `idle` / `bright` / `idle-timeout` / `reboot`。
+  - **默认关**（Kconfig `TODOHELPER_DEBUG_SHELL`，本仓库开发用 `sdkconfig.defaults`
+    打开）；关掉时整个组件不参与编译，`debug_shell_init()` 是返回 `ESP_OK` 的空函数。
+  - 路由用 `http_router_require_auth(..., true)` **强制要求鉴权，即使全局鉴权是关的** ——
+    它能切页、按控件、改 NVS、重启，所以"编了调试固件"不等于"把设备控制权暴露在开放网络上"。
+- **`tools/dsh.sh`**：发一条命令并打印文本输出。**自动处理令牌轮换** ——
+  那个"生成 token"按钮本身就会轮换令牌，而本组件路由永远要求鉴权；脚本每次重新发现
+  令牌、401 时换候选重试、成功者记进 `build/.dsh_tokens`（日志只在**生成**时才有一行）。
+- **`tools/dsh_debug_probe.sh`**：单独取当前 HTTP 鉴权令牌。**优先查日志**，
+  NVS 仅兜底 —— 因为读 flash 会**复位板子**（esptool 无法在应用运行时附加）。
+
+### Verified（真机，全程无人值守）
+
+用 shell 跑通 v1.3.1 那个"只靠看屏幕才能确认"的弹窗，一次请求同时证明四件事：
+
+```
+$ bash tools/dsh.sh click 生成并开启
+clicked button (matched label '生成并开启')
+top layer now: 2 child(ren), 1 msgbox(es)  <- dialog is OPEN
+
+$ bash tools/dsh.sh widgets
+  msgbox     24,136   752x208  [click]        ← 752 宽 / 208 高 = 横排
+    label      45,145   685x34   HTTP 鉴权已开启
+      image     739,150    12x24              ← 「×」在
+    label      40,238   353x48   把下面的 token 填进…   ← 左列 353 px
+      obj       407,226   353x72
+        label     419,238   329x48   d84ad67d…ca      ← 右列 353 px，令牌可见
+      label     370,306    60x24   知道了
+
+$ bash tools/dsh.sh click 知道了
+top layer now: 1 child(ren), 0 msgbox(es)    ← 关掉了
+```
+
+**结论：打开 → 令牌真的渲染 → 两列横排（各 353 px）→ 能关**，全部由脚本断言。
+
+### Known issues
+
+- **首次进入单词页会让内部 RAM 从 74 KB / 最大连续块 18 KB 掉到 49 KB / 5 KB**，
+  离开页面不回收（反复采样稳定，不是持续泄漏）。那个 5 KB 正是 `page_word.c` 里
+  **每张卡一个、5 KB 栈**的 `th_mm_enrich` worker，与 v1.3.1 给评分路径做 NO_MEM
+  降级时的判据一致。这是本板最紧的一处，改单词页时请注意。
+- `tasks` 的逐任务栈水位需要 `CONFIG_FREERTOS_USE_TRACE_FACILITY=y`，当前为**关**
+  （它按任务占 RAM，而内部 RAM 是本板最紧的资源）；该命令会打印任务数与说明。
+- 本轮的 bug 1/2/3 修复**仍按 v1.3.1 的结论有效**，本轮只加了验证手段。
+
+---
+
 ## [1.3.1] — 2026-09-28
 
 **修三个上机实测的 bug**（用户报告）：鉴权弹窗样式/布局/关不掉、单词评分报

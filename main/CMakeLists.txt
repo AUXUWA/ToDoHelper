@@ -22,4 +22,7 @@ idf_component_register(
         idle_face
         ai_service
         voice_service
+        # Development aid; its init is a no-op unless CONFIG_TODOHELPER_DEBUG_SHELL
+        # is set (see components/debug_shell/Kconfig).
+        debug_shell
 )

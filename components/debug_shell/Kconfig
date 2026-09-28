@@ -1,0 +1,20 @@
+menu "ToDoHelper debug shell"
+
+    config TODOHELPER_DEBUG_SHELL
+        bool "Enable the on-device debug shell (/api/v1/debug/exec)"
+        default n
+        help
+            Adds a small text-command shell reachable over HTTP so a developer
+            can inspect and drive the device without a serial cable:
+
+                curl -X POST -d 'widgets token' http://<dev>/api/v1/debug/exec
+                curl -X POST -d 'click 知道了'   http://<dev>/api/v1/debug/exec
+
+            It can switch pages, press widgets, dump the LVGL object tree, read
+            heaps/tasks/NVS and reboot the board. That is exactly why it is
+            **off by default** and why its routes always require the HTTP auth
+            token even when authentication is otherwise disabled.
+
+            Turn this on for a debugging build only; do not ship it enabled.
+
+endmenu

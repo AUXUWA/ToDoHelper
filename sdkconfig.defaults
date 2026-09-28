@@ -124,3 +124,8 @@ CONFIG_CAMERA_SC101IOT_DVP_YUV422_640X480_15FPS=y
 CONFIG_CAMERA_SC101IOT_DVP_YUV422_1280X720_15FPS=n
 CONFIG_CAMERA_SC101IOT_DVP_YUV422_DEFAULT_FMT_YUV422_640X480_15FPS=y
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
+
+# Debug shell (development aid): text-command interface at /api/v1/debug/exec
+# so the UI can be inspected and driven remotely. Off in a shipped build; see
+# components/debug_shell/Kconfig. Turn OFF before shipping.
+CONFIG_TODOHELPER_DEBUG_SHELL=y

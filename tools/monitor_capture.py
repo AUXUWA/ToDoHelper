@@ -37,7 +37,35 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    port = serial.Serial(args.port, args.baud, timeout=0.5)
+    """
+    Opening the port must not disturb the board.
+
+    pyserial asserts DTR and RTS when a Serial() is constructed, and on this
+    board's CP210x EN<-RTS / GPIO0<-DTR wiring that **resets the ESP32**. So
+    `--no-reset` has to be applied *at open time*, not afterwards: the original
+    code only avoided the explicit RTS pulse, while the constructor's implicit
+    assertion already rebooted the chip.
+
+    Symptom this caused (worth remembering): `tools/dsh.sh page settings` reported
+    success and a 300 ms recheck still showed the new page, yet the next command
+    saw `home` again - because the wrapper's token listener opened this port in
+    between, rebooting the board, and app_main's boot hand-off switches to home.
+    It looked exactly like a UI bug that "switches back by itself".
+    """
+    if args.no_reset:
+        port = serial.Serial()
+        port.port = args.port
+        port.baudrate = args.baud
+        port.timeout = 0.5
+        # Deassert before open so the lines never pulse.
+        port.dtr = False
+        port.rts = False
+        port.open()
+        port.setDTR(False)
+        port.setRTS(False)
+    else:
+        port = serial.Serial(args.port, args.baud, timeout=0.5)
+
     sink = open(args.out, "w", encoding="utf-8") if args.out else None
 
     if not args.no_reset:
