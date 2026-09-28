@@ -194,7 +194,8 @@ bash tools/build.sh build      # 或 flash，或 -v build
 
 - 目标芯片 `esp32s31`（ESP32-S31-Korvo，800×480 RGB 屏 + GT1151 触摸 + ES8389 + SDMMC 4-bit）
 - ESP-IDF **v6.1**，路径 `D:\ESP-IDF\v6.1\esp-idf`；工程 `D:\project\ESP-IDFv6.1\ToDoHelper`
-- 串口 **COM34**（115200）；设备 IP 固定 **192.168.137.110**，mDNS `todohelper.local`
+- 串口 **COM34**（115200）；设备走 DHCP，地址以 mDNS `todohelper.local` 或
+  `GET /api/v1/device/info` 的 `ip` 为准（**不是固定 IP**，换网络就变）
 
 ```powershell
 # 0) 关键前置：先杀掉占用串口的 monitor，否则烧录/抓串口都会失败

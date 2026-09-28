@@ -433,7 +433,7 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
      * (link up, before DHCP). Without this the IP and RSSI gathered just above
      * never reach sys_status, and the UI shows the values from association time
      * forever: the status bar read "WiFi 0 dBm" and the API reported 0.0.0.0
-     * while s_rssi was -35 and s_ip was 192.168.137.110.
+     * while s_rssi was -35 and s_ip still held the stale address.
      */
     push_status();
 

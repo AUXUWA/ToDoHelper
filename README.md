@@ -59,7 +59,8 @@ bash tools/build.sh -v build       # 详细构建
 （profile 把 `idf.py` 定义成函数、原生 exe 接不进 cmdlet 管道、`env -i` 清空环境）
 记录在 `AGENT.md §4.2`。
 
-开机后浏览器打开 **`http://todohelper.local/`**（或设备 IP，本机实测 `192.168.137.110`）。
+开机后浏览器打开 **`http://todohelper.local/`**，或打开设备「设置」页里显示的 IP
+（地址由 DHCP 分配，换网络就会变，所以以设备自己报出的为准）。
 SD 卡只需 FAT32 可挂载：`<卡根>/todohelper/` 下的词库、字体、待办缓存由固件首次启动自动创建
 （目录结构见 `AGENT.md §9.5`）。**拔卡也能跑**：回退片内 LittleFS。
 
