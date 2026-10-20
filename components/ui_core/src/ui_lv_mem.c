@@ -44,27 +44,33 @@
 #include "esp_heap_caps.h"
 
 /**
- * 是否正在「画字」的分配区间。
+ * 「画字」区间的嵌套层数。
  *
- * 注意这是一个简单的全局标志，不是线程局部变量：LVGL 的绘制都在 LVGL 任务
- * 上跑，其它任务即使恰好在这个区间里分配，也只是慢一点（拿到 PSRAM 而已），
+ * 用计数器而不是布尔量：万一有一天出现嵌套（内层的 leave() 先跑），
+ * 布尔量会把外层的区间也一起关掉，那部分缓存元数据就会回到内部堆。
+ * 计数器没有这个问题。
+ *
+ * 这是一个简单的全局量，不是线程局部变量：LVGL 的绘制都在 LVGL 任务上跑，
+ * 其它任务即使恰好在这个区间里分配，也只是慢一点（拿到 PSRAM 而已），
  * 不会出错。真正要紧的是「画字的那次分配一定要进 PSRAM」。
  */
-static volatile bool s_font_scope;
+static volatile int s_font_scope;
 
 void ui_lv_mem_font_scope_enter(void)
 {
-    s_font_scope = true;
+    s_font_scope++;
 }
 
 void ui_lv_mem_font_scope_leave(void)
 {
-    s_font_scope = false;
+    if (s_font_scope > 0) {
+        s_font_scope--;
+    }
 }
 
 bool ui_lv_mem_in_font_scope(void)
 {
-    return s_font_scope;
+    return s_font_scope > 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -94,7 +100,7 @@ void lv_mem_remove_pool(lv_mem_pool_t pool)
 
 void *lv_malloc_core(size_t size)
 {
-    if (s_font_scope) {
+    if (ui_lv_mem_in_font_scope()) {
         /* Glyph cache metadata: it is big, cold and long-lived - exactly what
          * PSRAM is for. */
         void *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -116,7 +122,7 @@ void *lv_realloc_core(void *p, size_t new_size)
         return lv_malloc_core(new_size);
     }
 
-    if (s_font_scope) {
+    if (ui_lv_mem_in_font_scope()) {
         /*
          * A block that lives in PSRAM has to stay there.
          *
