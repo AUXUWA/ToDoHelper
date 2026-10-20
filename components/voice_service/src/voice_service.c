@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "bsp/esp32_s31_korvo.h"
 #include "http_router.h"
 #include "storage_manager.h"
 #include "th_bsp.h"
@@ -107,6 +108,23 @@ bool voice_service_microphone_available(void)
 bool voice_service_speaker_available(void)
 {
     return s_speaker_ok;
+}
+
+bool voice_service_microphone_capable(void)
+{
+    /* The board has a microphone (the BSP says so); whether the codec has been
+     * started is a different question - see voice_service_audio_ready(). */
+    return BSP_CAPS_AUDIO_MIC != 0;
+}
+
+bool voice_service_speaker_capable(void)
+{
+    return BSP_CAPS_AUDIO_SPEAKER != 0;
+}
+
+bool voice_service_audio_ready(void)
+{
+    return s_audio_ready;
 }
 
 esp_err_t voice_service_ensure_audio(void)
@@ -266,15 +284,36 @@ static void record_task(void *arg)
     int32_t acc[VOICE_DECIMATE] = { 0 };
     size_t acc_index = 0;
     int32_t peak = 0;
+    int read_error_logged = 0;
 
     while (!s_stop_requested && produced < VOICE_MAX_SAMPLES) {
-        const int got = esp_codec_dev_read(mic, chunk, sizeof(chunk));
-        if (got <= 0) {
+        /*
+         * esp_codec_dev_read() returns an **error code**, not a byte count:
+         * 0 (ESP_CODEC_DEV_OK) means the read succeeded, negative means it
+         * failed (no data yet / timeout). The byte count is not exposed by
+         * that API - the data interface blocks until the buffer is full or the
+         * timeout expires, so a successful read means the whole chunk is
+         * valid.
+         *
+         * (The first version of this loop read it as a byte count, so every
+         * successful read looked like "0 bytes" and the buffer was thrown
+         * away - the microphone looked dead when it was not.)
+         */
+        const int ret = esp_codec_dev_read(mic, chunk, sizeof(chunk));
+        if (ret != 0) {
+            /* Log the first failure only: the reason is what tells "no samples
+             * because the codec never clocks out data" from "no samples because
+             * the read API works differently than I assumed". */
+            if (read_error_logged == 0) {
+                read_error_logged = 1;
+                SYS_LOGW(TAG, "capture read failed: %d (0x%x); no samples yet",
+                         ret, (unsigned)ret);
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
-        const size_t samples = (size_t)got / sizeof(int16_t);
+        const size_t samples = sizeof(chunk) / sizeof(int16_t);
         for (size_t i = 0; i + 1 < samples; i += VOICE_CODEC_CHANNELS) {
             /* Downmix to mono first, then decimate 48 kHz -> 16 kHz. */
             const int32_t mono = ((int32_t)chunk[i] + (int32_t)chunk[i + 1]) / 2;
@@ -819,18 +858,25 @@ voice_wake_mode_t voice_service_get_wake_mode(void)
 
 static esp_err_t voice_status_get_handler(httpd_req_t *req)
 {
-    /* The audio is brought up lazily, so "microphone: false" would otherwise
-     * only mean "nobody asked yet". Bring it up now: the question behind this
-     * call is exactly "can this board do voice?". */
-    (void)voice_service_ensure_audio();
-
+    /*
+     * Report the board's **capability** without bringing the audio up.
+     *
+     * Bringing it up costs ~20 KB of internal RAM (the I2S DMA buffers and the
+     * codec handles) and it is never released - so a status query must not do
+     * it. Before this change, merely expanding the web console's AI section
+     * permanently took that RAM.
+     *
+     * "audio_ready" says whether the hardware has actually been started yet
+     * (it starts when a voice feature is used).
+     */
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) {
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "voice status");
     }
 
-    cJSON_AddBoolToObject(root, "microphone", voice_service_microphone_available());
-    cJSON_AddBoolToObject(root, "speaker", voice_service_speaker_available());
+    cJSON_AddBoolToObject(root, "microphone", voice_service_microphone_capable());
+    cJSON_AddBoolToObject(root, "speaker", voice_service_speaker_capable());
+    cJSON_AddBoolToObject(root, "audio_ready", voice_service_audio_ready());
     cJSON_AddBoolToObject(root, "recording", voice_service_is_recording());
     cJSON_AddBoolToObject(root, "asr_configured", voice_service_asr_configured());
     cJSON_AddBoolToObject(root, "tts_configured", voice_service_tts_configured());

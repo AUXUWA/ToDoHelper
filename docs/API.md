@@ -1300,10 +1300,11 @@ curl -X POST http://todohelper.local/api/v1/ai/chat \
 缓冲在 PSRAM（10 s = 320 KB），落盘 `ai/rec_<uptime_ms>.pcm`（无 WAV 头）。
 **回放**：16 kHz 单声道 → 最近邻升采样 → 48 kHz 立体声 → codec。
 
-**⚠️ 硬件现状（v1.9.0 真机实测）**：codec 能起来（`mic=1 speaker=1`），
-但**采集通路一个样本都收不到**（2 秒录音 = 0 ms）。所以「语音输入」这一半目前
-是**待定**状态，设备上会自动降级成文字输入。证据与两条假设见
-`docs/ROADMAP_v1.9.0.md` §2。调试 shell 的 `audio [ms]` 命令可以随时复测。
+**硬件现状（v1.9.3 真机实测）**：codec 能起来（`mic=1 speaker=1`），
+**麦克风也真的能录到东西**（1.5 秒录到 1466 ms、峰值 3124/32767）。
+（v1.9.0 那句「采集通路一个样本都收不到」是本工程的 bug ——
+`esp_codec_dev_read()` 返回错误码而不是字节数，见 `docs/ROADMAP_v1.9.0.md` §2。）
+调试 shell 的 `audio [ms]` 命令可以随时复测。
 
 ---
 
@@ -1446,7 +1447,7 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | POST | `/api/v1/ai/config` | ai_service | 设置 API Key / 模型 / 轮数。**强制鉴权**，响应不回显 Key | ✅ 200（需 token） |
 | GET | `/api/v1/ai/config` | ai_service | **v1.9.0 新增**：读当前配置状态（`model` / `has_api_key` / `history_rounds` / `state`），**不回显 Key** | ✅ 200 |
 | POST | `/api/v1/ai/abort` | ai_service | 中断正在进行的流式回答 | ✅ 200 |
-| GET | `/api/v1/voice/status` | voice_service | 录音/回放可用性与 ASR/TTS 端点配置状态（**v1.9.0 起会真的把音频外设起起来再回答**） | ✅ 200 |
+| GET | `/api/v1/voice/status` | voice_service | 板子有没有麦克风/扬声器（`microphone`/`speaker` 是**能力**，不占用内存）、音频外设是否已启动（`audio_ready`）、ASR/TTS 端点是否已配 | ✅ 200 |
 | POST | `/api/v1/voice/config` | voice_service | 配置 ASR/TTS HTTP 端点（协议见 §ai_service / §voice_service） | ✅ 200 |
 | GET | `/api/v1/maimemo/status` | maimemo_client | 墨墨令牌**掩码**与上次同步进度；**不碰网络**（可安全轮询）。见 §2.5 | ✅ 200 |
 | POST | `/api/v1/maimemo/config` | maimemo_client | body `{"token","push","verify","clear"}`；**令牌只写不读**。见 §2.5 | ✅ 200（写方法→需 token） |

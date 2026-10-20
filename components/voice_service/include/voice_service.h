@@ -85,6 +85,21 @@ bool voice_service_microphone_available(void);
 bool voice_service_speaker_available(void);
 
 /**
+ * @brief True when the board has a microphone at all (BSP capability).
+ *
+ * Different from voice_service_microphone_available(): that one says "the codec
+ * has been started and the microphone path came up", this one says "this board
+ * has a microphone" - and it costs nothing to answer.
+ */
+bool voice_service_microphone_capable(void);
+
+/** @brief True when the board has a speaker/PA path at all (BSP capability). */
+bool voice_service_speaker_capable(void);
+
+/** @brief True when the audio hardware has actually been started. */
+bool voice_service_audio_ready(void);
+
+/**
  * @brief Bring the audio hardware up now (it is normally lazy) and report.
  *
  * @return ESP_OK when at least one of the microphone / speaker came up,
