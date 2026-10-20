@@ -17,6 +17,7 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "http_router.h"
@@ -55,6 +56,15 @@ static volatile bool s_recording;
 static volatile bool s_stop_requested;
 static volatile bool s_playing;
 
+/** Audio bring-up state (see voice_service_ensure_audio()). */
+static volatile bool s_init_task_running;
+static volatile bool s_init_done;
+static volatile esp_err_t s_init_result;
+static SemaphoreHandle_t s_init_sem;
+
+/** How long the codec gets to answer before we stop waiting for it. */
+#define VOICE_INIT_TIMEOUT_MS 3000
+
 static int16_t *s_pcm;          /* VOICE_MAX_SAMPLES mono samples, in PSRAM */
 static size_t s_pcm_count;
 static uint32_t s_pcm_ms;
@@ -77,6 +87,7 @@ static int16_t s_play_buf[VOICE_PLAY_CHUNK];
 /* ------------------------------------------------------------------------ */
 
 static void ensure_audio(void);
+static void audio_init_task(void *arg);
 
 bool voice_service_microphone_available(void)
 {
@@ -93,8 +104,54 @@ esp_err_t voice_service_ensure_audio(void)
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-    ensure_audio();
-    return (s_mic_ok || s_speaker_ok) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    if (s_audio_ready) {
+        return (s_mic_ok || s_speaker_ok) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * The bring-up runs in its own task with a timeout.
+     *
+     * It talks to the codec over I2C, and a codec that never answers would
+     * block the caller forever - and the caller is often the HTTP handler,
+     * so a wedged codec would take down the **whole HTTP server** with it.
+     * (That is exactly what happened when the audio path was tried with a
+     * mismatched MCLK setup: the device stayed alive but stopped answering
+     * HTTP.) So: own task, bounded wait, and the caller moves on.
+     */
+    if (s_init_sem == NULL) {
+        s_init_sem = xSemaphoreCreateMutex();
+        if (s_init_sem == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_init_task_running) {
+        return ESP_ERR_INVALID_STATE; /* someone else is already trying */
+    }
+    s_init_task_running = true;
+    s_init_done = false;
+    s_init_result = ESP_FAIL;
+
+    if (xTaskCreate(audio_init_task, "th_audio", 4096, NULL, 4, NULL) != pdPASS) {
+        s_init_task_running = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Wait at most VOICE_INIT_TIMEOUT_MS for the codec to answer. */
+    for (int waited = 0; waited < VOICE_INIT_TIMEOUT_MS; waited += 50) {
+        if (s_init_done) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (!s_init_done) {
+        SYS_LOGW(TAG, "audio bring-up did not finish in %d ms; giving up on it",
+                 (int)VOICE_INIT_TIMEOUT_MS);
+        s_init_task_running = false;
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_init_task_running = false;
+    return s_init_result;
 }
 
 int32_t voice_service_last_peak(void)
@@ -156,6 +213,18 @@ static void ensure_audio(void)
     if (!s_speaker_ok) {
         SYS_LOGW(TAG, "no speaker; replies will be text only (FR7 degradation)");
     }
+}
+
+/**
+ * The bring-up itself, in its own task (see voice_service_ensure_audio()).
+ */
+static void audio_init_task(void *arg)
+{
+    (void)arg;
+    ensure_audio();
+    s_init_result = (s_mic_ok || s_speaker_ok) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    s_init_done = true;
+    vTaskDelete(NULL);
 }
 
 /* ------------------------------------------------------------------------ */
