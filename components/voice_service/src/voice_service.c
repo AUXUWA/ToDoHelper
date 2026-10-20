@@ -58,6 +58,11 @@ static volatile bool s_playing;
 static int16_t *s_pcm;          /* VOICE_MAX_SAMPLES mono samples, in PSRAM */
 static size_t s_pcm_count;
 static uint32_t s_pcm_ms;
+/** Peak absolute amplitude of the last capture (0 = silence, 32767 = full scale).
+ *
+ * The only way to tell a working microphone from a muted one on the device:
+ * a capture that is all zeros means the codec is not delivering samples. */
+static int32_t s_pcm_peak;
 
 static char s_asr_url[192];
 static char s_tts_url[192];
@@ -71,6 +76,8 @@ static int16_t s_play_buf[VOICE_PLAY_CHUNK];
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------ */
 
+static void ensure_audio(void);
+
 bool voice_service_microphone_available(void)
 {
     return s_mic_ok;
@@ -79,6 +86,25 @@ bool voice_service_microphone_available(void)
 bool voice_service_speaker_available(void)
 {
     return s_speaker_ok;
+}
+
+esp_err_t voice_service_ensure_audio(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ensure_audio();
+    return (s_mic_ok || s_speaker_ok) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+int32_t voice_service_last_peak(void)
+{
+    return s_pcm_peak;
+}
+
+uint32_t voice_service_last_duration_ms(void)
+{
+    return s_pcm_ms;
 }
 
 bool voice_service_is_recording(void)
@@ -160,6 +186,7 @@ static void record_task(void *arg)
     uint32_t frames_since_decimate = 0;
     int32_t acc[VOICE_DECIMATE] = { 0 };
     size_t acc_index = 0;
+    int32_t peak = 0;
 
     while (!s_stop_requested && produced < VOICE_MAX_SAMPLES) {
         const int got = esp_codec_dev_read(mic, chunk, sizeof(chunk));
@@ -182,6 +209,11 @@ static void record_task(void *arg)
                 }
                 s_pcm[produced++] = (int16_t)(sum / (int32_t)VOICE_DECIMATE);
                 acc_index = 0;
+                const int32_t sample = sum / (int32_t)VOICE_DECIMATE;
+                const int32_t magnitude = (sample < 0) ? -sample : sample;
+                if (magnitude > peak) {
+                    peak = magnitude;
+                }
                 if (produced >= VOICE_MAX_SAMPLES) {
                     break;
                 }
@@ -193,6 +225,7 @@ static void record_task(void *arg)
     esp_codec_dev_close(mic);
     s_pcm_count = produced;
     s_pcm_ms = (uint32_t)((produced * 1000) / VOICE_SAMPLE_RATE);
+    s_pcm_peak = peak;
     s_recording = false;
 
     voice_recording_t info = {
@@ -286,6 +319,53 @@ static size_t expand_to_codec(const int16_t *mono, size_t count, int16_t *out, s
     return o;
 }
 
+/**
+ * Play mono 16 kHz samples through the speaker.
+ *
+ * Shared by the file playback and the cloud TTS: both end up with the same
+ * format (16 kHz / 16 bit / mono).
+ */
+static esp_err_t play_mono_pcm(const int16_t *mono, size_t count)
+{
+    if (mono == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_audio();
+    if (!s_speaker_ok) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    esp_codec_dev_handle_t spk = speaker_handle();
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = VOICE_CODEC_RATE,
+        .channel = VOICE_CODEC_CHANNELS,
+        .bits_per_sample = VOICE_CODEC_BITS,
+    };
+
+    if (esp_codec_dev_open(spk, &fs) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    (void)esp_codec_dev_set_out_vol(spk, 70);
+
+    s_playing = true;
+    size_t done = 0;
+    while (done < count && s_playing) {
+        const size_t chunk = (count - done > 256) ? 256 : (count - done);
+        const size_t out = expand_to_codec(&mono[done], chunk, s_play_buf, VOICE_PLAY_CHUNK);
+        if (out > 0 && esp_codec_dev_write(spk, s_play_buf, out * sizeof(int16_t)) != ESP_OK) {
+            break;
+        }
+        done += chunk;
+    }
+
+    esp_codec_dev_close(spk);
+    s_playing = false;
+
+    (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, NULL, 0);
+    return ESP_OK;
+}
+
 esp_err_t voice_service_play(const char *pcm_path)
 {
     if (pcm_path == NULL) {
@@ -293,11 +373,6 @@ esp_err_t voice_service_play(const char *pcm_path)
     }
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
-    }
-
-    ensure_audio();
-    if (!s_speaker_ok) {
-        return ESP_ERR_NOT_SUPPORTED;
     }
     if (!storage_available()) {
         return ESP_ERR_INVALID_STATE;
@@ -322,37 +397,9 @@ esp_err_t voice_service_play(const char *pcm_path)
         return ESP_FAIL;
     }
 
-    esp_codec_dev_handle_t spk = speaker_handle();
-    esp_codec_dev_sample_info_t fs = {
-        .sample_rate = VOICE_CODEC_RATE,
-        .channel = VOICE_CODEC_CHANNELS,
-        .bits_per_sample = VOICE_CODEC_BITS,
-    };
-
-    if (esp_codec_dev_open(spk, &fs) != ESP_OK) {
-        free(raw);
-        return ESP_FAIL;
-    }
-    (void)esp_codec_dev_set_out_vol(spk, 70);
-
-    s_playing = true;
-    const size_t total = len / sizeof(int16_t);
-    size_t done = 0;
-    while (done < total && s_playing) {
-        const size_t chunk = (total - done > 256) ? 256 : (total - done);
-        const size_t out = expand_to_codec(&raw[done], chunk, s_play_buf, VOICE_PLAY_CHUNK);
-        if (out > 0 && esp_codec_dev_write(spk, s_play_buf, out * sizeof(int16_t)) != ESP_OK) {
-            break;
-        }
-        done += chunk;
-    }
-
-    esp_codec_dev_close(spk);
+    const esp_err_t err = play_mono_pcm(raw, len / sizeof(int16_t));
     free(raw);
-    s_playing = false;
-
-    (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, NULL, 0);
-    return ESP_OK;
+    return err;
 }
 
 esp_err_t voice_service_stop_play(void)
@@ -388,7 +435,10 @@ static esp_err_t voice_http_event(esp_http_client_event_t *evt)
 
     if (ctx->buf == NULL) {
         ctx->cap = 4096;
-        ctx->buf = malloc(ctx->cap);
+        /* PSRAM: a TTS answer is raw PCM (16 kHz / 16 bit / mono = 32 KB per
+         * second), so the response can be hundreds of KB - that never fits in
+         * internal RAM. */
+        ctx->buf = heap_caps_malloc(ctx->cap, MALLOC_CAP_SPIRAM);
         if (ctx->buf == NULL) {
             ctx->overflow = true;
             return ESP_OK;
@@ -400,7 +450,9 @@ static esp_err_t voice_http_event(esp_http_client_event_t *evt)
         while (grown < ctx->len + (size_t)evt->data_len + 1) {
             grown *= 2;
         }
-        char *bigger = realloc(ctx->buf, grown);
+        /* Explicit PSRAM caps: plain realloc() would move a small block into
+         * internal RAM (and a big one could not be allocated there at all). */
+        char *bigger = heap_caps_realloc(ctx->buf, grown, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (bigger == NULL) {
             ctx->overflow = true;
             return ESP_OK;
@@ -416,13 +468,19 @@ static esp_err_t voice_http_event(esp_http_client_event_t *evt)
 }
 
 /**
- * POST @p body and hand the response text back through @p response (heap, the
- * caller frees it).
+ * POST @p body and hand the response back through @p response (heap, the
+ * caller frees it) and its byte length through @p response_len.
+ *
+ * The length matters for the TTS path: the answer is raw PCM, so it is not
+ * text and must not be measured with strlen().
  */
 static esp_err_t http_post(const char *url, const char *content_type, const void *body,
-                          size_t body_len, char **response)
+                          size_t body_len, char **response, size_t *response_len)
 {
     *response = NULL;
+    if (response_len != NULL) {
+        *response_len = 0;
+    }
 
     voice_body_t ctx = { 0 };
     const esp_http_client_config_t cfg = {
@@ -462,6 +520,9 @@ static esp_err_t http_post(const char *url, const char *content_type, const void
     }
 
     *response = ctx.buf;
+    if (response_len != NULL) {
+        *response_len = ctx.len;
+    }
     return ESP_OK;
 }
 
@@ -518,7 +579,7 @@ esp_err_t voice_service_transcribe_last(void)
 
     char *response = NULL;
     esp_err_t err = http_post(s_asr_url, "application/octet-stream", s_pcm,
-                             s_pcm_count * sizeof(int16_t), &response);
+                             s_pcm_count * sizeof(int16_t), &response, NULL);
     if (err != ESP_OK) {
         const char *empty = "";
         (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_ASR_DONE, empty, 1);
@@ -526,7 +587,8 @@ esp_err_t voice_service_transcribe_last(void)
     }
 
     char text[VOICE_TEXT_MAX] = { 0 };
-    cJSON *root = cJSON_Parse(response);
+    /* Depth-limited parse: a malformed answer must not blow the stack. */
+    cJSON *root = sys_json_parse(response, 16);
     if (root != NULL) {
         const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "text");
         if (cJSON_IsString(item)) {
@@ -563,13 +625,97 @@ esp_err_t voice_service_speak(const char *text)
     }
 
     char *response = NULL;
-    esp_err_t err = http_post(s_tts_url, "application/json", json, strlen(json), &response);
+    size_t response_len = 0;
+    esp_err_t err = http_post(s_tts_url, "application/json", json, strlen(json),
+                              &response, &response_len);
     cJSON_free(json);
     if (err != ESP_OK) {
         return err;
     }
+
+    /* The endpoint answers with raw PCM (16 kHz / 16 bit / mono) - play it. */
+    const size_t samples = response_len / sizeof(int16_t);
+    if (samples == 0) {
+        SYS_LOGW(TAG, "TTS endpoint returned no audio");
+        free(response);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const esp_err_t play_err = play_mono_pcm((const int16_t *)response, samples);
     free(response);
-    return ESP_ERR_NOT_SUPPORTED;
+    return play_err;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Background requests (the ASR / TTS calls are blocking)                    */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * The ASR request in this component's own task.
+ *
+ * The HTTP round trip to a cloud ASR can take seconds; doing that on the LVGL
+ * task would freeze the whole UI. The result arrives as VOICE_EVENT_ASR_DONE.
+ */
+static void asr_task(void *arg)
+{
+    (void)arg;
+    (void)voice_service_transcribe_last();
+    vTaskDelete(NULL);
+}
+
+esp_err_t voice_service_start_transcribe(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_pcm_count == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xTaskCreate(asr_task, "th_asr", 4096, NULL, 4, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/**
+ * The TTS request in this component's own task.
+ *
+ * The HTTP round trip plus the playback are both blocking; the result arrives
+ * as VOICE_EVENT_PLAY_DONE.
+ */
+static void tts_task(void *arg)
+{
+    (void)arg;
+    const char *text = (const char *)arg;
+    (void)voice_service_speak(text);
+    vTaskDelete(NULL);
+}
+
+esp_err_t voice_service_speak_async(const char *text)
+{
+    if (text == NULL || text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* The text has to outlive this call, so it gets its own copy. */
+    const size_t len = strlen(text) + 1;
+    char *copy = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        copy = malloc(len);
+    }
+    if (copy == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(copy, text, len);
+
+    if (xTaskCreate(tts_task, "th_tts", 4096, copy, 4, NULL) != pdPASS) {
+        free(copy);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -591,6 +737,11 @@ voice_wake_mode_t voice_service_get_wake_mode(void)
 
 static esp_err_t voice_status_get_handler(httpd_req_t *req)
 {
+    /* The audio is brought up lazily, so "microphone: false" would otherwise
+     * only mean "nobody asked yet". Bring it up now: the question behind this
+     * call is exactly "can this board do voice?". */
+    (void)voice_service_ensure_audio();
+
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) {
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "voice status");
@@ -620,7 +771,8 @@ static esp_err_t voice_config_post_handler(httpd_req_t *req)
         return http_reply_bad_request(req, "missing body");
     }
 
-    cJSON *root = cJSON_Parse(body);
+    /* Depth-limited parse: a malformed body must not blow the stack. */
+    cJSON *root = sys_json_parse(body, 16);
     free(body);
     if (root == NULL) {
         return http_reply_bad_request(req, "invalid json");

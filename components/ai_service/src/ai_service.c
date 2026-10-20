@@ -420,7 +420,7 @@ static void stream_append(ai_stream_ctx_t *ctx, const char *text)
         return;
     }
     if (ctx->full == NULL) {
-        ctx->full = malloc(AI_MAX_RESPONSE);
+        ctx->full = heap_caps_malloc(AI_MAX_RESPONSE, MALLOC_CAP_SPIRAM);
         if (ctx->full == NULL) {
             return;
         }
@@ -504,7 +504,7 @@ static esp_err_t ai_http_event(esp_http_client_event_t *evt)
         return ESP_OK;
     }
     if (ctx->body.buf == NULL) {
-        ctx->body.buf = malloc(AI_MAX_RESPONSE);
+        ctx->body.buf = heap_caps_malloc(AI_MAX_RESPONSE, MALLOC_CAP_SPIRAM);
         if (ctx->body.buf == NULL) {
             ctx->body.overflow = true;
             return ESP_OK;
@@ -739,20 +739,30 @@ esp_err_t ai_service_chat_stream(const char *text,
 /* Worker task (used by the UI path)                                          */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Forwards one streamed delta to the UI.
+ *
+ * The UI has had the progressive rendering ready for a long time
+ * (stream_chunk() in page_ai_chat.c) - it was simply never fed: the worker
+ * used the blocking call and handed over the whole answer as one chunk.
+ */
+static esp_err_t ai_stream_chunk_cb(const char *text, void *arg)
+{
+    (void)arg;
+    if (text == NULL || text[0] == '\0') {
+        return ESP_OK;
+    }
+    return sys_event_post_to(AI_EVENT, AI_EVENT_REPLY_CHUNK, text, strlen(text) + 1);
+}
+
 static void ai_task(void *arg)
 {
     (void)arg;
     ai_request_t request;
 
     while (xQueueReceive(s_requests, &request, portMAX_DELAY) == pdTRUE) {
-        char reply[AI_MESSAGE_MAX];
-        const esp_err_t err = ai_service_chat(request.text, reply, sizeof(reply));
-        if (err == ESP_OK) {
-            /* Chunks let the UI render progressively; a single chunk is fine
-             * for the non-streaming path. */
-            (void)sys_event_post_to(AI_EVENT, AI_EVENT_REPLY_CHUNK, reply,
-                                    strlen(reply) + 1);
-        }
+        /* Streaming: the answer appears on the screen piece by piece. */
+        (void)ai_service_chat_stream(request.text, ai_stream_chunk_cb, NULL);
     }
     vTaskDelete(NULL);
 }

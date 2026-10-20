@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "ai_service.h"
+#include "voice_service.h"
 #include "pages_internal.h"
 #include "esp_attr.h"
 
@@ -580,6 +581,123 @@ static void abort_clicked_cb(lv_event_t *e)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Voice                                                                     */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * 语音提问：录音 → 识别 → 把识别出来的文字当成提问发出去。
+ *
+ * 录音与识别都是「慢」操作，分别在 voice_service 自己的任务里跑；
+ * 这一页只负责按下按钮、把结果接住。
+ */
+static void mic_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (voice_service_is_recording()) {
+        (void)voice_service_stop_record();
+        ui_toast("录音已停止，正在识别…");
+        return;
+    }
+
+    if (!voice_service_microphone_available() && voice_service_ensure_audio() != ESP_OK) {
+        ui_toast("这台设备没有麦克风，请用键盘或网页端提问");
+        return;
+    }
+    if (!voice_service_asr_configured()) {
+        ui_toast("没有配置语音识别端点（网页端 → AI 对话与语音）");
+        return;
+    }
+
+    const esp_err_t err = voice_service_start_record();
+    if (err != ESP_OK) {
+        ui_toast("录音启动失败：%s", esp_err_to_name(err));
+        return;
+    }
+    ui_toast("录音中…再点一次结束");
+}
+
+/** 朗读上一条回答（需要配了 TTS 端点）。 */
+static void speak_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+
+    if (!voice_service_tts_configured()) {
+        ui_toast("没有配置语音合成端点（网页端 → AI 对话与语音）");
+        return;
+    }
+    if (!voice_service_speaker_available() && voice_service_ensure_audio() != ESP_OK) {
+        ui_toast("这台设备没有扬声器");
+        return;
+    }
+
+    const char *reply = ai_service_get_last_reply();
+    if (reply == NULL || reply[0] == '\0') {
+        ui_toast("还没有可朗读的回答");
+        return;
+    }
+
+    const esp_err_t err = voice_service_speak_async(reply);
+    if (err != ESP_OK) {
+        ui_toast("朗读启动失败：%s", esp_err_to_name(err));
+    }
+}
+
+/**
+ * 语音事件：录音结束 / 识别完成 / 播放结束。
+ *
+ * 识别出来的文字直接当成一次提问发出去 —— 语音只是「另一种打字方式」。
+ *
+ * 用 ui_event_subscribe() 而不是 ui_event_bind()：两个事件基（AI / VOICE）
+ * 的事件 id 是各自从 0 开始的，绑到同一个页面的 on_event 上会分不清谁是谁。
+ */
+static esp_err_t voice_event_cb(int32_t event_id, void *data)
+{
+    switch (event_id) {
+    case VOICE_EVENT_RECORD_DONE: {
+        const voice_recording_t *rec = (const voice_recording_t *)data;
+        if (rec == NULL) {
+            break;
+        }
+        if (rec->count == 0) {
+            /* 采集一个样本都没有：codec 起来了但没有数据进来。 */
+            ui_toast("没有采集到声音");
+            break;
+        }
+        if (voice_service_last_peak() == 0) {
+            /* 有样本但全是零：麦克风没有信号。 */
+            ui_toast("麦克风没有信号");
+            break;
+        }
+        const esp_err_t err = voice_service_start_transcribe();
+        if (err != ESP_OK) {
+            ui_toast("识别启动失败：%s", esp_err_to_name(err));
+        }
+        break;
+    }
+    case VOICE_EVENT_ASR_DONE: {
+        const char *text = (const char *)data;
+        if (text == NULL || text[0] == '\0') {
+            ui_toast("没听清");
+            break;
+        }
+        /* 识别出来的文字当成一次提问。 */
+        add_bubble(text, true);
+        strlcpy(s_pending_user, text, sizeof(s_pending_user));
+        stream_finish();
+        (void)ai_service_chat_async(text);
+        break;
+    }
+    case VOICE_EVENT_PLAY_DONE:
+        ui_toast("朗读完成");
+        break;
+    default:
+        break;
+    }
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Page                                                                      */
 /* ------------------------------------------------------------------------ */
 
@@ -627,6 +745,8 @@ static esp_err_t ai_chat_create(lv_obj_t *parent)
         lv_color_t color;
     } buttons[] = {
         { "输入问题", send_clicked_cb, UI_COLOR_PRIMARY },
+        { "语音", mic_clicked_cb, UI_COLOR_SURFACE_ALT },
+        { "朗读", speak_clicked_cb, UI_COLOR_SURFACE_ALT },
         { "新对话", new_clicked_cb, UI_COLOR_SURFACE_ALT },
         { "中断", abort_clicked_cb, UI_COLOR_SURFACE_ALT },
     };
@@ -649,6 +769,15 @@ static esp_err_t ai_chat_create(lv_obj_t *parent)
     (void)ui_event_bind(AI_EVENT, AI_EVENT_REPLY_CHUNK, UI_PAGE_AI_CHAT, AI_MESSAGE_MAX);
     (void)ui_event_bind(AI_EVENT, AI_EVENT_REPLY_DONE, UI_PAGE_AI_CHAT, 0);
     (void)ui_event_bind(AI_EVENT, AI_EVENT_ERROR, UI_PAGE_AI_CHAT, sizeof(esp_err_t));
+
+    /* 语音事件走单独的订阅：VOICE_EVENT 与 AI_EVENT 的 id 各自从 0 开始，
+     * 绑到同一个页面的 on_event 上会分不清。 */
+    (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_RECORD_DONE,
+                             sizeof(voice_recording_t), voice_event_cb);
+    (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_ASR_DONE, VOICE_TEXT_MAX,
+                             voice_event_cb);
+    (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, 0, voice_event_cb);
+
     SYS_LOGD(TAG, "ai chat page built");
     return ESP_OK;
 }

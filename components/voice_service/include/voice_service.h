@@ -85,6 +85,35 @@ bool voice_service_microphone_available(void);
 bool voice_service_speaker_available(void);
 
 /**
+ * @brief Bring the audio hardware up now (it is normally lazy) and report.
+ *
+ * @return ESP_OK when at least one of the microphone / speaker came up,
+ *         ESP_ERR_NOT_FOUND when the codec is not on this board.
+ *
+ * Calling this costs internal RAM (the I2S DMA buffers), so it is not done at
+ * boot - only when a voice feature is actually used.
+ */
+esp_err_t voice_service_ensure_audio(void);
+
+/**
+ * @brief Peak absolute amplitude of the last capture (0 = silence).
+ *
+ * A capture that produced samples but a peak of 0 means the codec is running
+ * but the microphone is not delivering anything - the only way to tell that
+ * apart from "no microphone at all" on the device.
+ */
+int32_t voice_service_last_peak(void);
+
+/**
+ * @brief Duration of the last capture in milliseconds (0 = nothing captured).
+ *
+ * Together with the peak this tells the two failure modes apart:
+ * 0 ms  -> the codec delivered no samples at all;
+ * > 0 ms with a peak of 0 -> samples, but silence (the microphone is mute).
+ */
+uint32_t voice_service_last_duration_ms(void);
+
+/**
  * @brief Start capturing into the internal PSRAM buffer.
  *
  * Posts VOICE_EVENT_WAKE immediately (the button/touch path) and
@@ -150,6 +179,23 @@ bool voice_service_tts_configured(void);
  * configured). Blocking: call from a task, never from the LVGL task.
  */
 esp_err_t voice_service_transcribe_last(void);
+
+/**
+ * @brief Run the ASR request in this component's own task.
+ *
+ * The result arrives as VOICE_EVENT_ASR_DONE. Safe to call from the LVGL
+ * task (the request itself does not block it).
+ */
+esp_err_t voice_service_start_transcribe(void);
+
+/**
+ * @brief Synthesise and play @p text in the background.
+ *
+ * The HTTP round trip to the TTS endpoint and the playback are both blocking,
+ * so they run in this component's own task; VOICE_EVENT_PLAY_DONE marks the
+ * end. Safe to call from the LVGL task.
+ */
+esp_err_t voice_service_speak_async(const char *text);
 
 /**
  * @brief Synthesise @p text and play it.

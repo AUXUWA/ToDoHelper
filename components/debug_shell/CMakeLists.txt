@@ -9,4 +9,6 @@ idf_component_register(
     # back (it keeps a cached "is a key configured" flag) and must not read the
     # key back out (requirement 8.8). L4 -> L3 is fine.
     ai_service
+    # voice_service: the audio hardware probe (debug shell `audio` command)
+    voice_service
 )

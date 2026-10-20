@@ -65,6 +65,7 @@
 #include "sys_utils.h"
 #include "ui_core.h"
 #include "ui_font_mem.h"
+#include "voice_service.h"
 
 /* lv_refr_now(): refresh the screen synchronously, so a redraw can be timed. */
 #include "core/lv_refr.h"
@@ -443,6 +444,63 @@ static void cmd_ftstats(dbg_out_t *o)
                    (unsigned)stats[i].glyph_entries,
                    (unsigned)stats[i].bitmap_entries);
     }
+}
+
+/**
+ * Audio hardware probe.
+ *
+ * The microphone and the speaker were never verified on this board (the
+ * codec is brought up lazily, so the boot log says nothing about it). This
+ * command answers the two questions that matter:
+ *   1. does the codec come up at all?
+ *   2. does the microphone deliver samples, or is it mute?
+ *
+ * It runs the capture in voice_service's own task, so the UI is not blocked.
+ */
+static void cmd_audio(dbg_out_t *o, const char *arg)
+{
+    const esp_err_t err = voice_service_ensure_audio();
+    out_printf(o, "audio init: %s (mic=%d speaker=%d)\n",
+               esp_err_to_name(err),
+               voice_service_microphone_available() ? 1 : 0,
+               voice_service_speaker_available() ? 1 : 0);
+    out_printf(o, "internal free %u B, largest %u B\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)sys_heap_largest_internal());
+
+    if (arg == NULL) {
+        return;
+    }
+
+    const int ms = atoi(arg);
+    if (ms < 200 || ms > 10000) {
+        out_printf(o, "usage: audio [record_ms]  (200..10000)\n");
+        return;
+    }
+
+    const esp_err_t rec = voice_service_start_record();
+    out_printf(o, "record %d ms -> %s\n", ms, esp_err_to_name(rec));
+    if (rec != ESP_OK) {
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS((uint32_t)ms));
+    (void)voice_service_stop_record();
+
+    /* Wait for the capture task to finish and publish the result. */
+    for (int i = 0; i < 50 && voice_service_is_recording(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    const int32_t peak = voice_service_last_peak();
+    const uint32_t captured_ms = voice_service_last_duration_ms();
+    out_printf(o, "captured %u ms, peak %d / 32767%s\n", (unsigned)captured_ms, (int)peak,
+               (captured_ms == 0) ? "  <- the codec delivered no samples at all"
+                                   : ((peak == 0) ? "  <- silence: the microphone delivers nothing"
+                                                   : ""));
+    out_printf(o, "internal free %u B, largest %u B\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)sys_heap_largest_internal());
 }
 
 static void cmd_tasks(dbg_out_t *o)
@@ -1212,6 +1270,8 @@ static void dbg_exec(char *line, dbg_out_t *out)
         cmd_status(out);
     } else if (strcmp(cmd, "heap") == 0) {
         cmd_heap(out);
+    } else if (strcmp(cmd, "audio") == 0) {
+        cmd_audio(out, a1);
     } else if (strcmp(cmd, "ftstats") == 0) {
         cmd_ftstats(out);
     } else if (strcmp(cmd, "tasks") == 0) {

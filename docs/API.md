@@ -88,8 +88,8 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
   `httpd_start()` 后调用一次 `http_router_attach()`。因此 `todo_manager`(L3) 不必依赖 `sync_server`(L4)。
 - **跨层通知**走 L0 `sys_notify()`，而不是调用 L4 的 `sync_server_broadcast_event()`。
 - `ui_pages` / `idle_face` 不被任何组件依赖，只有 `main` 依赖它们。
-- ⚠️ `ai_service`(L5) 的 `REQUIRES` 里含 `idle_face`(L4)，且它**未接入** `main/app_main.c` 的模块表
-  （`main/CMakeLists.txt` 也没有 `REQUIRES ai_service`）——详见 §5。
+- ⚠️ `ai_service`(L5) 的 `REQUIRES` 里含 `idle_face`(L4)（**由下向上的依赖**，与上面第一条规则相悖）。
+  它**已经接入** `main/app_main.c` 的模块表与 `main/CMakeLists.txt`（1.0.0 那句「未接入」是错的）——详见 §5。
 - ⚠️ **`word_service`(L3) 的 `REQUIRES` 里含 `maimemo_client`(L5)** —— 这是**由下向上的依赖**，
   与上面第一条规则相悖。1.3.0 的实现选择是"`word_service` 直接调用 `maimemo_fetch_today()`"
   （`word_cloud_refresh()`），而不是让 `maimemo_client` 订阅事件后回注，理由是云端队列要在
@@ -920,7 +920,10 @@ SSE 上限 **3** 个并发客户端（`SYNC_SSE_MAX_CLIENTS`；每个订阅者�
 > 长连接必须 `httpd_req_async_handler_begin()` 把 socket 交给自己的任务，结束时
 > `httpd_req_async_handler_complete()`。参考实现：`sync_server.c` 的
 > `events_get_handler()` + `sse_client_task()`。背景与实测见 `AGENT.md §9.0.1` 第 4 条。
-> （已知同类隐患：`/api/v1/ai/chat/stream` 与阻塞版 `/api/v1/ai/chat`，用户决定本轮不动。）
+> （`/api/v1/ai/chat` 与 `/api/v1/ai/chat/stream` **v1.5.0 起也改成了异步 handler**，
+> 不再是同类隐患；参考实现：`ai_service_http.c` 的 `ai_http_dispatch()` +
+> `th_ai_http` 任务。**注意**：异步 handler 结束时必须
+> `httpd_req_async_handler_complete()`，漏了就永久占住一个会话槽，整机不再 accept。）
 
 `lru_purge_enable=true` 时，socket 用满会关掉最久未用的会话，但**异步（SSE）会话不会被回收**
 （`esp_httpd_priv.h`：`for_async_req` 的 socket 不参与 LRU purge）。
@@ -1233,6 +1236,77 @@ I (xxx) TH:maimemo: pushed to the study plan: 1 accepted of 1 resolved (advance=
 
 ---
 
+### ai_service（L5，DeepSeek 对话；v1.9.0 补文档）
+
+- **目录 / 入口**：`components/ai_service/src/ai_service.c`（`ai_service_init()`）、
+  `ai_service_http.c`（`ai_service_register_http()`）
+- **对话接口**：`POST https://api.deepseek.com/chat/completions`（OpenAI 兼容格式），
+  鉴权用 `Authorization: Bearer <key>`，TLS 走系统 CA bundle
+- **模型白名单**：`deepseek-chat`（默认）/ `deepseek-reasoner`
+
+**路由（7 条）**
+
+| 方法 | 路径 | 请求 / 响应 |
+|---|---|---|
+| POST | `/api/v1/ai/chat` | `{"text":"问题"}` → `{"reply":"回答"}`。**v1.5.0 起异步**：handler 立刻把会话交给自有任务，AI 跑着的时候设备其它接口照常可用 |
+| POST | `/api/v1/ai/chat/stream` | `{"text":"问题"}` → `text/event-stream`，事件：`chunk`（`data: {"delta":"..."}`）→ `done` / `error` |
+| GET | `/api/v1/ai/config` | **v1.9.0 新增**（读状态）：`{"model","has_api_key","history_rounds","state"}` |
+| POST | `/api/v1/ai/config` | 字段：`api_key`（空串 = 清除）、`system_prompt`、`model`、`history_rounds`、`save_history` → 同上的状态 JSON。**响应绝不回显 Key** |
+| GET | `/api/v1/ai/history` | 对话历史。**强制鉴权** |
+| DELETE | `/api/v1/ai/history` | 清空历史。**强制鉴权** |
+| POST | `/api/v1/ai/abort` | 中断正在进行的回答 |
+
+```bash
+# 上位机配 Key（网页端「AI 对话与语音」分区也是这个接口）
+curl -X POST http://todohelper.local/api/v1/ai/config \
+     -H "Content-Type: application/json" -d '{"api_key":"sk-..."}'
+# 问一句
+curl -X POST http://todohelper.local/api/v1/ai/chat \
+     -H "Content-Type: application/json" -d '{"text":"用一句话打个招呼"}'
+```
+
+**令牌模型**：Key 存在 NVS `ai_api_key`，**只写不读** —— `ai_service_has_api_key()`、
+`POST /ai/config` 的响应、调试 shell 的 `cfg get ai_api_key` 三处都只回布尔。
+⚠️ NVS 没开加密，**Key 在 flash 上是明文**（`AGENT.md` §9.0.1.4 第 14 条）。
+
+**错误模型**：无 Key → 400 `no API key configured`；离线 → 503；Key 被拒（401/403）→
+503；超时 → 503。**没有重试** —— 一次网络抖动就是一次失败。
+
+**⚠️ 两个容易踩的点**：
+- `ai_service_set_system_prompt()` **会清空对话历史**（换角色设定 = 重新开始）。
+- 多轮历史是**内存态**（上限 24 条、按轮成对裁剪）；要落盘得打开 NVS `ai_save_hist`。
+
+### voice_service（L5，录音/回放与云端语音；v1.9.0 补文档）
+
+- **目录 / 入口**：`components/voice_service/src/voice_service.c`（`voice_service_init()`）
+- **硬件**：I2S-STD + ES8389 codec（`esp_codec_dev`），模拟麦走 codec 的 ADC，
+  功放由 `pa_pin = GPIO7` 控制。**音频是惰性起起来的**（省内部 RAM）
+
+**路由（2 条）**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/voice/status` | `{"microphone","speaker","recording","asr_configured","tts_configured","wake_mode","last_ms"}`。**v1.9.0 起会真的把音频外设起起来再回答**（否则「没起」看起来就像「没麦克风」） |
+| POST | `/api/v1/voice/config` | 字段：`asr_url`、`tts_url`、`wake_mode`（`button` / `none`）→ 返回状态 JSON |
+
+**协议（两个端点都是自己定的，设备是客户端）**
+
+| | 请求 | 期望响应 |
+|---|---|---|
+| ASR（识别） | `POST` 端点，body 是**原始 PCM**（16 kHz / 16 bit / 单声道） | `{"text":"识别结果"}` |
+| TTS（合成） | `POST` 端点，body 是 `{"text":"要念的内容"}` | `audio/pcm`（16 kHz / 16 bit / 单声道） |
+
+**录音**：48 kHz / 16 bit / 2ch 采集 → 软件下混 + 3 点抽取 → 16 kHz / 16 bit / 单声道，
+缓冲在 PSRAM（10 s = 320 KB），落盘 `ai/rec_<uptime_ms>.pcm`（无 WAV 头）。
+**回放**：16 kHz 单声道 → 最近邻升采样 → 48 kHz 立体声 → codec。
+
+**⚠️ 硬件现状（v1.9.0 真机实测）**：codec 能起来（`mic=1 speaker=1`），
+但**采集通路一个样本都收不到**（2 秒录音 = 0 ms）。所以「语音输入」这一半目前
+是**待定**状态，设备上会自动降级成文字输入。证据与两条假设见
+`docs/ROADMAP_v1.9.0.md` §2。调试 shell 的 `audio [ms]` 命令可以随时复测。
+
+---
+
 ### main（编排层，非组件）
 
 - **目录 / 入口**：`main/app_main.c`（`void app_main(void)`）；没有公开头文件
@@ -1305,11 +1379,13 @@ I (xxx) TH:app: ready (storage=/sdcard)
 
 下表是**实际注册**的全部路由（来源：`components/*/src/*.c` 中的
 `http_router_register()` / `http_router_register_not_implemented()` 路由表）。
-当前注册 **51** 条：`sync_server` 8 + `todo_manager` 7 + `weather_service` 5 +
-`calendar_service` 5 + `word_service` 5 + `wifi_manager` 7 + `ai_service` 6 + `voice_service` 2 +
-`maimemo_client` 6 = 51。
-（**1.3.0 已上机复核**：`GET /api/v1/device/status` 返回 `"routes":51`，与上面按注册表
-推算的数字一致。1.0.0 的真机值为 45 条，即本表去掉 `maimemo_client` 的 6 条。）
+**v1.9.0 真机复核**：`GET /api/v1/device/status` 返回 `"routes":62`
+（含调试 shell 的 2 条时是 64 —— 调试 shell 默认不开）。
+按注册项（`path + method`）拆：`sync_server` 8 + `todo_manager` 10 + `weather_service` 5 +
+`calendar_service` 5 + `word_service` 8 + `wifi_manager` 7 + `ai_service` 7 + `voice_service` 2 +
+`maimemo_client` 8 = 60，另加 `sync_server` 的 `/ws/events` 501 占位等。
+（1.3.0 那句「51 条」是按**唯一路径**数的，而且当时 `todo_manager` / `word_service` /
+`maimemo_client` 还没长到现在这么多；v1.9.0 起以真机返回的 62 为准。）
 
 > **1.0.0 更正**：旧版这张表把 `/api/v1/wifi/*` 记为"组件里没有任何 `http_router_register()`
 > 调用 → 404"、把 `ai_service` 记为"不在 `app_main` 模块表里 → 运行时 404"。**两条都是错的**，
@@ -1367,10 +1443,11 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | POST | `/api/v1/ai/chat/stream` | ai_service | **v1.5.0 起异步**（`text/event-stream`，异步 handler + 自有任务）；chunk/done/error 事件格式不变 | ✅ 200 |
 | GET | `/api/v1/ai/history` | ai_service | 对话历史。**强制鉴权** | ✅ 200（需 token） |
 | DELETE | `/api/v1/ai/history` | ai_service | 清空历史。**强制鉴权** | ✅ 200（需 token） |
-| POST | `/api/v1/ai/config` | ai_service | 设置 API Key / 模型。**强制鉴权**，响应不回显 Key | ✅ 200（需 token） |
+| POST | `/api/v1/ai/config` | ai_service | 设置 API Key / 模型 / 轮数。**强制鉴权**，响应不回显 Key | ✅ 200（需 token） |
+| GET | `/api/v1/ai/config` | ai_service | **v1.9.0 新增**：读当前配置状态（`model` / `has_api_key` / `history_rounds` / `state`），**不回显 Key** | ✅ 200 |
 | POST | `/api/v1/ai/abort` | ai_service | 中断正在进行的流式回答 | ✅ 200 |
-| GET | `/api/v1/voice/status` | voice_service | 录音/回放可用性与 ASR/TTS 端点配置状态（音频按需打开） | ✅ 200 |
-| POST | `/api/v1/voice/config` | voice_service | 配置 ASR/TTS HTTP 端点（选型未定，见需求 FR7） | ✅ 200 |
+| GET | `/api/v1/voice/status` | voice_service | 录音/回放可用性与 ASR/TTS 端点配置状态（**v1.9.0 起会真的把音频外设起起来再回答**） | ✅ 200 |
+| POST | `/api/v1/voice/config` | voice_service | 配置 ASR/TTS HTTP 端点（协议见 §ai_service / §voice_service） | ✅ 200 |
 | GET | `/api/v1/maimemo/status` | maimemo_client | 墨墨令牌**掩码**与上次同步进度；**不碰网络**（可安全轮询）。见 §2.5 | ✅ 200 |
 | POST | `/api/v1/maimemo/config` | maimemo_client | body `{"token","push","verify","clear"}`；**令牌只写不读**。见 §2.5 | ✅ 200（写方法→需 token） |
 | POST | `/api/v1/maimemo/sync` | maimemo_client | 异步发起一次方案 A 同步；已有同步在跑 → 400。见 §2.5 | ✅ 200/400 |
@@ -1517,8 +1594,8 @@ curl.exe -i http://todohelper.local/api/v1/wifi/status        # 404（WiFi API �
 它是独立于 `notes`/`phrases` 的作用域，所以常见情况是 `interpretations: ok` 而
 `notes`/`phrases: ESP_ERR_NOT_SUPPORTED` —— 这时云端词**仍然有释义**，只是没有助记。
 
-**关于 `X-Auth-Token`**：这些路由**都不在** `sync_server.c` 的 `s_always_auth[]` 里
-（那份名单只有 `device/reboot`、`device/auth`、`ai/config`、`ai/history`）。
+**关于 `X-Auth-Token`**：这些路由**都不在** `sync_server.c` 的强制鉴权名单里
+（那份名单叫 `s_protected_routes[]`，只列了 `todos` 与 `ai/history` 这几条 GET）。
 因此生效的是 §2.3 的**通用规则**：**`POST` 无条件鉴权**（`is_write_method()`），
 `GET` 默认不鉴权。即 `auth_enabled=true` 时，**五个 POST**
 （`config`、`sync`、`push`、**`probe`**、**`advance`**）必须带 `X-Auth-Token`，
@@ -1598,11 +1675,11 @@ curl.exe "http://todohelper.local/api/v1/words/history?limit=20"
 | `SYS_KEY_AUTH_TOKEN` | `auth_token` | str | HTTP 鉴权 token 🔒（≤63 字符；空/缺省 = 关闭鉴权） | `sync_server` |
 | `SYS_KEY_HTTP_PORT` | `http_port` | i32 | HTTP 端口；缺省 `SYNC_SERVER_DEFAULT_PORT` = 80 | `sync_server` |
 | `SYS_KEY_MDNS_ENABLED` | `mdns_enabled` | bool | 是否发布 `todohelper.local`；缺省 `true` | `sync_server` |
-| `SYS_KEY_AI_API_KEY` | `ai_api_key` | str | DeepSeek API Key 🔒（P2） | `ai_service`（未接入） |
-| `SYS_KEY_AI_MODEL` | `ai_model` | str | `deepseek-chat` / `deepseek-reasoner`（P2） | `ai_service`（未接入） |
-| `SYS_KEY_AI_PROMPT` | `ai_prompt` | str | 角色设定 system prompt（P2） | `ai_service`（未接入） |
-| `SYS_KEY_AI_ROUNDS` | `ai_rounds` | i32 | 保留对话轮数，默认 10（P2） | `ai_service`（未接入） |
-| `SYS_KEY_AI_SAVE_HIST` | `ai_save_hist` | bool | 是否保存聊天记录（P2；Kconfig 默认 `n`） | `ai_service`（未接入） |
+| `SYS_KEY_AI_API_KEY` | `ai_api_key` | str | DeepSeek API Key 🔒（P2） | `ai_service` |
+| `SYS_KEY_AI_MODEL` | `ai_model` | str | `deepseek-chat` / `deepseek-reasoner`（P2） | `ai_service` |
+| `SYS_KEY_AI_PROMPT` | `ai_prompt` | str | 角色设定 system prompt（P2） | `ai_service` |
+| `SYS_KEY_AI_ROUNDS` | `ai_rounds` | i32 | 保留对话轮数，默认 10（P2） | `ai_service` |
+| `SYS_KEY_AI_SAVE_HIST` | `ai_save_hist` | bool | 是否保存聊天记录（P2；Kconfig 默认 `n`） | `ai_service` |
 | `SYS_KEY_VOICE_WAKE` | `voice_wake` | i32 | 语音唤醒方式（P2） | ⚠️ 已登记，**当前无组件读写**（无 `voice_service`） |
 | `SYS_KEY_TTS_ENABLED` | `tts_enabled` | i32 | TTS 播报开关（P2） | ⚠️ 已登记，**当前无组件读写** |
 | `SYS_KEY_MAIMEMO_TOKEN` | `mm_token` | str | 墨墨开放 API 令牌 🔒（≤191 字符；空/缺省 = 云端模式关闭）。**与 `ai_api_key` 同规则：不写日志、任何接口都不回读（只回掩码）** | `maimemo_client` |
@@ -1662,7 +1739,7 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 | `fonts/ui.ttf` | `ui_core`（字体链） | 路径来自 `CONFIG_TODOHELPER_FONT_PATH`（默认 `fonts/ui.ttf`，相对 `storage_app_dir()`）。放这里即可**免重烧**换字体；整条 FreeType 通路受 `CONFIG_TODOHELPER_FONT_FREETYPE`（默认 n）门控，关闭时回落到 LVGL 内置 Source Han Sans SC CJK |
 | `backup/todos_*.json` | — | 需求 §9.2 规划项。⚠️ 目录会被创建，Kconfig `CONFIG_TODOHELPER_TODO_BACKUP_KEEP`（默认 7）已声明，但**当前没有任何代码写备份** |
 | `logs/app.log` | — | 需求 §9.2 规划项，**当前未实现**（日志只在串口） |
-| `ai/chat_history.json` | `ai_service`（未接入） | 定义在 `ai_service.c`（`AI_HISTORY_FILE`），因组件未接入 `main`，当前不会产生 |
+| `ai/chat_history.json` | `ai_service` | 定义在 `ai_service.c`（`AI_HISTORY_FILE`）。**只有把 NVS `ai_save_hist` 打开才会写**（Kconfig `TODOHELPER_AI_SAVE_HISTORY` 默认 `n`），所以默认不会产生这个文件 |
 | `tts/*.pcm` | — | P2 规划项，当前不存在 |
 | `images/weather/`、`anim/idle_face/` | — | 目录会被创建但**当前不使用**：天气图标在 `assets` 分区（`ui_assets`），待机眼睛为程序化绘制 |
 | `cache/<name>`（通用） | 任意组件 | `storage_read_cache()` / `storage_write_cache()` 的固定前缀，见上两条 |
@@ -1715,7 +1792,7 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 | **`/ws/events`（WebSocket）** | 本 IDF 构建**没有 WebSocket 组件**，故用 **SSE**：`GET /api/v1/events`（`text/event-stream`，最多 3 客户端，15 s keepalive）。`/ws/events` 仍**注册为 501 占位**并给出 `hint`，让客户端能区分"没做"与"URL 写错"（需求 §8.7） |
 | ~~**WiFi HTTP API（5 条）**~~ | ⚠️ **1.0.0 旧记录已作废**：`wifi_manager_http.c` **有** 7 条路由且真机实测 200（见 §2.1 与 §2.3 的更正说明）。原文"没有任何 `http_router_register()` 调用 → 404"来自未核实的子 agent 自述 |
 | **FreeType CJK 字体通路** | **已启用**：`components/ui_core/fonts/ui_cjk.ttf` 已生成（含 **1.3.0 合并的 203 个 IPA 字形**，`tools/gen_cjk_font.py` 生成后会跑 `validate_font()`），运行期从 `<storage>/todohelper/fonts/ui_cjk.ttf` 加载。**字体没有烘进 app**，所以**换字体是拷文件、不是重新烧录**（`AGENT.md` §4.4 / §9.2） |
-| ~~`ai_service`（P2，FR7）~~ | ⚠️ **1.0.0 旧记录已作废**：`ai_service_init()` **就在** `main/app_main.c` 的模块表里（开机日志 `module 'ai_service' ready`），6 条 `/api/v1/ai/*` 路由运行时**可达**。⚠️ 但其中 `/api/v1/ai/chat` 与 `/api/v1/ai/chat/stream` 仍是**同步 handler**，一次 AI 回复期间会堵住整台设备的 HTTP（用户明确决定暂不修），详见 §2.1 表内注释与 `AGENT.md` §9.0.1 最后一条 |
+| ~~`ai_service`（P2，FR7）~~ | ⚠️ **1.0.0 旧记录已作废**：`ai_service_init()` **就在** `main/app_main.c` 的模块表里（开机日志 `module 'ai_service' ready`），`/api/v1/ai/*` 路由运行时**可达**。**v1.5.0 起 `/ai/chat` 与 `/ai/chat/stream` 已改成异步 handler**（`httpd_req_async_handler_begin()` 把会话交给自有任务），一次 AI 回复期间**设备其它 HTTP 接口照常可用** —— 1.0.0 那句「会堵住整台设备的 HTTP」早已不成立。**v1.9.0** 又补了 `GET /api/v1/ai/config`（读状态）与网页端的「AI 对话与语音」配置区 |
 | **`voice_service`（P2，FR7）** | ⚠️ **1.0.0 旧记录"组件目录不存在"已作废**：组件在 `components/voice_service/`，2 条路由已注册（`GET /api/v1/voice/status`、`POST /api/v1/voice/config`）。录音回放真实可用；**ASR/TTS 端点选型未定**（走可配置 HTTP 端点），属半成品 |
 | **待机表情联动** | ⚠️ **1.0.0 旧记录"不订阅任何系统事件"已改善但仍有缺口**：`ai_service` 已接入会驱动表情。1.1/1.2 又加了自发表情 / 困倦度 / 瞳孔缩放 / 慢动作三层（`idle_face`）。**但 WiFi 失败、待办完成、同步中等业务场景仍未触发 `idle_face_express()`** |
 | `backup/todos_*.json` 每日备份 | 目录已建、`CONFIG_TODOHELPER_TODO_BACKUP_KEEP` 已声明，**无实现**（需求 §16/§9.2 的滚动备份策略待定） |

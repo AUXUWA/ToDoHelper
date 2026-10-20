@@ -477,6 +477,78 @@
       </div>
     </details>
 
+    <!-- AI 对话与语音：设备没有键盘，DeepSeek 的 Key 和云端语音端点都在这里配 -->
+    <details class="card" id="ai">
+      <summary class="card-head" style="cursor:pointer;list-style:none;margin:0">
+        <h2>AI 对话与语音</h2>
+        <span class="spacer"></span>
+        <span class="stamp" id="ai-state">状态未知</span>
+      </summary>
+      <div class="fields" style="padding-top:10px">
+        <p class="small muted" id="ai-help">
+          设备本身没有键盘（中文用软键盘打不了几个字），所以 <strong>DeepSeek 的 API Key
+          只能在这里填</strong>。Key 是<strong>只写</strong>的：填进去之后设备只回一个
+          「已配置 / 未配置」，本页永远不会把完整 Key 显示出来，也不写进 localStorage。
+        </p>
+
+        <label class="field"><span>DeepSeek API Key（只写，保存后不再回显）</span>
+          <input type="password" id="ai-key" autocomplete="new-password" placeholder="sk-..."></label>
+
+        <label class="field"><span>模型</span>
+          <select id="ai-model">
+            <option value="deepseek-chat">deepseek-chat（日常对话，快）</option>
+            <option value="deepseek-reasoner">deepseek-reasoner（会推理，慢一些）</option>
+          </select></label>
+
+        <label class="field"><span>系统提示词（留空 = 不改）</span>
+          <input type="text" id="ai-prompt" placeholder="例如：你是一个记单词的助手，回答简短一些"></label>
+
+        <label class="field"><span>保留对话轮数</span>
+          <input type="number" id="ai-rounds" min="1" max="20" step="1" placeholder="10"></label>
+
+        <label class="inline-check"><input type="checkbox" id="ai-save-hist">
+          <span>把对话历史存到 SD 卡（换设备或清历史后还能接着聊）</span></label>
+
+        <div class="row-actions">
+          <button class="btn primary" type="button" id="ai-save">保存设置</button>
+          <button class="btn danger" type="button" id="ai-clear">清除 Key</button>
+          <button class="btn" type="button" id="ai-test">试一下</button>
+        </div>
+
+        <div id="ai-test-box" hidden>
+          <h3 class="mm-sub">试问结果</h3>
+          <pre id="ai-test-out" class="ai-out"></pre>
+        </div>
+
+        <h3 class="mm-sub">语音（云端识别 / 合成）</h3>
+        <p class="small muted">
+          设备本地不做语音识别（没有离线识别模型），识别与合成都走<strong>你自己指定的
+          云端端点</strong>。协议：<br>
+          · 识别（ASR）：<code>POST</code> 端点，body 是原始 PCM（16 kHz / 16 bit / 单声道），
+          期望返回 <code>{"text":"识别结果"}</code>；<br>
+          · 合成（TTS）：<code>POST</code> 端点，body 是 <code>{"text":"要念的内容"}</code>，
+          期望返回 <code>audio/pcm</code>（16 kHz / 16 bit / 单声道）。<br>
+          端点没配的时候，设备就只走文字：识别那半边会提示不可用，合成那半边安静跳过。
+        </p>
+
+        <label class="field"><span>语音识别端点（ASR）</span>
+          <input type="url" id="ai-asr" placeholder="https://…"></label>
+        <label class="field"><span>语音合成端点（TTS）</span>
+          <input type="url" id="ai-tts" placeholder="https://…"></label>
+        <label class="field"><span>唤醒方式</span>
+          <select id="ai-wake">
+            <option value="button">按屏幕上的麦克风按钮</option>
+            <option value="none">关闭语音输入</option>
+          </select></label>
+
+        <div class="row-actions">
+          <button class="btn" type="button" id="ai-voice-save">保存语音配置</button>
+          <button class="btn" type="button" id="ai-voice-refresh">刷新语音状态</button>
+        </div>
+        <p class="small muted" id="ai-voice-state">语音状态未知</p>
+      </div>
+    </details>
+
   </div>
 </div>
 
@@ -2053,6 +2125,167 @@ $("maimemo").addEventListener("toggle", function (event) {
   if (event.currentTarget.open) {
     loadMaimemo();
     loadWordHistory();
+  }
+});
+
+/* ==================================================================== */
+/* AI 对话与语音                                                          */
+/* ==================================================================== */
+
+/* Key 是只写的：任何刷新 / 重渲染都不许把它写回输入框。 */
+function aiForgetKey() {
+  var input = $("ai-key");
+  if (input) { input.value = ""; }
+}
+
+function aiRender(state) {
+  var stamp = $("ai-state");
+  if (!state) {
+    stamp.textContent = "状态未知";
+    return;
+  }
+  var hasKey = !!state.has_api_key;
+  stamp.textContent = (hasKey ? "Key 已配置" : "未配置 Key") + " · " + (state.model || "?");
+  $("ai-model").value = state.model || "deepseek-chat";
+  if (state.history_rounds) { $("ai-rounds").value = state.history_rounds; }
+  /* 提示词是「写一次就不回显」的：改了它会清空设备上的对话历史，
+     所以这里只提示，不自动填。 */
+  $("ai-prompt").placeholder = $("ai-prompt").placeholder ||
+    "例如：你是一个记单词的助手，回答简短一些";
+}
+
+function loadAi() {
+  return api("/api/v1/ai/config", { timeoutMs: 8000 })
+    .then(function (state) {
+      aiRender(state);
+      return state;
+    })
+    .catch(function (err) {
+      $("ai-state").textContent = "读取失败";
+      if (err.kind === "auth") { reachableWithProblem(err); }
+      return null;
+    });
+}
+
+function loadVoice() {
+  return api("/api/v1/voice/status", { timeoutMs: 8000 }).then(function (state) {
+    var bits = [];
+    bits.push(state.microphone ? "麦克风已就绪" : "无麦克风");
+    bits.push(state.speaker ? "扬声器已就绪" : "无扬声器");
+    bits.push(state.asr_configured ? "识别端点已配" : "识别端点未配");
+    bits.push(state.tts_configured ? "合成端点已配" : "合成端点未配");
+    $("ai-voice-state").textContent = bits.join(" · ");
+    /* 端点 URL 不回显：它可能把令牌写在 query 里（与 AI Key 同一套规矩）。
+       要改就重新填一次。 */
+    $("ai-asr").placeholder = state.asr_configured ? "已配置（不回显；要改请重新填）" : "https://…";
+    $("ai-tts").placeholder = state.tts_configured ? "已配置（不回显；要改请重新填）" : "https://…";
+    $("ai-wake").value = state.wake_mode || "button";
+    return state;
+  }).catch(function (err) {
+    $("ai-voice-state").textContent = "语音状态读取失败";
+    if (err.kind === "auth") { reachableWithProblem(err); }
+    return null;
+  });
+}
+
+$("ai-save").addEventListener("click", function () {
+  var key = $("ai-key").value.trim();
+  var body = {
+    model: $("ai-model").value,
+    history_rounds: parseInt($("ai-rounds").value, 10) || 10,
+    save_history: $("ai-save-hist").checked
+  };
+  if (key) { body.api_key = key; }
+  var prompt = $("ai-prompt").value.trim();
+  if (prompt) { body.system_prompt = prompt; }
+
+  $("ai-save").disabled = true;
+  api("/api/v1/ai/config", { method: "POST", body: JSON.stringify(body), timeoutMs: 15000 })
+    .then(function (state) {
+      aiForgetKey();
+      $("ai-prompt").value = "";
+      aiRender(state);
+      toast(key ? "AI 设置已保存" : "AI 设置已保存（Key 未改动）", "ok");
+    })
+    .catch(function (err) {
+      reportError(err, "保存 AI 设置");
+    })
+    .then(function () {
+      $("ai-save").disabled = false;
+    });
+});
+
+$("ai-clear").addEventListener("click", function () {
+  $("ai-clear").disabled = true;
+  api("/api/v1/ai/config", {
+    method: "POST",
+    body: JSON.stringify({ api_key: "" })
+  }).then(function (state) {
+    aiForgetKey();
+    aiRender(state);
+    toast("已清除设备上的 AI Key", "ok");
+  }).catch(function (err) {
+    reportError(err, "清除 AI Key");
+  }).then(function () {
+    $("ai-clear").disabled = false;
+  });
+});
+
+$("ai-test").addEventListener("click", function () {
+  var box = $("ai-test-box");
+  var out = $("ai-test-out");
+  box.hidden = false;
+  out.textContent = "正在问…";
+  $("ai-test").disabled = true;
+  api("/api/v1/ai/chat", {
+    method: "POST",
+    body: JSON.stringify({ text: "用一句话打个招呼" }),
+    timeoutMs: 60000
+  }).then(function (data) {
+    out.textContent = (data && (data.reply || data.text)) || JSON.stringify(data);
+  }).catch(function (err) {
+    out.textContent = "失败：" + err.message;
+  }).then(function () {
+    $("ai-test").disabled = false;
+  });
+});
+
+$("ai-voice-save").addEventListener("click", function () {
+  $("ai-voice-save").disabled = true;
+  api("/api/v1/voice/config", {
+    method: "POST",
+    body: JSON.stringify({
+      asr_url: $("ai-asr").value.trim(),
+      tts_url: $("ai-tts").value.trim(),
+      wake_mode: $("ai-wake").value
+    }),
+    timeoutMs: 10000
+  }).then(function (state) {
+    if (state) {
+      var bits = [];
+      bits.push(state.microphone ? "麦克风已就绪" : "无麦克风");
+      bits.push(state.speaker ? "扬声器已就绪" : "无扬声器");
+      bits.push(state.asr_configured ? "识别端点已配" : "识别端点未配");
+      bits.push(state.tts_configured ? "合成端点已配" : "合成端点未配");
+      $("ai-voice-state").textContent = bits.join(" · ");
+    }
+    toast("语音配置已保存", "ok");
+  }).catch(function (err) {
+    reportError(err, "保存语音配置");
+  }).then(function () {
+    $("ai-voice-save").disabled = false;
+  });
+});
+
+$("ai-voice-refresh").addEventListener("click", function () {
+  loadVoice();
+});
+
+/* 折叠时不打扰设备：展开才拉状态。 */
+$("ai").addEventListener("toggle", function (event) {
+  if (event.currentTarget.open) {
+    loadAi();
+    loadVoice();
   }
 });
 

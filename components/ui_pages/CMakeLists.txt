@@ -26,5 +26,7 @@ idf_component_register(
         maimemo_client
         sync_server
         ai_service
+        # voice_service: the AI page's microphone / speak buttons.
+        voice_service
         lvgl
 )

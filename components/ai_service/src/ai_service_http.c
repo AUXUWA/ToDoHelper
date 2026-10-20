@@ -550,6 +550,23 @@ static esp_err_t abort_post_handler(httpd_req_t *req)
     return http_reply_ok(req, "{\"aborted\":true}");
 }
 
+/**
+ * The current configuration, for the web console.
+ *
+ * A GET (not a POST with an empty body): reading is reading. The API key is
+ * never echoed - only whether one is configured.
+ */
+static esp_err_t config_get_handler(httpd_req_t *req)
+{
+    char data[192];
+    snprintf(data, sizeof(data),
+             "{\"model\":\"%s\",\"has_api_key\":%s,\"history_rounds\":%u,\"state\":\"%s\"}",
+             ai_service_get_model(), ai_service_has_api_key() ? "true" : "false",
+             (unsigned)ai_service_get_history_rounds(),
+             ai_service_state_name(ai_service_get_state()));
+    return http_reply_ok(req, data);
+}
+
 esp_err_t ai_service_register_http(void)
 {
     static const struct {
@@ -561,6 +578,7 @@ esp_err_t ai_service_register_http(void)
         { "/api/v1/ai/chat/stream", HTTP_POST, chat_stream_post_handler },
         { "/api/v1/ai/history", HTTP_GET, history_get_handler },
         { "/api/v1/ai/history", HTTP_DELETE, history_delete_handler },
+        { "/api/v1/ai/config", HTTP_GET, config_get_handler },
         { "/api/v1/ai/config", HTTP_POST, config_post_handler },
         { "/api/v1/ai/abort", HTTP_POST, abort_post_handler },
     };
