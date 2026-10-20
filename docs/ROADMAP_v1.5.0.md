@@ -548,6 +548,23 @@ cJSON *sys_json_parse(const char *json, int max_depth);
    （新增 API、新的行为约定、新的坑）。
 4. 内部 RAM 基线不得劣化（`ai_service` 的 24 KB 静态数组是本轮要还回去的）。
 
+### 6.1 本轮的实际验证结果（2026-10-20）
+
+| 项 | 结果 |
+|---|---|
+| 构建 | ✅ 0 error 0 warning，`todohelper.bin` 0x2f8f20，app 分区剩 63% |
+| 烧录 | ✅ 已烧到 COM34（`tools/flash.ps1`，32 s） |
+| 开机 | ✅ 无 abort / panic / 断言；SD 与片内 LittleFS **同时挂载**；`TH:app: ready (storage=/sdcard)` |
+| 待办数据 | ✅ 从「片内 2 条（陈旧）+ 卡上 4 条（完整）」正确收敛到 **4 条（next id 48）** |
+| 内部存储分区 | ✅ 从 1324 KB 降到 32 KB（不再重复搬运） |
+| 上机新发现 | ⚠️ 三个只有真机才暴露的洞，已修（见 `CHANGELOG.md`「上机后补的三处」） |
+| UI 目视 | ❌ **未做**（无法远程看屏幕）——需人在设备上过一遍 |
+| HTTP 端到端 | ❌ **未做**：板子连不上保存的 AP `xuaoxe_computer`（握手超时 reason 201，PC 在 `ECUT_STUD`） |
+| 内部 RAM / 帧率实测 | ❌ 未复核（需要设备联网后读 `int-low` / FPS 探针） |
+
+**下一位接手的人，请优先补这三项**：UI 目视确认、HTTP 端到端（新路由 + 鉴权 + ack）、
+内部 RAM 复核。
+
 ---
 
 ## 7. 下一轮候选（本轮明确不做，但已核实存在的问题）
