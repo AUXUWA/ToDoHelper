@@ -12,9 +12,14 @@ menu "ToDoHelper debug shell"
 
             It can switch pages, press widgets, dump the LVGL object tree, read
             heaps/tasks/NVS and reboot the board. That is exactly why it is
-            **off by default** and why its routes always require the HTTP auth
-            token even when authentication is otherwise disabled.
+            **off by default**.
 
             Turn this on for a debugging build only; do not ship it enabled.
+
+            Note on authentication (v1.5.0): the device checks no tokens until
+            one is configured - that is the long-standing LAN default, and it is
+            what keeps "set the first token", "configure the AI key" and this
+            shell reachable. Once a token exists, *every* route needs it, this
+            one included.
 
 endmenu

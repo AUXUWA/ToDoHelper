@@ -26,9 +26,14 @@ curl "http://todohelper.local/api/v1/debug/exec?cmd=heap"
 curl -X POST -d 'widgets token' http://todohelper.local/api/v1/debug/exec
 curl -X POST -d 'click 知道了'  http://todohelper.local/api/v1/debug/exec
 
-# 开了 HTTP 鉴权时带上令牌（这个组件的路由**永远**要求鉴权）
+# 开了 HTTP 鉴权时带上令牌（设备设过令牌之后，所有路由包括这条都要令牌）
 curl -X POST -H 'X-Auth-Token: <token>' -d 'heap' http://<ip>/api/v1/debug/exec
 ```
+
+> **鉴权**（v1.5.0 起）：设备**没设过令牌**时，局域网默认不校验，这条路由直接可用；
+> 设备**设过令牌**之后，所有路由（包括这条）都要带 `X-Auth-Token`。
+> 所以刚开机的板子可以直接 `curl -d 'heap'`，开了鉴权的板子要带令牌——
+> 这也是 `tools/dsh.sh` 要「自动找令牌」的原因。
 
 ## 命令
 

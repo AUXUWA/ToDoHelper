@@ -30,24 +30,24 @@ static const char *TAG = "sync";
 ESP_EVENT_DEFINE_BASE(SYNC_EVENT);
 
 /**
- * Paths that demand a valid token no matter whether the global auth switch is
- * on.
+ * The auth model, in one place.
  *
- * They either change the device's own configuration (reboot, new token, AI
- * API key), expose private data (the AI conversation log) or hand out control
- * over the device (the debug shell), so "no token configured" must not turn
- * them into an open door.
+ * - **No token configured** → the device is open on the LAN. That is the
+ *   long-standing default (requirement 8.8) and the state the unit ships in;
+ *   demanding a token on some routes while no token exists would only block
+ *   the three ways to *get* going: setting the first token, configuring the
+ *   AI key, and using the debug shell. (All three were 401 in v1.5.0 - the
+ *   "strict" list was written as "these always need a token", but with no
+ *   token configured there is nothing to compare against, so it only ever
+ *   locked the user out of their own device.)
+ * - **A token is configured** → *every* route needs it, **reads included**.
+ *   That is the hole v1.5.0 closed: before, `GET /api/v1/todos` and
+ *   `GET /api/v1/ai/history` were readable by anyone on the LAN even with
+ *   authentication "enabled", while the web page told the user the opposite.
+ *
+ * The owner can always clear the token from the device's own settings page,
+ * so a LAN client that sets one first cannot lock them out for good.
  */
-static const char *const s_strict_auth_paths[] = {
-    "/api/v1/device/reboot",
-    "/api/v1/device/auth",
-    "/api/v1/ai/config",
-    "/api/v1/ai/history",
-    /* The debug shell can reboot the board and drive the UI; its own README
-     * promises that its routes require a token "even when the global auth is
-     * off". The route only exists in debug builds, the path check does not. */
-    "/api/v1/debug/exec",
-};
 
 /**
  * Read routes that have to go through the auth hook as well.
@@ -252,17 +252,6 @@ const char *sync_server_url(void)
 /* Auth (requirement 8.8)                                                    */
 /* ------------------------------------------------------------------------ */
 
-/** Is this one of the paths that always need a valid token? */
-static bool path_is_strict(const char *path)
-{
-    for (size_t i = 0; i < sizeof(s_strict_auth_paths) / sizeof(s_strict_auth_paths[0]); i++) {
-        if (strcmp(path, s_strict_auth_paths[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /**
  * Compare the request's token with the cached one.
  *
@@ -294,10 +283,12 @@ static bool token_matches(httpd_req_t *req)
 /**
  * @brief Auth decision for one request (requirement 8.8).
  *
- * Three layers:
- *  1. strict paths (reboot, token change, AI config, AI history): a valid
- *     token is required even when the global switch is off;
- *  2. every other path: the token is required as soon as one is configured;
+ * Two layers:
+ *  1. **no token configured** -> open. That is the long-standing LAN default
+ *     and the state the unit ships in. Requiring a token on some routes while
+ *     no token exists only blocks the three ways to get going: setting the
+ *     first token, configuring the AI key, using the debug shell.
+ *  2. **a token is configured** -> every route needs it, reads included.
  *  3. the token itself is only read from the `X-Auth-Token` header.
  */
 bool sync_server_check_auth(httpd_req_t *req)
@@ -307,7 +298,7 @@ bool sync_server_check_auth(httpd_req_t *req)
         return false;
     }
 
-    if (!path_is_strict(path) && !s_auth_enabled) {
+    if (!s_auth_enabled) {
         /* LAN default: no token configured -> open (requirement 8.8). */
         return true;
     }

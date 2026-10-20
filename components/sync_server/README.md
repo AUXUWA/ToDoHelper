@@ -60,35 +60,37 @@
    - 空闲 15 秒（`SYNC_SSE_KEEPALIVE_MS`）发一行 `: keepalive` 注释，防止 NAT/代理掐连接；
      这也是**发现"客户端悄悄消失"的最坏延迟**（浏览器被关、WiFi 掉线时，只有发送失败才会察觉）；
    - 断连时 `sse_unregister()` 排空并删除队列，`sync_server_sse_clients()` 反映当前订阅数。
-7. **鉴权模型（需求 §8.8）**：默认 `auth_enabled = false`（局域网内免鉴权，方便电脑端直接改待办）。
-   一旦通过 `sync_server_set_auth_token()` 设过 token（NVS 键 `auth_token`，**不硬编码、不写日志**），
-   **写方法与被标记的读方法**都必须带 `X-Auth-Token`。
+7. **鉴权模型（需求 §8.8）**：**两档**，取决于有没有设过 token。
+   - **没设 token**（出厂与常用状态）：**所有路由都不校验**。这是局域网默认，
+     也是「写第一个令牌」「配 AI Key」「用调试 shell」这三条路能走通的前提——
+     没有令牌可比对，对某些路径单独要令牌只会把用户挡在自己设备外面。
+   - **设过 token**（NVS 键 `auth_token`，**不硬编码、不写日志**）：
+     **所有路由都要带 `X-Auth-Token`，包括 GET**。
    `sync_server_check_auth()` **只读 `X-Auth-Token` 头，绝不接受 URL query 传 token**（query 会进日志）。
    token 长度上限 63 字符；传 `NULL`/`""` 会清除并关闭鉴权。
-   另有 5 条路径**无论鉴权开关如何都强制校验**（`s_strict_auth_paths`）：
-
-   | 强制鉴权路径 | 原因 |
-   |---|---|
-   | `/api/v1/device/reboot` | 敏感操作 |
-   | `/api/v1/device/auth` | 会改 token |
-   | `/api/v1/ai/config` | 涉及 API Key |
-   | `/api/v1/ai/history` | 对话记录 |
-   | `/api/v1/debug/exec` | 调试 shell 能重启/改 UI（仅调试固件有这条路由） |
 
    失败统一 **401** + `{"code":401,"msg":"unauthorized","data":null}`，并记 `auth failed for <path>`
    与 `SYNC_EVENT_AUTH_FAILED`。传输是明文局域网、**不提供 HTTPS**。
+   用户始终可以在**设备自己的设置页**里生成/清除令牌，所以局域网里某个客户端抢先设了令牌，
+   也不会把人永久挡在门外。
 
-   ### 鉴权矩阵（v1.5.0 起）
+   ### 鉴权矩阵（v1.5.0 起，2026-10-20 真机实测过）
 
    | 路由 | 鉴权关闭（没设 token） | 鉴权开启（设了 token） |
    |---|---|---|
    | `GET /`、`/index.html` | 放行 | 放行 |
    | `GET /api/v1/device/info`、`/api/v1/device/status` | 放行 | 放行（不含任何密钥） |
-   | `GET /api/v1/todos`、`GET /api/v1/todos/{id}` | 放行 | **要 token** |
-   | `GET /api/v1/ai/history` | **401**（强制路径） | **要 token** |
+   | `GET /api/v1/todos`、`GET /api/v1/todos/{id}`、`GET /api/v1/todos/export` | 放行 | **要 token** |
+   | `GET /api/v1/ai/history` | 放行 | **要 token** |
    | `GET /api/v1/events`（SSE） | 放行 | **要 token** |
    | 所有 POST/PUT/PATCH/DELETE | 放行 | **要 token** |
-   | `POST /api/v1/device/reboot`、`/api/v1/device/auth`、`/api/v1/ai/config`、`DELETE /api/v1/ai/history`、`/api/v1/debug/exec` | **401**（强制路径） | **要 token** |
+   | `POST /api/v1/device/auth`（设/清令牌） | 放行（**没有令牌可比对**，这是「设置第一个令牌」的引导路径） | **要 token**（要带当前那个） |
+
+   > **v1.4.0 的漏洞**：`GET /api/v1/todos` 与 `GET /api/v1/ai/history` 在「已开启鉴权」时
+   > **仍然不校验令牌**（路由器只对写方法强制过 hook），而网页上位机一直告诉用户
+   > 「开启鉴权后所有请求都要带令牌」。真机实测：设了令牌后这两条从 200 变成 401。
+   > v1.5.0 用 `http_router_require_auth()` 标记这两条只读路由（并在服务器启动时与
+   > `SYS_EVENT_READY` 各标记一次，因为 `require_auth()` 必须在路由注册之后调用）。
 
    **网页端兼容**：网页上位机本来就带 `X-Auth-Token`（`api()` 的公共漏斗 + SSE 的 `fetch` 流），
    所以开启鉴权后照常工作；SSE 走 `EventSource`（浏览器不支持 fetch 流式时）带不了请求头，

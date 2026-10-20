@@ -1418,23 +1418,25 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | 传递方式 | **只有请求头 `X-Auth-Token: <token>`**；不接受 URL query 传 token（会进日志）。头读取用 `httpd_req_get_hdr_value_str()`，缓冲 80 B |
 | 存储 | NVS 键 `auth_token`（明文，局域网内传输；**不提供 HTTPS**） |
 | 默认状态 | 未设置 token 时 `auth_enabled=false`：局域网内大多接口可无鉴权访问（便于电脑端直接改待办） |
-| 开启方式 | `POST /api/v1/device/auth` body `{"token":"..."}`；长度 >63 → `ESP_ERR_INVALID_ARG`（500）；空串/`null` 则删除键并关闭鉴权 |
-| **写方法无条件鉴权** | `POST` / `PUT` / `PATCH` / `DELETE` **一律**过 hook（`is_write_method()`） |
-| **强制鉴权路径** | `/api/v1/device/reboot`、`/api/v1/device/auth`、`/api/v1/ai/config`、`/api/v1/ai/history`、`/api/v1/debug/exec` 被显式标记，**即使 `auth_enabled=false` 也必须带正确 token**，否则 401 |
-| **只读接口（v1.5.0 起）** | `GET` 默认不鉴权，但**下列只读路由被 `http_router_require_auth()` 标记**，开了鉴权就**必须**带 token：<br>`GET /api/v1/todos`、`GET /api/v1/todos/*`（含 `{id}`、`export`）、`GET /api/v1/ai/history` |
+| 开启方式 | `POST /api/v1/device/auth` body `{"token":"..."}`；长度 >63 → `ESP_ERR_INVALID_ARG`（500）；空串/`null` 则删除键并关闭鉴权。**设备没设令牌时这个接口不需要旧令牌**（否则「设置第一个令牌」这条路会被自己堵死）；设备已经有令牌时，这个请求自己要带**当前**令牌 |
+| **模型一：没设令牌** | `auth_enabled=false` → **所有路由都不校验**（局域网默认）。这是设备出厂与常用的状态，也让「写第一个令牌」「配 AI Key」「用调试 shell」这三条路走得通 |
+| **模型二：设了令牌** | **所有路由都要带 token，包括 GET**。`POST`/`PUT`/`PATCH`/`DELETE` 由 `is_write_method()` 强制过 hook；**只读路由**由 `http_router_require_auth()` 标记后同样过 hook：<br>`GET /api/v1/todos`、`GET /api/v1/todos/*`（含 `{id}`、`export`）、`GET /api/v1/ai/history` |
 | 标记时机 | 路由由各组件在 `init()` 里注册，而 `require_auth()` 只能在**注册之后**调用；因此 `sync_server` 在**服务器启动时**与 **`SYS_EVENT_READY`（所有模块初始化完毕）**各标记一次 |
 | 令牌缓存 | token 在内存里缓存（`s_auth_token`），设置/清除时刷新；**不再每个请求都读一遍 NVS**（那会让 httpd 任务排在 flash 写后面）。令牌本身**不写日志**、不通过任何接口回读 |
 | 失败关闭 | 缓存里的令牌放不下（只可能发生在有人绕过本组件直接改 NVS 时）→ **鉴权按开启处理**，宁可谁也进不来，也不把设备敞开 |
 | hook 缺失 | `http_router_check_auth()` **fail-open 返回 `true`**（只在没装 `sync_server` 的测试环境出现） |
 | 失败响应 | HTTP **401** + `{"code":401,"msg":"unauthorized","data":null}`；同时发 `SYNC_EVENT_AUTH_FAILED`（payload = 路径）并打 `TH:sync: auth failed for <path>` |
+| 真机实测 | 2026-10-20 板子（`192.168.137.95`）：设令牌后 `GET /api/v1/todos` 无令牌 → **401**、错令牌 → **401**、正确令牌 → **200**；`GET /api/v1/ai/history` 无令牌 → **401**（这一条在 v1.4.0 是 200，**是本轮修掉的那个洞**） |
 
 > **网页上位机**始终带 `X-Auth-Token`（用户在「连接设置」里填的那个），
 > 所以开了鉴权后网页照常可用；SSE 订阅也带同一个头。
+> 网页的「连接设置」里还有两个按钮：**「让设备用这个令牌」**（把令牌写进设备）与
+> **「关闭设备鉴权」**——因为没设令牌时设备不校验，这两个操作不需要旧令牌。
 
 `curl.exe` 两个例子：
 
 ```powershell
-# 设置 token（首次必须通过其它方式打开，或先在设备上通过设置页设置）
+# 设置 token（设备还没设过令牌时不需要带旧令牌；已经有令牌时要带当前的）
 curl.exe -X POST http://todohelper.local/api/v1/device/auth -H "Content-Type: application/json" -H "X-Auth-Token: old-token" -d '{\"token\":\"my-secret\"}'
 # 之后写操作带 token
 curl.exe -X POST http://todohelper.local/api/v1/device/reboot -H "X-Auth-Token: my-secret"
