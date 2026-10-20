@@ -806,6 +806,14 @@ I (xxx) TH:weather_om: 4.0 C, feels 2.1 C, 46%, '晴' (code 0)
 | 统计 | `esp_err_t word_stats(word_stats_t *out);` | `new_words`=从未复习；`due`=`next_review_ts<=now`；`learned`=`level>=3` |
 | 统计 | `uint32_t word_get_daily_count(void);` | |
 | 统计 | `esp_err_t word_set_daily_count(uint32_t count);` | 夹到 **1–100**，并清空队列强制重建 |
+| 词库 | `size_t word_count(void);` | **1.4.0** 当前词库载入的词数 |
+| 云端 | `bool word_cloud_mode(void);` | 需 `mm_mode=cloud` **且**有令牌 |
+| 云端 | `esp_err_t word_cloud_refresh(void);` | **阻塞**。拉今日词表 + **给每词填满内容**（本地书优先，缺的查云端）。见 §2.5 与 `components/word_service/README.md` |
+| 云端 | `size_t word_cloud_count(void);` | 当前云端队列词数 |
+| 云端 | `esp_err_t word_cloud_export(bool force);` | **1.4.0** 把队列写成 `words/maimemo.json` |
+| 记录 | `esp_err_t word_history_append(uint32_t id, const char *spelling, word_review_result_t result, bool cloud);` | **1.4.0** 追加一条学习记录（JSONL 追加写） |
+| 记录 | `esp_err_t word_history_read(word_review_log_entry_t *out, size_t max, size_t *count, bool today_only);` | **1.4.0** 读回最近记录（追加顺序=旧→新） |
+| 记录 | `esp_err_t word_history_clear(void);` | **1.4.0** 删除记录文件 |
 | HTTP | `esp_err_t word_service_register_http(void);` | 由 `init()` 自动调用 |
 
 类型与常量：`word_item_t {uint32_t id; char spelling[64]; char phonetic[64]; char meaning[256]; char example[256]; uint8_t level; int64_t next_review_ts;}`、
@@ -1086,17 +1094,23 @@ I (xxx) TH:idle_face: idle face attached (WxH eyes, gap G)      # 待机页首�
 | 方案 A | `esp_err_t maimemo_fetch_progress(maimemo_progress_t *out);` | 账号进度（finished/total/study_time_ms/due_count）；阻塞 |
 | 方案 A | `esp_err_t maimemo_sync_start(void);` | **异步**刷新今日队列（worker 任务 + 事件）；**唯一对 UI 安全的入口** |
 | 方案 A | `esp_err_t maimemo_get_cached_progress(maimemo_progress_t *out);` | 上次同步结果，**不碰网络** |
-| 方案 B | `esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out);` | 助记/例句；命中缓存则不联网；作用域不足 → `ESP_ERR_NOT_SUPPORTED` 并按词缓存 |
+| 方案 B | `esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out);` | 助记/例句/**释义**；命中缓存则不联网；**只有三者的作用域都不足**才返回 `ESP_ERR_NOT_SUPPORTED` 并按词缓存 |
+| 方案 B | `esp_err_t maimemo_fetch_meaning(const char *spelling, char *out, size_t len);` | **1.4.0** 单独取释义（`GET /interpretations`）。`/vocabulary` **只返回 `{id,spelling}`**，所以这是云端词唯一的释义来源 |
 | 方案 C | `esp_err_t maimemo_push_words(const char **spellings, size_t count, bool advance, int *accepted);` | 批量加词（≤1000/次）；`accepted` = **服务器自报**条数 |
 | 方案 C | `esp_err_t maimemo_push_unknown(const char *spelling);` | 单张卡评分路径用；未开启方案 C 时**不碰网络**直接返回 `ESP_ERR_NOT_SUPPORTED` |
 | 方案 C | `bool maimemo_push_enabled(void);` | 方案 C 是否开启 |
 | 方案 C | `esp_err_t maimemo_set_push_enabled(bool enabled);` | 持久化到 NVS `mm_push` |
-| HTTP | `esp_err_t maimemo_register_http(void);` | 注册 6 条 `/api/v1/maimemo/*` 路由；由 `init()` 自动调用 |
+| 方案 D | `esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *advanced);` | **1.4.0** 把学过的词（按拼写）排回复习计划（`POST /study/advance_study`）；**阻塞**，调用方应批量 |
+| 方案 D | `esp_err_t maimemo_advance_words(const char **voc_ids, size_t count, int *advanced);` | **1.4.0** 同上但直接给 voc_id；`advanced` = 服务器自报的 `advanced_count` |
+| 方案 D | `bool maimemo_advance_enabled(void);` | **1.4.0** 复用 `mm_push`：加词与推进都改账号数据，一个开关管两者 |
+| 方案 D | `esp_err_t maimemo_probe(maimemo_probe_result_t *out, size_t max, size_t *count);` | **1.4.0** 逐条探测 6 个端点作用域；**一个失败不会中断其余**（作用域互相独立）|
+| HTTP | `esp_err_t maimemo_register_http(void);` | 注册 **8** 条 `/api/v1/maimemo/*` 路由；由 `init()` 自动调用 |
 
 类型与常量：`maimemo_item_t {char voc_id[80]; char spelling[64]; bool is_new; bool is_finished;
 char first_response[24];}`（`first_response` = `"FORGET"` / `"FAMILIAR"` / `"UNSPECIFIED"`）、
 `maimemo_progress_t {int finished; int total; int study_time_ms; int due_count;}`、
-`maimemo_enrich_t {char mnemonic[256]; char example[256]; bool from_cache;}`、
+`maimemo_enrich_t {char mnemonic[256]; char example[256]; char meaning[192]; bool from_cache;}`、
+`maimemo_probe_result_t {const char *path; esp_err_t err; int detail;}`、`MAIMEMO_PROBE_MAX`=6、
 `MAIMEMO_SPELLING_MAX`=64、`MAIMEMO_VOC_ID_MAX`=80、`MAIMEMO_MAX_TODAY`=64、
 `MM_MAX_RESPONSE`=24 KB、`MM_MAX_CACHE_FILE`=256 KB、`MM_TOKEN_MAX`=192。
 
@@ -1116,9 +1130,13 @@ LVGL 的控件事件回调与 `lv_timer` 回调都在**适配器锁内**运行�
   **与 AI Key 同规则（需求 §8.8）：不硬编码、不写日志、任何接口都不回读。**
   `GET /api/v1/maimemo/status` 只回 `configured` 与掩码提示（`token_hint`，形如 `g_zV****`）。
 - **令牌作用域决定哪些方案能用，且这是正常情况不是错误。** 常见的学习作用域令牌：
-  `/study/*` 与 `/vocabulary` 可用，`/notes`、`/phrases` 返回 `common_permission_denied`。
+  `study` 与 `/vocabulary` 可用，`/notes`、`/phrases` 返回 `common_permission_denied`。
+  **1.4.0 起必须知道 `/interpretations`（释义）是独立于这两者的作用域** ——
+  它常常**可用**，而释义正是"本地词库没有的词"唯一的内容来源。所以不要再从
+  "助记读不到"推断"释义也读不到"；用 `POST /api/v1/maimemo/probe` 实测。
   处理方式：映射为 **`ESP_ERR_NOT_SUPPORTED`**（语义 "这个令牌不许做这件事，别再问了"）
-  并**按词缓存为不可用**，所以每个词只会被问一次。理由：一个"能同步队列但不显示助记"的
+  并**按端点、按词缓存**（`unavailable` / `meaning_unavailable`），所以每个词只会被问一次。
+  理由：一个"能同步队列但不显示助记"的
   设备仍是有用的，一个"报错"的设备不是。
 
 #### 错误模型（**HTTP 200 也可能是失败**）
@@ -1315,6 +1333,9 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/api/v1/words/next` | word_service | 下一张卡 + `position`/`queue_total`；队空 → **404** | ✅ 200/404 |
 | POST | `/api/v1/words/{id}/review` | word_service | body `{"result":"known"|"fuzzy"|"unknown"}`（其它值 → 400），返回该词最新状态 | ✅ 200 |
 | POST | `/api/v1/words/config` | word_service | body 可含 `daily_count`/`book`/`reset:true`，返回统计 | ✅ 200 |
+| GET | `/api/v1/words/history` | word_service | **1.4.0** 设备端学习记录；`?today=1&limit=N`（≤200，默认 50）。**无记录返回空数组而非错误** | ✅ 200 |
+| POST | `/api/v1/words/history` | word_service | **1.4.0** body `{"clear":true}` 清空记录；缺该字段 → 400 | ✅ 200/400 |
+| POST | `/api/v1/words/export` | word_service | **1.4.0** 把当前云端队列写成 `words/maimemo.json`；无云端队列 → 400 | ✅ 200/400 |
 | GET | `/api/v1/wifi/status` | wifi_manager | `state`/`connected`/`ssid`/`ip`/`rssi`/`mac`/`hostname`。**1.0.0 实测 200** | ✅ 200 |
 | GET | `/api/v1/wifi/scan` | wifi_manager | **上一次**扫描的缓存结果 `{count,items[]}`；刚开机未扫过时 `count:0`（要新结果先 POST） | ✅ 200 |
 | POST | `/api/v1/wifi/scan` | wifi_manager | 触发异步扫描，立即返回 `{"scanning":true}`；结果靠随后 GET 轮询 | ✅ 200 |
@@ -1336,6 +1357,8 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/api/v1/maimemo/today` | maimemo_client | **实时**拉取今日词表（阻塞一次 HTTPS 往返）。见 §2.5 | ✅ 200/400 |
 | GET | `/api/v1/maimemo/enrich` | maimemo_client | `?spelling=` 取助记/例句；作用域不足 → `unavailable:true` 而非报错。见 §2.5 | ✅ 200/400 |
 | POST | `/api/v1/maimemo/push` | maimemo_client | body `{"spellings":[...],"advance":bool}`，把词加回学习计划。见 §2.5 | ✅ 200/400 |
+| POST | `/api/v1/maimemo/probe` | maimemo_client | **1.4.0** 逐条探测令牌能力（6 个端点），返回 `endpoints[]`/`usable`/`total`。异步，最坏 30 秒。见 §2.5 | ✅ 200/400 |
+| POST | `/api/v1/maimemo/advance` | maimemo_client | **1.4.0** body `{"spellings":[...]}`（1–64），把学过的词排回复习计划。未开启回传 → 400。见 §2.5 | ✅ 200/400 |
 
 > **路径参数写法**：路由器只支持**一个** `*`，所以单项接口注册为 `/api/v1/todos/*`、动作为 `/api/v1/todos/*/done`。
 > `*` 必须至少吞掉一个字符，因此 `/api/v1/todos/`（尾斜杠）**不**匹配 `/api/v1/todos/*`，会落到 404。
@@ -1408,10 +1431,13 @@ curl.exe -X POST http://todohelper.local/api/v1/device/reboot -H "X-Auth-Token: 
    鉴权不过 → **401**；
 6. 通过后执行 handler。
 
-其它实现细节：路由表为定长静态数组（`HTTP_ROUTER_MAX_ROUTES`=48，**1.0.0 文档写"当前用 29"已过期**；
-按 §2.1 的 51 条注册数，**表已接近上限**，加路由前先确认是否要抬高该常量）；
+其它实现细节：路由表为定长静态数组（`HTTP_ROUTER_MAX_ROUTES`=**64**，见
+`components/http_router/include/http_router.h` —— 本文档此前写 48 与"当前用 29"**都是过期的**，
+1.4.0 已核对源码更正）；
+**1.4.0 后的用量是 51 个唯一路径 / 55 条 `path+method` 注册项**（表按注册项计数），
+所以**还剩 9 个位置**，加路由前请重新核对；
 路径缓冲 64 B；同 `path+method` 重复注册 = **替换 handler**（因此各组件 `init()` 是幂等的）；
-表满返回 `ESP_ERR_NO_MEM` 并 `SYS_LOGE("route table full (48)")`；
+表满返回 `ESP_ERR_NO_MEM` 并 `SYS_LOGE("route table full (64)")`；
 `http_router_attach()` 重复调用遇到 `ESP_ERR_HTTPD_HANDLER_EXISTS` 返回 `ESP_OK`。
 
 自检命令：
@@ -1425,10 +1451,10 @@ curl.exe -i http://todohelper.local/ws/events                 # 501 + data.hint
 curl.exe -i http://todohelper.local/api/v1/wifi/status        # 404（WiFi API 未实现）
 ```
 
-### 2.5 墨墨背单词接口（`/api/v1/maimemo/*`，1.3.0）
+### 2.5 墨墨背单词接口（`/api/v1/maimemo/*`，1.3.0 起；1.4.0 增 2 条）
 
-**六个端点封装的是设备侧对墨墨开放 API 的代理**，不是墨墨 API 本身。
-设备不把令牌交给浏览器；浏览器只能通过这 6 条路由使用令牌，且**永远读不回令牌明文**。
+**八条端点封装的是设备侧对墨墨开放 API 的代理**，不是墨墨 API 本身。
+设备不把令牌交给浏览器；浏览器只能通过这些路由使用令牌，且**永远读不回令牌明文**。
 
 > **状态码语义（重要，别按常见约定猜）**：
 > **HTTP 200 只表示"设备这一层传输成功"**，它**不代表墨墨那边成功**。
@@ -1445,13 +1471,31 @@ curl.exe -i http://todohelper.local/api/v1/wifi/status        # 404（WiFi API �
 | POST | `/api/v1/maimemo/config` | **需要 `X-Auth-Token`**（写方法） | body `{"token":"...","push":bool,"verify":bool,"clear":bool}`，全部可选 | 与 `status` 同结构；另在请求了 `verify` 时多一个 `verify` 字段（`"ok"` 或 `esp_err_to_name()` 值）。**校验失败不等于令牌坏** |
 | POST | `/api/v1/maimemo/sync` | **需要 `X-Auth-Token`**（写方法） | — | `{"started":true}`；已有同步在跑 → **400** `"a sync is already running"`；无令牌 → **400**。结果靠轮询 `status` |
 | GET | `/api/v1/maimemo/today` | 无（只读） | — | `items[]`（每项 `spelling`/`is_new`/`is_finished`/`first_response`）+ `count`；无令牌 → **400**。**实时拉取，阻塞一次 HTTPS 往返** |
-| GET | `/api/v1/maimemo/enrich` | 无（只读） | query **`?spelling=`**（必填，缺失/空 → **400**） | `spelling`、`mnemonic`、`example`、`from_cache`(bool)、`unavailable`(bool)。作用域不足 → `unavailable:true` 且**仍返回 200**（不是错误） |
+| GET | `/api/v1/maimemo/enrich` | 无（只读） | query **`?spelling=`**（必填，缺失/空 → **400**） | `spelling`、`mnemonic`、`example`、**`meaning`**（1.4.0）、`from_cache`(bool)、`unavailable`(bool)。作用域不足 → `unavailable:true` 且**仍返回 200**（不是错误） |
 | POST | `/api/v1/maimemo/push` | **需要 `X-Auth-Token`**（写方法） | body `{"spellings":["a","b"],"advance":bool}`；`spellings` 必须是数组、1–1000 条，否则 **400** | `{"accepted":N}`，N 是**服务器自报**的接受条数。无令牌 → **400** |
+| POST | `/api/v1/maimemo/probe` | **需要 `X-Auth-Token`**（写方法） | —（无 body） | **1.4.0** `{"endpoints":[{"endpoint","ok","status","detail"?}...],"usable":N,"total":6}`。无令牌 → **400**。**异步 handler**（最坏 6 次串行 HTTPS，30+ 秒），绝不阻塞 httpd |
+| POST | `/api/v1/maimemo/advance` | **需要 `X-Auth-Token`**（写方法） | **1.4.0** body `{"spellings":[...]}`，1–64 条 | `{"advanced":N,"count":M}`，N 是服务器自报的 `advanced_count`。未开启回传（`mm_push`）→ **400**；无令牌 → **400** |
 
-**关于 `X-Auth-Token`**：这 6 条**都不在** `sync_server.c` 的 `s_always_auth[]` 里
+**`/probe` 的 `status` 字段就是给人看的**，它靠 `esp_err_to_name()` 区分三种"不 ok"
+（这正是以前让用户以为令牌坏了的根源）：
+
+| `status` | 含义 | 用户该做什么 |
+|---|---|---|
+| `ESP_OK`（`ok:true`）| 可用，`detail` 是该端点的条数（词数 / 记录数）| — |
+| `ESP_ERR_NOT_SUPPORTED` | **令牌作用域不够**（正常，尤其只有学习权限的令牌）| 想要这个功能就换权限更宽的令牌 |
+| `ESP_ERR_INVALID_STATE` | **令牌被拒绝**（过期 / 无效）| 重新生成令牌 |
+| `ESP_ERR_NOT_FOUND` | 端点可用，只是这个词/账号没数据 | — |
+
+**`/probe` 的意义**：`interpretations` 那一行决定"**本地词库没有的墨墨词能否显示中文释义**"。
+它是独立于 `notes`/`phrases` 的作用域，所以常见情况是 `interpretations: ok` 而
+`notes`/`phrases: ESP_ERR_NOT_SUPPORTED` —— 这时云端词**仍然有释义**，只是没有助记。
+
+**关于 `X-Auth-Token`**：这些路由**都不在** `sync_server.c` 的 `s_always_auth[]` 里
 （那份名单只有 `device/reboot`、`device/auth`、`ai/config`、`ai/history`）。
 因此生效的是 §2.3 的**通用规则**：**`POST` 无条件鉴权**（`is_write_method()`），
-`GET` 默认不鉴权。即 `auth_enabled=true` 时，三个 POST 必须带 `X-Auth-Token`，三个 GET 不需要。
+`GET` 默认不鉴权。即 `auth_enabled=true` 时，**五个 POST**
+（`config`、`sync`、`push`、**`probe`**、**`advance`**）必须带 `X-Auth-Token`，
+三个 GET（`status`、`today`、`enrich`）不需要。
 （`verify` 会真的访问墨墨，5~15 s，所以它是**显式请求**而不是保存就校验。）
 
 ```powershell
@@ -1461,11 +1505,32 @@ curl.exe -X POST http://todohelper.local/api/v1/maimemo/sync -H "X-Auth-Token: m
 # 只读操作不需要 token
 curl.exe http://todohelper.local/api/v1/maimemo/status
 curl.exe "http://todohelper.local/api/v1/maimemo/enrich?spelling=abrupt"
+# 1.4.0：先看令牌能做什么，再看设备端学习记录
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/probe -H "X-Auth-Token: my-secret"
+curl.exe "http://todohelper.local/api/v1/words/history?limit=20"
 ```
 
 **`enrich` 的 `unavailable` 与"没有助记"是两件事**：
 `unavailable:true` = 令牌作用域不够（不重试）；`unavailable:false` + 空 `mnemonic` = 问过了、
 这个词确实没有助记。UI 只在前者/后者都为空时**整块隐藏**，不显示空标签。
+
+**1.4.0 起 `unavailable` 只管助记/例句**：释义（`meaning`）的作用域是独立的，
+由 `enrich.json` 里单独的 `meaning_unavailable` 跟踪。所以**可能**看到
+`unavailable:true` 但 `meaning` 有值 —— 那是正常且期望的组合（云端独占词因此有中文可看）。
+
+#### ⛔ 墨墨开放 API 没有"提交复习评分"的接口
+
+`/study/` 下只有 `get_study_progress`、`get_today_items`、`query_study_records`、
+`add_words`、`advance_study` 五个操作。所以：
+
+- 设备上背完的词**不会**让墨墨 App 的「今日 N/M」增加；
+- "回传设备端学习情况"在平台能力内**只能**用 `advance_study`（`POST /api/v1/maimemo/advance`）
+  把学过的词排回复习计划；
+- 设备自己的记录在 `GET /api/v1/words/history`（见 §2.1）。
+
+依据：[官方开放 API 功能页](http://memodocs.maimemo.com/docs/PNvOw2E1AivPtlkRlQgce1W1n2c)、
+[官方 CLI `memo-api-cli`](https://github.com/maimemo/memo-api-cli) 的
+`src/commands/study.ts` 与 `src/types/study_model.ts`。
 
 **组件细节、三个方案的完整语义、线程规则与实测记录见
 `components/maimemo_client/README.md` 与 `AGENT.md` §9.0.6。**
@@ -1555,7 +1620,9 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
 | `cache/weather.json` | `weather_service` | 字段 `city/lat/lon/temp/feels_like/humidity/condition/icon/weather_code/update_ts/provider`；**绝不写入 API Key**；断网时页面靠它显示上次读数 |
 | `words/progress.json` | `word_service` | 结构 `{"items":{"w<id>":{level,n,last,next,at}},"version":1,"book","daily_count","known_total","fuzzy_total","unknown_total"}`；`review_count == 0` 的词不写入；原子写 |
 | `words/<book>.json` | `word_service` | 当前词库（默认 `cet4.json`）。缺失时：若 `CONFIG_TODOHELPER_WORD_EXPORT_TEMPLATE`（默认 y）把内置 32 词示例写到该路径，然后无论写成功与否都用固件内置词库兜底 |
-| `words/enrich.json` | `maimemo_client` | **1.3.0 新增**。墨墨助记/例句缓存（方案 B），路径常量 `MM_CACHE_REL` = `"words/enrich.json"`（**相对**应用目录，经 `storage_read_text()` / `storage_write_file()` 读写，**原子写**）。结构是 `{"entries":[{"spelling":"...","mnemonic":"...","example":"...","unavailable":true?}]}` —— 注意是**数组**（`entries`），不是按拼写做键的对象；`mnemonic`/`example`/`unavailable` 为空/false 时**该字段整体不写**（省体积）。`unavailable:true` 表示**令牌作用域不够、不要再问**（缓存这个结论正是为了让每个词只被问一次）。**整个文件一次性读进 PSRAM（上限 `MM_MAX_CACHE_FILE` = 256 KB）、改动后整文件重写**，不做逐词小文件 —— 内部 RAM 只有约 310 KB，批量数据必须显式走 PSRAM（`AGENT.md` §9.0.5）。文件不存在 / JSON 非法时只 `SYS_LOGW` 并**从空缓存开始**，功能照常（只是每次都要联网） |
+| `words/enrich.json` | `maimemo_client` | **1.3.0 新增，1.4.0 扩字段**。墨墨助记/例句/释义缓存（方案 B），路径常量 `MM_CACHE_REL` = `"words/enrich.json"`（**相对**应用目录，经 `storage_read_text()` / `storage_write_file()` 读写，**原子写**）。结构是 `{"entries":[{"spelling":"...","mnemonic":"...","example":"...","meaning":"...","unavailable":true?,"meaning_unavailable":true?}]}` —— 注意是**数组**（`entries`），不是按拼写做键的对象；空/false 的字段**整体不写**（省体积）。**1.4.0 把释义的"不可用"拆成独立字段**：`unavailable` 只表示 `/notes`+`/phrases` 被拒，`meaning_unavailable` 表示 `/interpretations` 被拒，因为两者作用域独立；只有两者都为 true 才整体判为不可用。**整个文件一次性读进 PSRAM（上限 `MM_MAX_CACHE_FILE` = 256 KB）、改动后整文件重写**，不做逐词小文件 —— 内部 RAM 只有约 310 KB，批量数据必须显式走 PSRAM（`AGENT.md` §9.0.5）。文件不存在 / JSON 非法时只 `SYS_LOGW` 并**从空缓存开始**，功能照常（只是每次都要联网）|
+| `words/maimemo.json` | `word_service` | **1.4.0 新增**。当日墨墨词表落成的**普通词库文件**（与 `<book>.json` 同格式：`{"name","version","words":[{id,spelling,phonetic?,meaning?,example?}]}`），由 `word_cloud_export()` 在每次云端同步成功后写出，也可用 `POST /api/v1/words/export` 手动重写。`id` 用**队列序号**（云端独占词没有本地 id）。**目的**：让墨墨那天的词表在重启后仍在、断网也能背，并能在上位机/SD 卡里查看。写失败只 `SYS_LOGD`，不影响同步结果 |
+| `words/review_log.jsonl` | `word_service` | **1.4.0 新增**。设备端学习记录，**JSONL（一行一条，追加写）**：`{"id":<num>,"w":"<拼写>","r":"known\|fuzzy\|unknown","t":<unix秒>,"cloud":true?}`。**为什么是 JSONL 不是 JSON 数组**：数组要整文件重写，而 `word_history_append()` 是从 LVGL 回调链（`word_review`）上来的，一次 O(n) FAT 写会卡住 UI；追加是 O(1)，且断电只损失最后一行（读取端跳过解析失败的行）。超过 `WORD_HISTORY_MAX_READ`（128 KB）时**只 WARN 不在线压缩**（同样理由）。`cloud:true` 表示这张卡来自墨墨队列。清空用 `POST /api/v1/words/history` |
 | `fonts/ui.ttf` | `ui_core`（字体链） | 路径来自 `CONFIG_TODOHELPER_FONT_PATH`（默认 `fonts/ui.ttf`，相对 `storage_app_dir()`）。放这里即可**免重烧**换字体；整条 FreeType 通路受 `CONFIG_TODOHELPER_FONT_FREETYPE`（默认 n）门控，关闭时回落到 LVGL 内置 Source Han Sans SC CJK |
 | `backup/todos_*.json` | — | 需求 §9.2 规划项。⚠️ 目录会被创建，Kconfig `CONFIG_TODOHELPER_TODO_BACKUP_KEEP`（默认 7）已声明，但**当前没有任何代码写备份** |
 | `logs/app.log` | — | 需求 §9.2 规划项，**当前未实现**（日志只在串口） |
@@ -1647,7 +1714,8 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
    在本文件创建后即失效。**仍待处理。**
 7. **本文件 §2.1 的"45 条路由"曾被 1.0.0 记录为与 `device/status.routes` 一致，但同文件
    §2.4 又写"当前用 29"** —— 两处自相矛盾（29 是更早的中间状态）。
-   1.3.0 已把两处统一为**按注册表推算的 51 条**，并注明 **51 尚未上机复核**。
+   1.3.0 已把两处统一为**按注册表推算的 51 条**，并注明 **51 尚未上机复核**；
+   **1.4.0 更正为：51 个唯一路径 / 55 条 `path+method` 注册项，上限 64**（已核对源码）。
    下次上机时请用 `GET /api/v1/device/status` 的 `routes` 字段校准这个数字。
 
 ---

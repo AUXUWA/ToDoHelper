@@ -17,6 +17,8 @@
 
 #include "pages_internal.h"
 
+#include "esp_heap_caps.h"
+
 #include "maimemo_client.h"
 #include "word_service.h"
 
@@ -46,6 +48,148 @@ static bool s_enrich_valid;
 static bool s_enrich_pending;
 
 /* ------------------------------------------------------------------------ */
+/* Studied-word uplink (v1.4.0)                                              */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * ## What this does, and what it deliberately does not claim
+ *
+ * MaiMemo's Open API has **no endpoint that submits a review grade** - its study
+ * surface is progress/today/records/add/advance only (verified against the
+ * official CLI and its study.proto-derived types). So a device-side grade can
+ * never move the account's "今日 N/M" counter, and this code does not pretend it
+ * can.
+ *
+ * What it does is the honest, useful part: words the user studied on the board
+ * are collected and **advanced back into the account's review plan** via
+ * `advance_study`, so the cloud schedules them instead of forgetting them, and
+ * they reappear in the phone app.
+ *
+ * Three properties make this safe on this board:
+ *   - it is **batched** - a word is queued and sent with the next flush, not
+ *     pushed one HTTPS round trip at a time (the old path did one resolve plus
+ *     one add per word);
+ *   - the network call runs on **one** worker task, never in the LVGL callback
+ *     (AGENT.md 9.0.1.1);
+ *   - the queue is a fixed small array, so a busy study session cannot allocate
+ *     without bound.
+ */
+#define WORD_UPLINK_MAX 24
+
+static char s_uplink[WORD_UPLINK_MAX][WORD_SPELLING_MAX];
+static size_t s_uplink_count;
+static bool s_uplink_running;
+
+/**
+ * Flush the collected spellings to MaiMemo on a worker task.
+ *
+ * The queue is copied and cleared on the LVGL task before this starts, so the
+ * worker owns its copy outright and the UI can keep grading while the TLS round
+ * trips happen.
+ */
+static void uplink_worker(void *arg)
+{
+    char (*batch)[WORD_SPELLING_MAX] = (char (*)[WORD_SPELLING_MAX])arg;
+
+    const char *spellings[WORD_UPLINK_MAX];
+    size_t count = 0;
+    while (count < WORD_UPLINK_MAX && batch[count][0] != '\0') {
+        spellings[count] = batch[count];
+        count++;
+    }
+
+    if (count > 0) {
+        int advanced = 0;
+        const esp_err_t err = maimemo_advance_spellings(spellings, count, &advanced);
+        if (err == ESP_OK) {
+            SYS_LOGI(TAG, "uplinked %d of %u studied word(s) back to the plan",
+                     advanced, (unsigned)count);
+        } else {
+            /* Not surfaced as a toast: the local record is already saved, and a
+             * cloud-plan update failing is not something the user asked for. */
+            SYS_LOGW(TAG, "uplink skipped: %s", esp_err_to_name(err));
+        }
+    }
+
+    free(batch);
+    s_uplink_running = false;
+    vTaskDelete(NULL);
+}
+
+/**
+ * Send whatever has been collected so far (LVGL task only).
+ *
+ * Called when the queue fills or when the page is left, which keeps the request
+ * count proportional to the session rather than to the number of cards graded.
+ */
+static void uplink_flush(void)
+{
+    if (s_uplink_count == 0 || s_uplink_running) {
+        return;
+    }
+    /* Cheap pre-checks: no allocation and no task when the feature is off, which
+     * is the default because advancing mutates the account's plan. */
+    if (!maimemo_advance_enabled() || !maimemo_has_token()) {
+        s_uplink_count = 0;
+        return;
+    }
+
+    /* PSRAM: this is a bulk buffer, and internal RAM is the scarce resource. */
+    char (*batch)[WORD_SPELLING_MAX] = heap_caps_calloc_prefer(
+        WORD_UPLINK_MAX, sizeof(*batch), 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (batch == NULL) {
+        s_uplink_count = 0;
+        return;
+    }
+    memcpy(batch, s_uplink, s_uplink_count * sizeof(*batch));
+    const size_t queued = s_uplink_count;
+    s_uplink_count = 0;
+    s_uplink_running = true;
+
+    /* 5 KB: TLS handshake plus the JSON bodies, and the stack must be internal
+     * RAM (AGENT.md 9.0.1). If it cannot start, the words stay in the local
+     * history, which is the honest outcome - the plan update is best effort. */
+    if (xTaskCreate(uplink_worker, "th_word_up", 5120, batch, 3, NULL) != pdPASS) {
+        SYS_LOGW(TAG, "cannot start the uplink worker; %u word(s) kept locally only",
+                 (unsigned)queued);
+        free(batch);
+        s_uplink_running = false;
+    }
+}
+
+/** Queue one studied spelling; flushes when the batch is full (LVGL task only). */
+static void uplink_add(const char *spelling)
+{
+    if (spelling == NULL || spelling[0] == '\0') {
+        return;
+    }
+    if (!maimemo_advance_enabled() || !maimemo_has_token()) {
+        return;
+    }
+
+    /* Skip a spelling already queued: re-grading a card should not duplicate it. */
+    for (size_t i = 0; i < s_uplink_count; i++) {
+        if (strcasecmp(s_uplink[i], spelling) == 0) {
+            return;
+        }
+    }
+
+    if (s_uplink_count >= WORD_UPLINK_MAX) {
+        uplink_flush();
+    }
+    if (s_uplink_count >= WORD_UPLINK_MAX) {
+        return;   /* flush could not start: drop rather than overwrite */
+    }
+
+    strlcpy(s_uplink[s_uplink_count], spelling, sizeof(s_uplink[0]));
+    s_uplink_count++;
+
+    if (s_uplink_count >= WORD_UPLINK_MAX) {
+        uplink_flush();
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Rendering                                                                 */
 /* ------------------------------------------------------------------------ */
 
@@ -54,6 +198,12 @@ static void render_enrich(void)
     if (s_enrich_label == NULL) {
         return;
     }
+    /*
+     * The card body already carries the local book's example (or the cloud's),
+     * so this block is now only for what the card cannot show: the 助记 (which
+     * has no field on word_item_t) and, for a word whose meaning came from the
+     * cloud cache rather than the card, the example read back from there.
+     */
     if (!s_revealed || !s_enrich_valid ||
         (s_enrich.mnemonic[0] == '\0' && s_enrich.example[0] == '\0')) {
         lv_obj_add_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
@@ -79,12 +229,21 @@ static void render_enrich(void)
     lv_obj_remove_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
 }
 
+/** Repaint the card body; defined below, referenced by enrich_ready_async(). */
+static void render_card(void);
+
 /** Applied on the LVGL task after the worker finishes fetching. */
 static void enrich_ready_async(void *arg)
 {
     (void)arg;
     s_enrich_pending = false;
-    render_enrich();
+    /*
+     * render_card(), not just render_enrich(): since v1.4.0 the worker may have
+     * filled in the card's meaning/example (that is how a cloud-only word gets
+     * its body text), so the card itself has to be repainted. render_card() ends
+     * by calling render_enrich(), so the footnote is still handled.
+     */
+    render_card();
 }
 
 /*
@@ -104,7 +263,6 @@ static void enrich_worker(void *arg)
     char *spelling = (char *)arg;
     maimemo_enrich_t enrich;
     const esp_err_t err = maimemo_enrich(spelling, &enrich);
-    free(spelling);
 
     if (err == ESP_OK) {
         s_enrich = enrich;
@@ -118,11 +276,53 @@ static void enrich_worker(void *arg)
         SYS_LOGD(TAG, "no enrichment (%s)", esp_err_to_name(err));
     }
 
+    /*
+     * v1.4.0: this is where a cloud-only card gets its body text. The queue is
+     * built without any network content (see cloud_fill_content in
+     * word_service.c), so the meaning the user is about to read arrives here.
+     *
+     * Only the fields the card is missing are filled: a local-book card keeps
+     * its curated text even if the cloud would say something different.
+     */
+    if (err == ESP_OK) {
+        bool changed = false;
+        if (s_word.meaning[0] == '\0' && enrich.meaning[0] != '\0') {
+            strlcpy(s_word.meaning, enrich.meaning, sizeof(s_word.meaning));
+            changed = true;
+        }
+        if (s_word.example[0] == '\0' && enrich.example[0] != '\0') {
+            strlcpy(s_word.example, enrich.example, sizeof(s_word.example));
+            changed = true;
+        }
+        if (changed) {
+            SYS_LOGI(TAG, "'%s' got its content from MaiMemo (释义 %u B, 例句 %u B)",
+                     spelling, (unsigned)strlen(enrich.meaning),
+                     (unsigned)strlen(enrich.example));
+        }
+    }
+
+    free(spelling);
     lv_async_call(enrich_ready_async, NULL);
     vTaskDelete(NULL);
 }
 
-/** Kick off a plan B prefetch for the current card (never blocks the UI). */
+/**
+ * Kick off a plan B prefetch for the current card (never blocks the UI).
+ *
+ * The word page used to create one 5 KB worker per card shown, which is the
+ * allocation that took the board's internal RAM from 74 KB to 49 KB and its
+ * largest contiguous block from 18 KB to 5 KB (CHANGELOG 1.3.2 "Known issues").
+ *
+ * v1.4.0 role: this is now the **content path for cloud-only words**. The queue
+ * build deliberately does no network I/O (fetching 64 words' content up front
+ * fragmented internal RAM to 160 bytes and wedged the web server - see
+ * cloud_fill_content in word_service.c), so a word that is not in the local book
+ * gets its meaning/example here, when the user actually flips to it, and the
+ * result is cached on the SD card so later views are offline.
+ *
+ * The prefetch is still skipped when the card already has everything, which is
+ * the common case: most queue words are in the local book.
+ */
 static void enrich_start(const char *spelling)
 {
     memset(&s_enrich, 0, sizeof(s_enrich));
@@ -133,6 +333,18 @@ static void enrich_start(const char *spelling)
 
     if (spelling == NULL || spelling[0] == '\0' || !maimemo_has_token() ||
         s_enrich_pending) {
+        return;
+    }
+
+    /*
+     * Nothing to add: the card already has both a meaning and an example (either
+     * from the local book or from the cache), so the only thing this worker could
+     * contribute is the 助记. Skipping keeps the common card from spawning a task
+     * at all - and this board has only ~13 KB of contiguous internal heap.
+     */
+    if (s_word.meaning[0] != '\0' && s_word.example[0] != '\0' &&
+        !maimemo_push_enabled()) {
+        SYS_LOGD(TAG, "'%s' already has content; skipping the enrich prefetch", spelling);
         return;
     }
 
@@ -181,11 +393,40 @@ static void render_card(void)
             lv_obj_add_flag(s_grade_bar, LV_OBJ_FLAG_HIDDEN);
         }
     } else {
-        /* Back: meaning and example, plus the 助记 from MaiMemo when we have it. */
-        lv_label_set_text_fmt(s_card_label, "%s\n\n%s\n\n%s",
-                              s_word.spelling,
-                              s_word.meaning[0] ? s_word.meaning : "（无释义）",
-                              s_word.example[0] ? s_word.example : "（无例句）");
+        /*
+         * Back: meaning and example, plus the 助记 from MaiMemo when we have it.
+         *
+         * A word with no meaning now has a *different* message depending on why,
+         * because the two cases need different user action:
+         *   - a cloud word with no content means the token's scope does not allow
+         *     reading 释义/助记/例句, so the hint points at the probe (the console
+         *     button that reports exactly which endpoints the token may use);
+         *   - anything else means the word genuinely has no entry yet.
+         * Showing a bare "（无释义）" for both is what made the earlier behaviour
+         * look like a bug rather than a scope limit.
+         */
+        const char *meaning = s_word.meaning[0] ? s_word.meaning : NULL;
+        const char *example = s_word.example[0] ? s_word.example : NULL;
+
+        if (meaning == NULL) {
+            const bool cloud_card = (s_word.id == WORD_ID_CLOUD) || word_cloud_mode();
+            lv_label_set_text_fmt(s_card_label, "%s\n\n%s", s_word.spelling,
+                                  cloud_card ? "（墨墨未返回释义：可在网页上位机点「探测令牌能力」查看原因）"
+                                             : "（无释义）");
+            lv_label_set_text(s_hint_label, "选择熟悉度，进入下一张");
+            if (s_grade_bar != NULL) {
+                lv_obj_remove_flag(s_grade_bar, LV_OBJ_FLAG_HIDDEN);
+            }
+            render_enrich();
+            return;
+        }
+
+        if (example != NULL) {
+            lv_label_set_text_fmt(s_card_label, "%s\n\n%s\n\n%s", s_word.spelling, meaning,
+                                  example);
+        } else {
+            lv_label_set_text_fmt(s_card_label, "%s\n\n%s", s_word.spelling, meaning);
+        }
         lv_label_set_text(s_hint_label, "选择熟悉度，进入下一张");
         if (s_grade_bar != NULL) {
             lv_obj_remove_flag(s_grade_bar, LV_OBJ_FLAG_HIDDEN);
@@ -200,7 +441,15 @@ static void render_progress(void)
         size_t position = 0;
         size_t total = 0;
         (void)word_queue_position(&position, &total);
-        lv_label_set_text_fmt(s_progress_label, "今日队列 %u/%u · 等级 %u",
+        /*
+         * Say where the queue came from. The user's report was that the word
+         * page "only has words from the local book" - so the source is now
+         * visible rather than something to infer: 墨墨 means the daily plan is
+         * driving the cards, 本地 means the offline book is.
+         */
+        const bool cloud_queue = word_cloud_mode() && word_cloud_count() > 0;
+        lv_label_set_text_fmt(s_progress_label, "%s %u/%u · 等级 %u",
+                              cloud_queue ? "墨墨今日" : "今日队列",
                               (unsigned)position, (unsigned)total,
                               s_have_word ? s_word.level : 0);
     }
@@ -293,6 +542,13 @@ static void grade_clicked_cb(lv_event_t *e)
     if (grade == WORD_REVIEW_UNKNOWN && maimemo_push_enabled()) {
         (void)maimemo_push_unknown_async(s_word.spelling);
     }
+
+    /*
+     * Uplink (v1.4.0): every graded word is queued so the words studied on the
+     * board go back into the account's plan in one batched call, instead of the
+     * "not recognised" words being the only feedback the account ever gets.
+     */
+    uplink_add(s_word.spelling);
 
     esp_err_t err = word_review(s_word.id, grade);
     if (err == ESP_ERR_NOT_FOUND && s_word.id == WORD_ID_CLOUD) {
@@ -448,23 +704,24 @@ static esp_err_t word_on_event(int32_t event_id, void *data)
 }
 
 /**
- * A MaiMemo sync finished: pull today's plan into the queue and restart.
+ * Leaving the page: send whatever is still queued for MaiMemo.
  *
- * Runs on the LVGL task (ui_event_subscribe marshals there), and
- * word_cloud_refresh() does blocking TLS - so the fetch is handed to a worker
- * task; this handler only schedules it.
+ * Flushing here (rather than per card) is what keeps the request count low: a
+ * ten-card session produces one call, not ten. The worker copies the queue
+ * first, so navigating away does not cancel the in-flight upload.
  */
-static void cloud_fetch_worker(void *arg)
+static esp_err_t word_on_hide(void)
 {
-    (void)arg;
-    const esp_err_t err = word_cloud_refresh();
-    if (err != ESP_OK) {
-        SYS_LOGW(TAG, "cloud queue refresh failed: %s", esp_err_to_name(err));
-    }
-    lv_async_call(enrich_ready_async, NULL);   /* re-render, on the LVGL task */
-    vTaskDelete(NULL);
+    uplink_flush();
+    return ESP_OK;
 }
 
+/**
+ * A MaiMemo sync finished.
+ *
+ * Runs on the LVGL task (ui_event_subscribe marshals there), so it must stay
+ * cheap - which it now is: word_service owns the queue build (see below).
+ */
 /*
  * These use ui_event_subscribe() rather than ui_event_bind(): see the forward
  * declaration above for why.
@@ -473,11 +730,13 @@ static esp_err_t maimemo_sync_done_event(int32_t event_id, void *data)
 {
     (void)event_id;
     (void)data;
-    if (word_cloud_mode()) {
-        if (xTaskCreate(cloud_fetch_worker, "th_mm_fetch", 5120, NULL, 3, NULL) != pdPASS) {
-            SYS_LOGW(TAG, "cannot start cloud fetch task");
-        }
-    }
+    /*
+     * The queue itself is built by word_service, which subscribes to this same
+     * event (v1.4.0). It used to be built *here*, which meant the queue only
+     * existed if the user happened to have the word page open when the sync
+     * finished - syncing from the web console left the device on the local book.
+     * All this handler needs to do now is repaint the numbers that changed.
+     */
     render_progress();
     return ESP_OK;
 }
@@ -498,5 +757,6 @@ const ui_page_t page_word = {
     .name = "word",
     .create = word_create,
     .on_show = word_on_show,
+    .on_hide = word_on_hide,
     .on_event = word_on_event,
 };

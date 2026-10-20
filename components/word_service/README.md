@@ -14,9 +14,11 @@
 | 分组 | 函数 |
 |---|---|
 | 生命周期 | `word_service_init()`、`word_reload()`、`word_load_from_sd()` |
-| 词库选择 | `word_get_book()`、`word_set_book()` |
+| 词库选择 | `word_get_book()`、`word_set_book()`、`word_count()` |
 | 今日队列 | `word_get_today()`、`word_next()`、`word_get()`、`word_restart_queue()`、`word_queue_position()` |
+| 云端队列 | `word_cloud_mode()`、`word_set_cloud_mode()`、`word_cloud_refresh()`、`word_cloud_count()`、`word_cloud_export()` |
 | 复习 | `word_review()`、`word_save_progress()`、`word_reset_progress()`、`word_review_name()`、`word_review_from_name()` |
+| 学习记录 | `word_history_append()`、`word_history_read()`、`word_history_clear()` |
 | 统计/配置 | `word_stats()`、`word_get_daily_count()`、`word_set_daily_count()` |
 | HTTP | `word_service_register_http()`（由 `init()` 自动调用） |
 
@@ -135,17 +137,150 @@ cJSON 节点）会把内部 RAM 抽干，并连带把当时正在连网的 WiFi 
 优先级是 **丢数据 > 卡 UI > 报错弹窗**——报错弹窗是最差的一种，
 因为它让用户以为功能坏了，而数据其实还在。
 
+## 云端队列（v1.4.0 重写）：墨墨词表 + 本地词库补内容
+
+**用户要的是"在 ESP 上完成整个背单词流程，本地词库只在没法联网和展示的时候用"**
+（原话："单词背诵里面没有墨墨单词的单词 只有本地词库的 其实我希望的功能是在 esp 上进行
+单词背诵的整个流程 本地词库是在无法联网以及展示的时候使用"）。
+
+### 旧实现的问题（已复现）
+
+`get_today_items` **只返回拼写**，而旧代码把云端词当成"spelling + 一个本地书下标"：
+
+```c
+map[i] = local_index_for(items[i].spelling);   /* 命中才有内容，否则空卡 */
+if (local == UINT16_MAX) { out[i].id = WORD_ID_CLOUD; }  /* 连释义都没有 */
+```
+
+于是**只有本地 CET-6 那 833 个词有内容**。实测线上 20 词队列里 12 词命中本地书，
+`quagga` / `narwhal` / `committee` 不在书里 —— **那 8 个词在板上根本没有东西可背**。
+
+### 新实现：构建时不联网，内容按需补（**读过再改**）
+
+`word_cloud_refresh()`（阻塞，worker 上下文）给每个云端词建一张完整卡片，分**两个阶段**：
+
+**阶段 1 —— 构建队列时，完全不联网：**
+
+1. **本地书按拼写命中 → 用本地的**。零流量、零配额、离线可用，音标/释义/例句是人工精选的。
+   同时保留本地 `id`，所以评分仍然更新同一条进度记录。
+2. **云端独占词 → 只挂历史缓存**（`maimemo_enrich_cached()`，纯 PSRAM 读）。
+   以前看过的词因此重启后仍有中文；没看过的就是空白，`meaning` 为空。
+
+**阶段 2 —— 用户翻到那张卡时**（`page_word.c` 的每卡 worker）：
+对仍缺内容的词调 `maimemo_enrich()`（释义 `/interpretations` + 助记 `/notes` + 例句 `/phrases`），
+把结果写回卡片**并缓存到 SD 卡**，所以第二次看是离线的。
+
+#### ⚠️ 为什么内容必须懒加载（这一版最重要的教训）
+
+**第一版是在构建队列时对每个云端词都调 `maimemo_enrich()`。它把板子打死了。**
+实测（55~64 词）：
+
+- 每个词一次 `GET /vocabulary` + 2~3 次 TLS，整趟跑了几分钟；
+- 每次 `maimemo_enrich()` 结尾都**整文件重写 `enrich.json`**，反复分配导致内部 RAM 碎片化；
+- 结果：`internal largest` 掉到 **160 字节**、`int-low` 从 45 KB 掉到 **472 字节**；
+- 随后 `task_wdt: IDLE0 (CPU 0) did not reset the watchdog` 反复刷屏、`CPU 1: httpd` 卡死，
+  **设备 ping 得通但所有 TCP 连不上**（v1.3.3 那个"Web 服务器被冻死"的形状重演）。
+
+改成懒加载后，同样的 55 词：`int-low` **15 KB**，队列构建后 TLS 与 Web 服务都正常。
+**根本区别是代价与"用户看了多少张卡"成正比，而不是与"账号里有多少词"成正比。**
+
+> 想在别处加"顺手把整队词的内容拉全"的优化之前，请重读这一节。
+
+队列因此从"spelling 占位数组"变成 **`word_item_t` 完整数组**，`word_get_today()` 与
+`word_next()` 只做一次结构体拷贝。
+
+### 谁触发构建（v1.4.0 修的**用户原始抱怨根因**）
+
+原来 `word_cloud_refresh()` **只被 `page_word.c` 调用**，于是"用户正好打开单词页"才建队列：
+从网页点「立即同步」或开机自动同步时，**进度数字更新了但一张卡都没进队列**，设备继续用本地书。
+实测复现过（`sync` 返回 `started:true`、串口 `study progress: 0/55`，而 `/words/today`
+仍是 CET-6 的 `adverse/advocate/...`）。
+
+现在 **`word_service` 自己订阅 `MAIMEMO_EVENT_SYNC_DONE`**（`on_maimemo_sync_done()`），
+谁发起的同步都会重建队列。两点必须记住：
+
+- **用 `sys_event_subscribe()`，不要用 `esp_event_handler_register()`。**
+  本项目的事件发到**自定义** `s_loop`（`sys_event_post_to()` →
+  `esp_event_post_to(s_loop, ...)`），用 ESP-IDF 默认循环注册**永远不触发，而且不报任何错**。
+- 处理函数里**不能**直接建队列：它在 `sys_evt` 任务上（栈很小），而 `word_cloud_refresh()`
+  要做 TLS 与 SD 写 → 交给一个一次性 worker（`th_word_cq`，6 KB）。
+
+### `words/maimemo.json`（`word_cloud_export()`）
+
+同步成功后把当日词表落成**普通词库文件**（与 `cet6.json` 同格式），于是：
+
+- **重启后还在、断网也能背**（这才是"离线兜底"该有的样子）；
+- 网页上位机 / SD 卡可以直接查看今天在背什么；
+- 需要时可用 `POST /api/v1/words/export` 手动重写。
+
+日志判据（**真机实测值**）：
+
+```
+I (xxx) TH:word: cloud queue: 55 words (2 from the local book, 2 with a meaning)
+I (xxx) TH:word: memo wordbook written: 55 cards, 2043 B
+```
+
+> `with a meaning` 比 `from the local book` 大，是因为它把**从缓存里挂上内容**的云端词
+> 也算进去了。**这两个数字都不高是当前令牌的正常结果**：它读不到 `/interpretations`
+> （见 `components/maimemo_client/README.md` 的实测表），所以云端词只能等翻卡时补、
+> 且补不到释义。换一个权限更宽的令牌后，`with a meaning` 会明显上升。
+
+`word_count()` 顺手补上（控制台/调试用），`WORD_MAIMEMO_BOOK` = `"maimemo"`。
+
+### 云端独占词的评分
+
+`WORD_ID_CLOUD` 的语义变了：以前是"没内容的空卡"，现在是"**墨墨独占词**（有释义有例句，
+只是本地没有进度记录）"。评分它时：
+
+- `word_review()` 找不到本地记录 → 写进**学习记录**（见下），不再只是打一行 DEBUG 日志；
+- `page_word.c` 的 **uplink** 路径把它排进墨墨复习计划（见 `maimemo_client` 方案 D）。
+
+## 设备端学习记录 `words/review_log.jsonl`（v1.4.0）
+
+`progress.json` 只存**每词最新状态**，回答不了"今天背了什么、结果如何"。而墨墨开放 API
+**没有提交评分的接口**（见 `components/maimemo_client/README.md` 的"能力边界"），
+所以这份记录是"设备端学习情况"唯一能被看到的地方。
+
+- 一行一条：`{"id":..,"w":"..","r":"known|fuzzy|unknown","t":<unix>,"cloud":true?}`
+- **追加写**（`storage_append_file`），不是整文件重写：JSON 数组要 O(n) 重写，
+  而这个函数是从 LVGL 回调链上来的（`word_review` → `word_history_append`）。
+  断电只会损失最后一行，读取端会跳过解析失败的行。
+- **但追加也不能就地做**（v1.4.0 的第一版就是那么写的，是错的）：
+  `word_review()` 跑在**持适配器锁的 LVGL 回调**里，而 `storage_append_file()` 是同步
+  `fopen`/`fwrite`/`fclose` —— 那就是"每次评分卡一下 UI"的经典形状（`AGENT.md §9.0.1.1`）。
+  现在：行在 RAM 里拼好 → 进 **16 条的定长环形队列**（`WORD_HISTORY_QUEUE`）→
+  由**已有的**去抖保存 worker 排空（`word_history_flush_pending()`）。
+  - **不新建任务**：本板内部 RAM 最大连续块只有约 13 KB，`xTaskCreate` 可能就是失败的那一个
+    （`AGENT.md §9.0.7 ③`）。
+  - 队列满时**丢最旧的**：刚评的卡比很久以前的更值得留。
+  - `word_history_read()` 会**先排空队列再读**，否则"刚评完看不到"会像功能坏了。
+  - `word_history_clear()` 会**先丢弃队列**，否则 worker 会把刚删掉的行又写回去。
+- 超过 `WORD_HISTORY_MAX_READ`（128 KB）时**只打 WARN 不压缩** —— 压缩 = 读+重写整个文件，
+  绝不能出现在评分路径上；空间由用户在网页点「清空记录」回收。
+- `word_history_read(out, max, &count, today_only)` 只解析需要的那部分；`today_only`
+  用 `day_start_stamp()`（`sys_time_ts()` 已含时区偏移，所以是整除 86400）。
+
 ## 今日队列的构建顺序
 
-`build_queue()` 三步，上限 `daily_count`（默认 10，`word_set_daily_count()` 夹在 **1–100**）：
+**本地书模式**：`build_queue()` 三步，上限 `daily_count`（默认 10，`word_set_daily_count()`
+夹在 **1–100**）：
 
 1. **到期复习**：`review_count > 0 && next_review_ts <= now` 的词，随后用插入排序按 `next_review_ts` 升序；
 2. **新词补位**：`review_count == 0` 的词，按词库顺序填满剩余名额；
 3. **还不足**：把剩下的**已复习**词（即尚未到期的）按词库顺序补上，保证"今天总有卡可翻"。
 
-`word_get_today(out, max, &count)` 会**重建**队列，并把 `*count` 设为**队列总长度**（不是拷进 `out` 的条数，
-所以传 `NULL`/`max=0` 只查数量时也拿得到总数）。`word_next()` 用内部游标逐张发牌，走到末尾会**回绕**到第一张；
-`word_queue_position()` 返回 1-based 游标位置与队列长度。`word_set_daily_count()` 会清空队列以强制按新容量重建。
+**云端模式**（`s_cloud_active`）则**直接使用墨墨那天的词表**，顺序由账号的计划决定，
+本地书不参与排队（只在 `cloud_fill_content()` 里提供内容）。这两条路径是互斥的：
+`word_get_today()` 与 `word_next()` 都先看 `s_cloud_active`。
+
+`word_get_today(out, max, &count)` 在本地模式下会**重建**队列，并把 `*count` 设为
+**队列总长度**（不是拷进 `out` 的条数，所以传 `NULL`/`max=0` 只查数量时也拿得到总数）。
+`word_next()` 用内部游标逐张发牌，走到末尾会**回绕**到第一张；
+`word_queue_position()` 返回 1-based 游标位置与队列长度，**云端模式下报的是云端长度**
+（否则翻着 20 张卡却显示 3/10）。`word_set_daily_count()` 会清空队列以强制按新容量重建。
+
+**`word_cloud_refresh()` 的失败降级**：任何失败（无令牌、网络、作用域）都会**丢掉云端队列并
+退回本地书**，绝不留下空页面。这也是"本地词库在无法联网时使用"的落点。
 
 ## 其他约定
 
@@ -169,6 +304,18 @@ cJSON 节点）会把内部 RAM 抽干，并连带把当时正在连网的 WiFi 
 | GET | `/api/v1/words/next` | 下一张卡 + `position`、`queue_total`；队空 → 404 |
 | POST | `/api/v1/words/{id}/review` | body `{"result":"known"\|"fuzzy"\|"unknown"}`，返回该词最新状态 |
 | POST | `/api/v1/words/config` | body 可含 `daily_count` / `book` / `reset:true`，返回统计 |
+| GET | `/api/v1/words/history` | **（v1.4.0）** 设备端学习记录。查询参数 `today=1`、`limit=N`（≤200，默认 50）。返回 `items[]`（`spelling`/`result`/`at`/`cloud`）、`count`、`today_only`、`server_ts`。**没有记录不是错误**，返回空数组 |
+| POST | `/api/v1/words/history` | **（v1.4.0）** body `{"clear":true}` 清空学习记录。做成 POST 以免浏览器预取误触发 |
+| POST | `/api/v1/words/export` | **（v1.4.0）** 把当前云端队列重写成 `words/maimemo.json`；没有云端队列时 400 |
+
+```powershell
+# 背几张卡之后看记录（设备端）
+curl.exe "http://todohelper.local/api/v1/words/history?limit=20"
+# 只看今天
+curl.exe "http://todohelper.local/api/v1/words/history?today=1"
+# 把今天的墨墨词表落到 SD 卡
+curl.exe -X POST http://todohelper.local/api/v1/words/export
+```
 
 ## Kconfig
 
@@ -212,3 +359,40 @@ curl.exe http://todohelper.local/api/v1/words/stats
 - `known` 后该词 `level` 应为 1、`next_review_ts` 约为 now + 2 天；
 - `unknown` 后 `level` 回到 0、`next_review_ts` 约为 now + 600 秒；
 - `words/progress.json` 应被原子更新，重启后 `progress restored` 的条数与已复习词数一致。
+
+### 云端模式的判据（v1.4.0，**尚未上机**）
+
+```powershell
+# 1) 先探测令牌能力（见 maimemo_client README），确认 interpretations 是否可用
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/probe
+
+# 2) 开云端模式 + 同步（需要已存令牌）
+curl.exe -X POST http://todohelper.local/api/v1/words/config -H "Content-Type: application/json" -d "{\"book\":\"maimemo\"}"
+curl.exe -X POST http://todohelper.local/api/v1/maimemo/sync
+
+# 3) 看设备上到底有没有内容：meaning 不该是空的
+curl.exe http://todohelper.local/api/v1/words/today
+```
+
+期望串口：
+
+```
+I (xxx) TH:word: cloud queue: 20 words (12 from the local book, 19 with a meaning)
+I (xxx) TH:word: memo wordbook written: 20 cards, 4821 B
+```
+
+**判据**：`with a meaning` 的数字应当**明显大于** `from the local book`；如果两者相等，
+说明 `/interpretations` 对本令牌不可用（回第 1 步看探测结果），此时本地没有的词仍只有拼写。
+
+背几张卡，然后：
+
+```powershell
+curl.exe "http://todohelper.local/api/v1/words/history?limit=20"
+```
+
+应当看到每评一张卡就多一条 `{"spelling":..,"result":..,"at":..}`，
+云端独占词还会带 `"cloud":true`。文件是 `words/review_log.jsonl`（一行一条、追加写）。
+
+> **重要**：这些记录**不会**出现在墨墨 App 的「今日 N/M」里 —— 开放 API 没有提交评分的接口。
+> 开启回传开关后，设备会用 `advance_study` 把学过的词排回复习计划（见
+> `components/maimemo_client/README.md` 方案 D）。**本轮（1.4.0）以上都没在真机上跑过。**

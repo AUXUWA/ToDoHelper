@@ -6,6 +6,174 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.4.0] — 2026-09-28
+
+**单词背诵主线改为「墨墨词表 + 本地词库补内容」：云端词终于带释义，学过的词回传复习计划。**
+HTTP API 与 NVS 键**都是新增**，旧的调用与配置继续有效（无破坏性变更）。
+
+### 起因（用户原话）
+
+> 单词背诵里面没有墨墨单词的单词 只有本地词库的 其实我希望的功能是在 esp 上进行单词背诵的
+> 整个流程 本地词库是在无法联网以及展示的时候使用
+
+复现确认：设备上「单词背诵」即使开着云端模式，也只有本地 CET-6 词库那 833 个词**有内容**。
+因为 `get_today_items` **只返回拼写**，卡片要靠 `local_index_for()` 匹配回本地书才拿得到
+音标/释义/例句；匹配不上就只有光秃秃一个单词。实测线上 20 词队列里 12 词命中本地书，
+`quagga` / `narwhal` / `committee` 都不在 —— **那 8 个词在板上没有东西可背**。
+
+### 调研结论（决定了方案边界，均已对照官方源码核实）
+
+| 结论 | 依据 |
+|---|---|
+| **墨墨开放 API 没有「提交复习评分」的接口** | `study` 只有 `progress` / `today` / `records` / `add` / `advance` 五个操作；`study.proto` 里没有任何上报端点的类型 |
+| **`POST /study/advance_study` 存在**（本仓库此前未用） | `AdvanceStudyRequest{voc_ids}` → `advanced_count`，上限 1000/次 |
+| **`GET /api/v1/interpretations?voc_id=` 能读释义** | `{interpretations:[{interpretation,tags,status,...}]}`；**这是"云端词补释义"唯一的正规来源** |
+| `/vocabulary` **只返回 `{id, spelling}`** | `vocabulary.ts`：没有释义/音标/例句，所以它只能做「拼写→ID」解析 |
+| 评分枚举还有 `VAGUE` / `WELL_FAMILIAR` / `CANCEL_WELL_FAMILIAR` | `study_model.ts` |
+
+> 依据：[官方开放 API 功能页](http://memodocs.maimemo.com/docs/PNvOw2E1AivPtlkRlQgce1W1n2c)、
+> [官方 CLI `memo-api-cli` 源码](https://github.com/maimemo/memo-api-cli)（`src/commands/study.ts`、
+> `src/types/study_model.ts`、`src/types/vocabulary.ts`、`src/types/interpretation.ts`）。
+
+### Added
+
+- **`maimemo_fetch_meaning()`**（`maimemo_client`）：读 `/interpretations` 拿释义。
+  它**与 `/notes`、`/phrases` 是不同的作用域**，所以代码不再"助记被拒就整个放弃"——
+  只有学习权限的令牌常常读不到助记/例句，**却读得到释义**，而释义正是本地词库没有的词
+  最需要的东西。两者按词分别缓存（`meaning_unavailable` 独立于 `unavailable`）。
+- **`maimemo_advance_words()` / `maimemo_advance_spellings()`**：用 `advance_study` 把设备上
+  学过的词**排回墨墨复习计划**。这是「上传设备端学习情况」在平台能力内**唯一**的合法形态。
+- **`maimemo_probe()` + `POST /api/v1/maimemo/probe`**：一次调用逐条试 6 个端点，返回每个
+  端点的结果与含义（可用 / 令牌无权 / 令牌被拒绝 / 没有数据）。把"我的令牌到底能做什么"
+  从猜测变成可观测的事实 —— 不需要手工 curl。
+- **`word_cloud_refresh()` 现在给每个云端词填满内容**（`cloud_fill_content()`）：
+  **本地书命中就用本地**（零流量、离线可用），**否则才问墨墨**补释义/例句，并缓存到 SD 卡。
+  云端队列因此从"只有拼写的占位卡"变成完整的 `word_item_t`。
+- **`words/maimemo.json`（`word_cloud_export()`）**：把当日墨墨词表落成一个**普通词库文件**，
+  于是它**重启后还在、断网也能背**，也可以在网页上位机里查看/编辑。
+- **设备端学习记录 `words/review_log.jsonl`**（`word_history_append/read/clear`）：
+  一行一条「词 / 评分 / 时间 / 来源」。`progress.json` 只存**每词最新状态**，答不了
+  "今天背了什么"，这正是"上传学习情况"在设备侧需要的记录。用 **JSONL 追加**而不是 JSON 数组，
+  因为数组要整文件重写 = 每评一张卡一次 O(n) flash 写；追加是 O(1)，且断电只损失最后一行。
+  - **追加本身也不能就地写**：`word_history_append()` 是从 `word_review()`（LVGL 回调，
+    **持适配器锁**）来的，而 `storage_append_file()` 是同步 `fopen`/`fwrite`/`fclose`。
+    所以行在 RAM 里拼好、进一个 **16 条的定长环形队列**，由**已有的**去抖保存 worker
+    一并排空（`word_history_flush_pending()`）—— 形状与 `word_save_progress_async()` 一致，
+    **不新建任务**（本板内部 RAM 最大连续块只有约 13 KB，`AGENT.md §9.0.7 ③`）。
+    读取前会先排空队列，否则"刚评完的卡看不到"会像功能坏了。
+- **`GET/POST /api/v1/words/history`**、**`POST /api/v1/words/export`**、
+  **`POST /api/v1/maimemo/advance`**。
+- **网页上位机**：「探测令牌能力」按钮（逐条结果 + 一句人话解释）、「设备端学习记录」列表
+  （最近 30 条，含"再点一次确认清空"的两段式防误触），并在面板上**明确写出**平台限制。
+
+### Changed
+
+- **`page_word.c` 的卡片**：云端卡显示真实释义/例句；没有释义时**区分原因**——云端词的提示指向
+  「探测令牌能力」，本地词才显示「无释义」。进度行区分「墨墨今日」与「今日队列」（词表来源可见）。
+- **`page_word.c` 的助记预取不再每张卡都建任务**：v1.3.2 记录的"进单词页内部 RAM 从 74 KB /
+  最大连续块 18 KB 掉到 49 KB / 5 KB"就是**每张卡一个 5 KB worker**。既然同步阶段已把内容
+  填进卡片，只有"卡片确实缺内容"时才值得起这个任务。
+- **已学词的云端回传改为批量**：以前只有「不认识」会单张推（一词一次 resolve + 一次 add）；
+  现在所有评分都进一个**固定 24 条的小队列**，满队或离开页面时**一次**发出，
+  请求数与"一次学习会话"成正比，而不是与"评了几张卡"成正比。
+
+### Known gaps（诚实说明）
+
+- **墨墨开放 API 没有提交评分的接口**，所以**设备上背完的词不会让墨墨 App 的「今日 N/M」增加**。
+  打开回传开关后，设备用 `advance_study` 把学过的词排回复习计划，让云端继续安排它们。
+  这一点写进了网页面板的说明文字，而不是假装成功。
+- **用户令牌读不到释义**：实测 `POST /api/v1/maimemo/probe` 里 `interpretations` 为
+  `ESP_ERR_NOT_SUPPORTED`，所以**本地词库没有的词目前只有拼写，没有中文释义**。
+  这是令牌权限而非代码问题，换权限更宽的令牌即可解锁 —— 见下文"Verified（真机）"。
+- **`/study/advance_study` 尚未在"可见成功"的情况下实测**（需要账号里有可推进的词，
+  且要先开启回传开关）。依据是官方 CLI 源码里的端点定义与类型。
+
+### 实现细节（踩过的坑，别再犯）
+
+- **5 KB 的栈数组会把这个 worker 打爆**：`maimemo_advance_spellings()` 原本用
+  `char storage[64][80]` 局部数组存 voc_id（5120 B）+ `ids[64]`（512 B），而它是在
+  **5 KB 的任务**里跑的（`th_word_up` / `mm_run_async` 的 worker），叠加 TLS 握手自身的栈
+  就会溢出。已改成 `heap_caps_calloc_prefer(..., MALLOC_CAP_SPIRAM)`。
+  判据：本板栈**只能来自内部 RAM**，而批量数据必须显式走 PSRAM（`AGENT.md §9.0.1` / §9.0.5）。
+- **不要把"助记读不到"当成"释义也读不到"**：两者是**不同的作用域**，
+  而释义恰恰是本地词库没有的词唯一的内容来源。`unavailable` 现在只管助记/例句。
+
+### Verified（真机，本轮烧录后实测）
+
+用户要求"烧录并告诉我应该看到的现象"，所以本版**做了真机验证**，并因此发现并修掉了
+三个只有上机才会暴露的问题（见下面的"上机才发现的三个问题"）。
+
+| 项 | 结果 |
+|---|---|
+| 固件版本 | `GET /api/v1/device/info` → `"version":"1.4.0"`，`sd_available:true`（8 GB 空闲）|
+| 路由 | `device/status` → `routes:58`（上限 64，`HTTP_ROUTER_MAX_ROUTES`）|
+| **云端队列真的在服务墨墨的词** | `GET /words/today` → `local:0 / CLOUD-ONLY:10`，词是 `pathway`、`undergraduate`、`taxpayer`、`kilogram` 等**不在 CET-6 词库里的** |
+| 云端队列规模 | 串口 `cloud queue: 55 words (2 from the local book, 2 with a meaning)` |
+| 词表落盘 | 串口 `memo wordbook written: 55 cards, 2043 B` |
+| 令牌能力探测 | `get_study_progress`/`get_today_items`(55)/`vocabulary` = **ok**；`interpretations`/`notes`/`phrases` = `ESP_ERR_NOT_SUPPORTED` |
+| 内存（构建队列后） | `internal 63 KB / largest 12 KB / int-low 15 KB` —— 未退化 |
+| Web 服务器 | 队列构建**之后** `GET /` 仍 **HTTP 200**，TLS 仍可用（不再冻死）|
+
+### 上机才发现的三个问题（都已修）
+
+这一节是本次烧录最有价值的部分：**三个问题在编译期、甚至在看代码时都完全看不出来。**
+
+1. **云端队列只在"用户正好打开单词页"时才构建** —— 这是**用户原始抱怨的真正根因**。
+   原来唯一的调用点是 `page_word.c` 的 `MAIMEMO_EVENT_SYNC_DONE` 处理函数。于是从网页
+   点「立即同步」（或开机自动同步、此时没人翻到单词页）时，**计划的词数、进度都更新了，
+   但一张卡都没进队列**，设备继续用本地书。实测复现：`sync` 返回 `{"started":true}`、
+   串口打出 `study progress: 0/55`，而 `GET /words/today` 仍然是 CET-6 的
+   `adverse/advocate/...`。
+   → **修法**：`word_service` 自己订阅该事件（依赖方向不变），谁发起的同步都会重建队列。
+
+2. **`esp_event_handler_register()` 注册在默认事件循环上，而本项目用的是自定义循环。**
+   `sys_event_post_to()` 内部是 `esp_event_post_to(s_loop, ...)`（自定义 `s_loop`），
+   所以用 ESP-IDF 的默认注册 API **永远不会触发，而且不报任何错**。
+   实测：同步成功、事件已发、handler 一次都没进（加日志才看出来）。
+   → **修法**：改用项目自己的 `sys_event_subscribe()`。
+
+3. **一次性给整队 55~64 个云端词拉内容会把板子打死。** 第一版在构建队列时对每个云端词
+   调 `maimemo_enrich()`：每词 `GET /vocabulary` + 2~3 次 TLS，且**每次都整文件重写
+   `enrich.json`**。实测内部 RAM 被碎片化到 **`largest` = 160 字节**、`int-low` 从 45 KB
+   掉到 **472 字节**，随后 `task_wdt: IDLE0 (CPU 0) did not reset the watchdog` 反复刷屏、
+   `CPU 1: httpd` 卡死，设备 **ping 得通但所有 TCP 连不上**（v1.3.3 那个形状的重演）。
+   → **修法**：构建队列**完全不联网**。本地书命中就在构建时填满；云端独占词先用
+   `maimemo_enrich_cached()`（纯 PSRAM 读）挂上历史缓存，没有的**等用户翻到那张卡时**再补，
+   补完写缓存。代价与"用户看了多少"成正比，而不是与"账号里有多少"成正比。
+   修后实测 `int-low 15 KB`，队列构建后 TLS 与 Web 服务都正常。
+
+**另外两个不是本版引入、但顺手确认了的**：
+
+- `/words/history`（读整个学习日志）与 `/words/export`（整文件写词表）原本在 httpd 单任务里
+  同步做文件 IO —— 与第 3 条同类的隐患。已改为异步 handler（`word_run_async()`），
+  与 v1.3.3 给墨墨路由做的处理一致。
+- 开机那次同步可能撞上 **DNS 未就绪**（`esp-tls: getaddrinfo() returns 202`）而失败，
+  属正常时序，下一次同步即成功。
+
+### Known gaps（诚实说明）
+
+- **用户令牌读不到释义**：实测 `interpretations` / `notes` / `phrases` 全部返回
+  `ESP_ERR_NOT_SUPPORTED`。所以**本地词库没有的词，卡上目前只有拼写，没有中文释义**。
+  「探测令牌能力」按钮就是用来一眼看清这件事的。
+  - **这不是平台没有这个能力**：官方把"调取墨墨词库的单词**释义、例句、助记**内容"列为核心功能
+    （[开放 API 功能介绍](http://memodocs.maimemo.com/docs/PNvOw2E1AivPtlkRlQgce1W1n2c)），
+    所以这是**个人令牌没有这些 scope**。
+  - **升级路径**：官方是 [open.maimemo.com/app](https://open.maimemo.com/app) 创建应用 →
+    填**授权范围**→ 审核 → OIDC 授权（文档明确写"后续需要增加权限可以再次编辑"）。
+    但那条路需要 `client_id`/`client_secret`、HTTPS 回调地址与一个后端，
+    **sdk 端目前只实现了"个人令牌直接填"这一条**。代价与建议见
+    `components/maimemo_client/README.md` 的"开放平台令牌（OIDC）的接入代价"。
+  - **先试最省事的一步**：在 App 里**重新生成一个个人令牌**再探测一次 ——
+    个人令牌的范围由墨墨控制，不排除新令牌不同，成本为零。
+- `/study/advance_study` 本身**仍未在"可见成功"的情况下实测过**（需要账号里有可推进的词）。
+
+### Verification（构建）
+
+- `bash tools/build.sh build` 通过（`todohelper.bin` 0x2edd00，分区余 63%）。
+- 网页 JS 用 `node --check` 校验语法通过；新增的 8 个元素 id 与脚本引用一一对应。
+
+---
+
 ## [1.3.3] — 2026-09-28
 
 **修：墨墨推送方向的请求会把整个 Web 服务器冻死。** 无破坏性变更。

@@ -33,6 +33,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -78,14 +79,21 @@ static bool s_initialized;
 static maimemo_progress_t s_progress;
 static bool s_have_progress;
 
-/** Enrichment cache, held in PSRAM: (spelling -> mnemonic/example). */
+/** Enrichment cache, held in PSRAM: (spelling -> mnemonic/meaning/example). */
 typedef struct {
     char spelling[MAIMEMO_SPELLING_MAX];
     char mnemonic[256];
     char example[256];
+    /** 释义 from `/interpretations` (v1.4.0). Separate from the note/phrase
+     *  pair because it is a different endpoint with a different scope, and it is
+     *  the field that lets a word absent from the local book still be studied. */
+    char meaning[192];
     /** true when the word was asked for and the API declined (permission).
      *  Cached so a study-scoped token does not re-ask on every card. */
     bool unavailable;
+    /** true when `/interpretations` specifically was refused, tracked apart from
+     *  the note/phrase pair (whose refusal sets `unavailable`). */
+    bool meaning_unavailable;
 } mm_cache_entry_t;
 
 static mm_cache_entry_t *s_cache;
@@ -796,9 +804,14 @@ static void mm_cache_load(void)
                 mm_copy(dst->spelling, sizeof(dst->spelling), entry, "spelling");
                 mm_copy(dst->mnemonic, sizeof(dst->mnemonic), entry, "mnemonic");
                 mm_copy(dst->example, sizeof(dst->example), entry, "example");
+                mm_copy(dst->meaning, sizeof(dst->meaning), entry, "meaning");
                 const cJSON *unavailable =
                     cJSON_GetObjectItemCaseSensitive(entry, "unavailable");
                 dst->unavailable = cJSON_IsBool(unavailable) && cJSON_IsTrue(unavailable);
+                const cJSON *meaning_unavailable =
+                    cJSON_GetObjectItemCaseSensitive(entry, "meaning_unavailable");
+                dst->meaning_unavailable =
+                    cJSON_IsBool(meaning_unavailable) && cJSON_IsTrue(meaning_unavailable);
                 if (dst->spelling[0] != '\0') {
                     index++;
                 }
@@ -835,8 +848,14 @@ static void mm_cache_save(void)
         if (src->example[0] != '\0') {
             cJSON_AddStringToObject(obj, "example", src->example);
         }
+        if (src->meaning[0] != '\0') {
+            cJSON_AddStringToObject(obj, "meaning", src->meaning);
+        }
         if (src->unavailable) {
             cJSON_AddBoolToObject(obj, "unavailable", true);
+        }
+        if (src->meaning_unavailable) {
+            cJSON_AddBoolToObject(obj, "meaning_unavailable", true);
         }
         cJSON_AddItemToArray(entries, obj);
     }
@@ -957,6 +976,62 @@ static esp_err_t mm_fetch_field(const char *path, const char *voc_id,
     return result;
 }
 
+esp_err_t maimemo_fetch_meaning(const char *spelling, char *out, size_t len)
+{
+    if (spelling == NULL || spelling[0] == '\0' || out == NULL || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+
+    if (!maimemo_has_token()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char voc_id[MAIMEMO_VOC_ID_MAX];
+    if (!mm_resolve_voc_id(spelling, voc_id, sizeof(voc_id))) {
+        SYS_LOGD(TAG, "'%s' is not in the MaiMemo vocabulary", spelling);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * `/interpretations` mirrors the shape of `/notes`: a GET with `?voc_id=`
+     * returning an array under `data`. The official CLI declares it as
+     * `GET /api/v1/interpretations?voc_id=` with
+     * `{interpretations:[{interpretation,tags,status,...}]}`, and it is the only
+     * endpoint in the Open API that returns 释义 - `/vocabulary` returns just
+     * `{id, spelling}`.
+     */
+    return mm_fetch_field("interpretations", voc_id, "interpretations",
+                          "interpretation", out, len);
+}
+
+esp_err_t maimemo_enrich_cached(const char *spelling, maimemo_enrich_t *out)
+{
+    if (spelling == NULL || spelling[0] == '\0' || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    mm_cache_load();
+    const mm_cache_entry_t *cached = mm_cache_find(spelling);
+    if (cached == NULL) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    strlcpy(out->mnemonic, cached->mnemonic, sizeof(out->mnemonic));
+    strlcpy(out->example, cached->example, sizeof(out->example));
+    strlcpy(out->meaning, cached->meaning, sizeof(out->meaning));
+    out->from_cache = true;
+    const bool have_text = (out->mnemonic[0] != '\0' || out->example[0] != '\0' ||
+                            out->meaning[0] != '\0');
+    xSemaphoreGive(s_lock);
+
+    /* Deliberately no network here - that is the whole point of this variant. */
+    return have_text ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
 esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
 {
     if (spelling == NULL || spelling[0] == '\0' || out == NULL) {
@@ -969,13 +1044,28 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
 
     mm_cache_entry_t *cached = mm_cache_find(spelling);
     if (cached != NULL) {
-        if (cached->unavailable) {
+        /*
+         * Serve from cache when there is anything to serve. Note that
+         * `unavailable` (notes/phrases refused) no longer short-circuits the
+         * whole call: `/interpretations` has its own scope, so a token that
+         * cannot read 助记 may still be able to read 释义, and those words are
+         * exactly the ones that need it most (they are missing from the local
+         * book). Only when *both* halves are known-unobtainable is the answer
+         * final.
+         */
+        const bool have_text = cached->mnemonic[0] != '\0' ||
+                               cached->example[0] != '\0' ||
+                               cached->meaning[0] != '\0';
+        const bool all_unavailable = cached->unavailable && cached->meaning_unavailable;
+        if (all_unavailable) {
             xSemaphoreGive(s_lock);
             return ESP_ERR_NOT_SUPPORTED;   /* already known unobtainable */
         }
-        if (cached->mnemonic[0] != '\0' || cached->example[0] != '\0') {
+        if (have_text && (cached->meaning_unavailable || cached->meaning[0] != '\0' ||
+                          cached->unavailable)) {
             strlcpy(out->mnemonic, cached->mnemonic, sizeof(out->mnemonic));
             strlcpy(out->example, cached->example, sizeof(out->example));
+            strlcpy(out->meaning, cached->meaning, sizeof(out->meaning));
             out->from_cache = true;
             xSemaphoreGive(s_lock);
             return ESP_OK;
@@ -1004,10 +1094,23 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
                                      out->example, sizeof(out->example));
     }
 
+    /*
+     * 释义 is a separate endpoint with its own scope, so it is attempted even
+     * when the note pair was refused - that combination (queue readable, notes
+     * refused, interpretations readable) is the common study-scoped token, and
+     * the meaning is the field that actually matters for a card.
+     */
+    const esp_err_t meaning_err = mm_fetch_field("interpretations", voc_id,
+                                                 "interpretations", "interpretation",
+                                                 out->meaning, sizeof(out->meaning));
+
     const bool out_of_scope = (notes_err == ESP_ERR_NOT_SUPPORTED &&
                                phrases_err == ESP_ERR_NOT_SUPPORTED);
-    SYS_LOGD(TAG, "'%s': 助记=%s 例句=%s%s", spelling, esp_err_to_name(notes_err),
-             esp_err_to_name(phrases_err), out_of_scope ? " (token scope limits these)" : "");
+    const bool meaning_out_of_scope = (meaning_err == ESP_ERR_NOT_SUPPORTED);
+    SYS_LOGD(TAG, "'%s': 助记=%s 例句=%s 释义=%s%s", spelling,
+             esp_err_to_name(notes_err), esp_err_to_name(phrases_err),
+             esp_err_to_name(meaning_err),
+             (out_of_scope && meaning_out_of_scope) ? " (token scope limits these)" : "");
 
     /*
      * Re-look the entry up instead of reusing the `cached` pointer taken above.
@@ -1025,22 +1128,25 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
     if (slot != NULL) {
         strlcpy(slot->mnemonic, out->mnemonic, sizeof(slot->mnemonic));
         strlcpy(slot->example, out->example, sizeof(slot->example));
+        strlcpy(slot->meaning, out->meaning, sizeof(slot->meaning));
         slot->unavailable = out_of_scope;
+        slot->meaning_unavailable = meaning_out_of_scope;
         mm_cache_save();
     }
     xSemaphoreGive(s_lock);
 
-    if (out_of_scope) {
+    if (out_of_scope && meaning_out_of_scope) {
         /* Cached as unavailable, so this is reported once per word rather than
          * once per card shown. */
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (out->mnemonic[0] == '\0' && out->example[0] == '\0') {
+    if (out->mnemonic[0] == '\0' && out->example[0] == '\0' && out->meaning[0] == '\0') {
         return ESP_ERR_NOT_FOUND;
     }
 
-    SYS_LOGI(TAG, "enriched '%s' (助记 %u B, 例句 %u B)", spelling,
-             (unsigned)strlen(out->mnemonic), (unsigned)strlen(out->example));
+    SYS_LOGI(TAG, "enriched '%s' (助记 %u B, 例句 %u B, 释义 %u B)", spelling,
+             (unsigned)strlen(out->mnemonic), (unsigned)strlen(out->example),
+             (unsigned)strlen(out->meaning));
     return ESP_OK;
 }
 
@@ -1200,6 +1306,292 @@ esp_err_t maimemo_push_unknown_async(const char *spelling)
         SYS_LOGW(TAG, "cannot start the push worker");
         return ESP_ERR_NO_MEM;
     }
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Plan D: read 释义 / advance studied words / probe scopes                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * ## What "uploading the device's study state" can and cannot mean
+ *
+ * The Open API has **no endpoint that submits a review grade**. Its whole study
+ * surface is `get_study_progress`, `get_today_items`, `query_study_records`,
+ * `add_words` and `advance_study` (verified against the official CLI's `study`
+ * command and the `study.proto`-derived types in `memo-api-cli`). There is no
+ * "this word was graded FAMILIAR" call, so the account's own "今日 N/M" counter
+ * cannot be moved from this device.
+ *
+ * `advance_study` is the closest legitimate write, and it is a genuinely useful
+ * one: it makes words due for review now, so a word the user studied on the
+ * board comes back in the account's plan (and thus in the phone app) rather than
+ * being ignored by the cloud. That is what this function does, and the UI says
+ * exactly that instead of implying a grade was submitted.
+ */
+
+bool maimemo_advance_enabled(void)
+{
+    /* One switch for both write paths: adding words and advancing words both
+     * mutate the account, so a user who declined one has declined both. */
+    return maimemo_push_enabled();
+}
+
+esp_err_t maimemo_advance_words(const char **voc_ids, size_t count, int *advanced)
+{
+    if (advanced != NULL) {
+        *advanced = 0;
+    }
+    if (voc_ids == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!maimemo_has_token()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON *ids = cJSON_AddArrayToObject(root, "voc_ids");
+    if (ids == NULL) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t usable = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (voc_ids[i] == NULL || voc_ids[i][0] == '\0') {
+            continue;
+        }
+        cJSON *entry = cJSON_CreateString(voc_ids[i]);
+        if (entry == NULL) {
+            continue;
+        }
+        cJSON_AddItemToArray(ids, entry);
+        usable++;
+    }
+    if (usable == 0) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (body == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON *reply = NULL;
+    const esp_err_t err = mm_post("study/advance_study", body, &reply);
+    free(body);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Report the server's own count: it may decline ids it does not track. */
+    int advanced_count = (int)usable;
+    const cJSON *data = mm_data(reply);
+    const cJSON *server_count =
+        data ? cJSON_GetObjectItemCaseSensitive(data, "advanced_count") : NULL;
+    if (cJSON_IsNumber(server_count)) {
+        advanced_count = (int)server_count->valuedouble;
+    }
+    cJSON_Delete(reply);
+
+    if (advanced != NULL) {
+        *advanced = advanced_count;
+    }
+    SYS_LOGI(TAG, "advanced %d of %u studied word(s) back into the plan",
+             advanced_count, (unsigned)usable);
+    return ESP_OK;
+}
+
+esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *advanced)
+{
+    if (spellings == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!maimemo_advance_enabled()) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /*
+     * Resolve first: advance_study takes voc_ids, and a spelling MaiMemo does
+     * not know cannot be advanced. Resolution is one GET per word, so the caller
+     * should batch - which the sync path does.
+     *
+     * The id buffer is **on the heap, not the stack**. A `char[64][80]` local is
+     * 5 KB, and this function is called from a 5 KB worker task (and from the
+     * HTTP worker of the same size): together with the TLS handshake's own stack
+     * use that overflows the task, which on this board shows up as a reboot
+     * rather than a clean error. PSRAM is the right home for bulk data here
+     * (AGENT.md 9.0.5).
+     */
+    const size_t limit = (count < 64) ? count : 64;
+    char (*storage)[MAIMEMO_VOC_ID_MAX] = heap_caps_calloc_prefer(
+        limit, sizeof(*storage), 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    const char **ids = heap_caps_calloc_prefer(limit, sizeof(*ids), 2,
+                                               MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (storage == NULL || ids == NULL) {
+        heap_caps_free(storage);
+        heap_caps_free(ids);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t resolved = 0;
+    for (size_t i = 0; i < limit; i++) {
+        if (spellings[i] == NULL || spellings[i][0] == '\0') {
+            continue;
+        }
+        if (!mm_resolve_voc_id(spellings[i], storage[resolved], sizeof(storage[0]))) {
+            SYS_LOGD(TAG, "advance: '%s' unknown to MaiMemo, skipped", spellings[i]);
+            continue;
+        }
+        ids[resolved] = storage[resolved];
+        resolved++;
+    }
+
+    esp_err_t err;
+    if (resolved == 0) {
+        SYS_LOGW(TAG, "advance: none of the %u words resolved", (unsigned)count);
+        err = ESP_ERR_NOT_FOUND;
+    } else {
+        err = maimemo_advance_words(ids, resolved, advanced);
+    }
+
+    heap_caps_free(storage);
+    heap_caps_free(ids);
+    return err;
+}
+
+/*
+ * Probe table. Ordered by how much each endpoint matters to the study flow:
+ * the first two decide whether the queue works at all, `/interpretations` and
+ * the note pair decide whether a card can show content for a word the local book
+ * does not have.
+ */
+static const struct {
+    const char *path;      /**< endpoint to exercise */
+    const char *label;     /**< what it proves, for the console */
+} MM_PROBE[] = {
+    { "study/get_study_progress", "账号进度" },
+    { "study/get_today_items",    "今日词表" },
+    { "vocabulary",               "拼写→ID 解析" },
+    { "interpretations",          "释义" },
+    { "notes",                    "助记" },
+    { "phrases",                  "例句" },
+};
+
+/** Resolve one spelling to a voc_id, for the probe's per-word endpoints.
+ *
+ * Probing needs *some* word to ask about. Hard-coding a single spelling made the
+ * whole word-scoped half of the probe depend on that one word existing in the
+ * account's vocabulary - and since the probe exists precisely to explain why a
+ * card has no content, a wrong "no data" verdict would be the worst outcome.
+ *
+ * So a few common spellings are tried in turn; they are all in the shipped CET-6
+ * book and in MaiMemo's vocabulary, so at least one resolving means the token
+ * and the endpoint are fine. The word-scoped endpoints are asked about the first
+ * one that resolves, which keeps the four probes comparable.
+ *
+ * Returns false only when none resolve, in which case the caller reports
+ * "no data" rather than a permission verdict (see maimemo_probe()).
+ */
+static bool mm_probe_voc_id(char *out, size_t len)
+{
+    static const char *const CANDIDATES[] = { "abrupt", "abolish", "absolute" };
+
+    for (size_t i = 0; i < sizeof(CANDIDATES) / sizeof(CANDIDATES[0]); i++) {
+        if (mm_resolve_voc_id(CANDIDATES[i], out, len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+esp_err_t maimemo_probe(maimemo_probe_result_t *out, size_t max, size_t *count)
+{
+    if (out == NULL || count == NULL || max == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+
+    if (!maimemo_has_token()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* One resolution shared by the four word-scoped endpoints: it is the same
+     * lookup they would each do, and on this board every HTTPS round trip is
+     * worth avoiding. */
+    char voc_id[MAIMEMO_VOC_ID_MAX] = { 0 };
+    bool have_voc = false;
+
+    const size_t total = sizeof(MM_PROBE) / sizeof(MM_PROBE[0]);
+    size_t written = 0;
+
+    for (size_t i = 0; i < total && written < max; i++) {
+        const char *path = MM_PROBE[i].path;
+        cJSON *root = NULL;
+        esp_err_t err;
+        int detail = -1;
+
+        const bool word_scoped = (strcmp(path, "study/get_study_progress") != 0 &&
+                                  strcmp(path, "study/get_today_items") != 0);
+        if (word_scoped && !have_voc) {
+            have_voc = mm_probe_voc_id(voc_id, sizeof(voc_id));
+        }
+
+        if (strcmp(path, "study/get_study_progress") == 0) {
+            err = mm_post(path, "{}", &root);
+            if (err == ESP_OK) {
+                const cJSON *data = mm_data(root);
+                const cJSON *progress =
+                    data ? cJSON_GetObjectItemCaseSensitive(data, "progress") : NULL;
+                const cJSON *finished =
+                    progress ? cJSON_GetObjectItemCaseSensitive(progress, "finished") : NULL;
+                detail = cJSON_IsNumber(finished) ? (int)finished->valuedouble : -1;
+            }
+        } else if (strcmp(path, "study/get_today_items") == 0) {
+            err = mm_post(path, "{\"is_finished\":false,\"limit\":64}", &root);
+            if (err == ESP_OK) {
+                const cJSON *data = mm_data(root);
+                const cJSON *items =
+                    data ? cJSON_GetObjectItemCaseSensitive(data, "today_items") : NULL;
+                detail = cJSON_IsArray(items) ? cJSON_GetArraySize(items) : -1;
+            }
+        } else if (strcmp(path, "vocabulary") == 0) {
+            /* Exercised through the shared resolution so the probe measures the
+             * same call the study flow depends on. */
+            err = have_voc ? ESP_OK : ESP_ERR_NOT_FOUND;
+            detail = have_voc ? 1 : 0;
+        } else if (!have_voc) {
+            /* No id to ask about: report the resolution failure rather than a
+             * misleading permission verdict. */
+            err = ESP_ERR_NOT_FOUND;
+        } else {
+            char query[128];
+            snprintf(query, sizeof(query), "voc_id=%s", voc_id);
+            const char *array_key = (strcmp(path, "interpretations") == 0) ? "interpretations"
+                                    : (strcmp(path, "notes") == 0)         ? "notes"
+                                                                          : "phrases";
+            err = mm_get(path, query, &root);
+            if (err == ESP_OK) {
+                const cJSON *data = mm_data(root);
+                const cJSON *list =
+                    data ? cJSON_GetObjectItemCaseSensitive(data, array_key) : NULL;
+                detail = cJSON_IsArray(list) ? cJSON_GetArraySize(list) : 0;
+            }
+        }
+
+        cJSON_Delete(root);
+        out[written].path = path;
+        out[written].err = err;
+        out[written].detail = detail;
+        written++;
+    }
+
+    *count = written;
     return ESP_OK;
 }
 

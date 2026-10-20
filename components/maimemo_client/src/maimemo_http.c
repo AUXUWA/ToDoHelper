@@ -390,6 +390,10 @@ static void enrich_worker(httpd_req_t *req, void *arg)
     cJSON_AddStringToObject(obj, "spelling", spelling);
     cJSON_AddStringToObject(obj, "mnemonic", enrich.mnemonic);
     cJSON_AddStringToObject(obj, "example", enrich.example);
+    /* 释义 (v1.4.0): read from /interpretations, which has its own permission
+     * scope. It is therefore possible - and expected - for this to carry a value
+     * while "unavailable" is true (that flag only covers 助记/例句). */
+    cJSON_AddStringToObject(obj, "meaning", enrich.meaning);
     cJSON_AddBoolToObject(obj, "from_cache", enrich.from_cache);
     /* "unavailable" is distinct from "not found": the token simply may not read
      * this endpoint, and the console says so rather than "no mnemonic exists". */
@@ -595,6 +599,208 @@ static esp_err_t push_post_handler(httpd_req_t *req)
     return err;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Capability probe and studied-word uplink (v1.4.0)                         */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Probe worker: exercises every endpoint and reports the outcome per endpoint.
+ *
+ * Runs off the httpd task for the same reason as every other handler here: it
+ * performs up to six sequential HTTPS round trips.
+ */
+static void probe_worker(httpd_req_t *req, void *arg)
+{
+    (void)arg;
+
+    maimemo_probe_result_t results[MAIMEMO_PROBE_MAX];
+    size_t count = 0;
+    const esp_err_t err = maimemo_probe(results, MAIMEMO_PROBE_MAX, &count);
+    if (err != ESP_OK) {
+        char json[192];
+        snprintf(json, sizeof(json),
+                 "{\"code\":400,\"msg\":\"probe failed\","
+                 "\"data\":{\"esp_err\":\"%s\"}}", esp_err_to_name(err));
+        (void)http_reply_json(req, 400, "probe failed", json);
+        return;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *items = cJSON_CreateArray();
+    if (root == NULL || items == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(items);
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "probe");
+        return;
+    }
+
+    int usable = 0;
+    for (size_t i = 0; i < count; i++) {
+        cJSON *obj = cJSON_CreateObject();
+        if (obj == NULL) {
+            continue;
+        }
+        cJSON_AddStringToObject(obj, "endpoint", results[i].path);
+        cJSON_AddBoolToObject(obj, "ok", results[i].err == ESP_OK);
+        /*
+         * The esp_err_t name is the useful part: ESP_ERR_NOT_SUPPORTED means the
+         * token's scope excludes the endpoint (a normal, expected answer), while
+         * ESP_ERR_INVALID_STATE means the token itself was rejected. Collapsing
+         * those two is what made the earlier "token does not work" reports
+         * misleading.
+         */
+        cJSON_AddStringToObject(obj, "status", esp_err_to_name(results[i].err));
+        if (results[i].detail >= 0) {
+            cJSON_AddNumberToObject(obj, "detail", (double)results[i].detail);
+        }
+        cJSON_AddItemToArray(items, obj);
+        if (results[i].err == ESP_OK) {
+            usable++;
+        }
+    }
+
+    cJSON_AddItemToObject(root, "endpoints", items);
+    cJSON_AddNumberToObject(root, "usable", (double)usable);
+    cJSON_AddNumberToObject(root, "total", (double)count);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "probe");
+        return;
+    }
+    (void)http_reply_ok(req, json);
+    cJSON_free(json);
+}
+
+/** POST /api/v1/maimemo/probe - "what can this token actually do?" */
+static esp_err_t probe_post_handler(httpd_req_t *req)
+{
+    if (!maimemo_has_token()) {
+        return http_reply_bad_request(req, "no token configured");
+    }
+    return mm_run_async(req, probe_worker, NULL, 6144, "th_mm_probe");
+}
+
+/** Body for the advance endpoint: spellings the device has studied. */
+typedef struct {
+    char **spellings;
+    size_t count;
+} advance_job_t;
+
+static void advance_worker(httpd_req_t *req, void *arg)
+{
+    advance_job_t *job = (advance_job_t *)arg;
+    int advanced = 0;
+    const esp_err_t err = maimemo_advance_spellings((const char **)job->spellings,
+                                                    job->count, &advanced);
+
+    char json[192];
+    if (err == ESP_OK) {
+        snprintf(json, sizeof(json), "{\"advanced\":%d,\"count\":%u}", advanced,
+                 (unsigned)job->count);
+        (void)http_reply_ok(req, json);
+    } else {
+        snprintf(json, sizeof(json),
+                 "{\"code\":500,\"msg\":\"internal error\","
+                 "\"data\":{\"detail\":\"advance words\",\"esp_err\":\"%s\"}}",
+                 esp_err_to_name(err));
+        (void)http_reply_json(req, 500, "advance words", json);
+    }
+}
+
+static void advance_job_free(advance_job_t *job)
+{
+    if (job == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < job->count; i++) {
+        free(job->spellings[i]);
+    }
+    free(job->spellings);
+    free(job);
+}
+
+/**
+ * POST /api/v1/maimemo/advance  body {"spellings":[...]}
+ *
+ * The device-side "upload the study state" path. MaiMemo has no endpoint that
+ * accepts a review grade, so this puts the studied words back into the account's
+ * review plan instead - see maimemo_client.h. Requires the same opt-in as the
+ * add-words push, because it also mutates the account.
+ */
+static esp_err_t advance_post_handler(httpd_req_t *req)
+{
+    if (!maimemo_has_token()) {
+        return http_reply_bad_request(req, "no token configured");
+    }
+    if (!maimemo_advance_enabled()) {
+        return http_reply_bad_request(req,
+                                      "disabled; enable pushing in the maimemo panel first");
+    }
+
+    char *body = NULL;
+    if (http_read_body(req, &body, NULL) != ESP_OK) {
+        return http_reply_bad_request(req, "missing body");
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (root == NULL) {
+        return http_reply_bad_request(req, "invalid json");
+    }
+
+    const cJSON *array = cJSON_GetObjectItemCaseSensitive(root, "spellings");
+    if (!cJSON_IsArray(array)) {
+        cJSON_Delete(root);
+        return http_reply_bad_request(req, "spellings must be an array");
+    }
+
+    const size_t count = (size_t)cJSON_GetArraySize(array);
+    if (count == 0 || count > 64) {
+        cJSON_Delete(root);
+        return http_reply_bad_request(req, "spellings must hold 1..64 entries");
+    }
+
+    advance_job_t *job = calloc(1, sizeof(*job));
+    if (job == NULL) {
+        cJSON_Delete(root);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "advance words");
+    }
+    job->spellings = calloc(count, sizeof(char *));
+    if (job->spellings == NULL) {
+        cJSON_Delete(root);
+        advance_job_free(job);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "advance words");
+    }
+
+    /*
+     * strdup each spelling: the cJSON tree is freed before the worker runs, and
+     * this is exactly the dangling-pointer bug the push handler had to fix.
+     */
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, array) {
+        if (!cJSON_IsString(entry) || entry->valuestring[0] == '\0') {
+            continue;
+        }
+        job->spellings[job->count] = strdup(entry->valuestring);
+        if (job->spellings[job->count] != NULL) {
+            job->count++;
+        }
+    }
+    cJSON_Delete(root);
+
+    if (job->count == 0) {
+        advance_job_free(job);
+        return http_reply_bad_request(req, "no usable spellings");
+    }
+
+    const esp_err_t err = mm_run_async(req, advance_worker, job, 6144, "th_mm_adv");
+    if (err != ESP_OK) {
+        advance_job_free(job);
+    }
+    return err;
+}
+
 esp_err_t maimemo_register_http(void)
 {
     static const struct {
@@ -608,6 +814,8 @@ esp_err_t maimemo_register_http(void)
         { "/api/v1/maimemo/today", HTTP_GET, today_get_handler },
         { "/api/v1/maimemo/enrich", HTTP_GET, enrich_get_handler },
         { "/api/v1/maimemo/push", HTTP_POST, push_post_handler },
+        { "/api/v1/maimemo/probe", HTTP_POST, probe_post_handler },
+        { "/api/v1/maimemo/advance", HTTP_POST, advance_post_handler },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

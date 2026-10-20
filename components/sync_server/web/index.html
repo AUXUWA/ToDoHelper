@@ -221,6 +221,8 @@
   .chip.mm-new{background:rgba(61,169,252,.16);color:var(--primary)}
   .chip.mm-done{background:rgba(46,204,113,.16);color:var(--success)}
   .chip.mm-plain{background:rgba(154,167,180,.14);color:var(--muted)}
+  /* 「不认识」/ 令牌被拒绝：需要用户注意，所以用 danger 色。 */
+  .chip.mm-unknown{background:rgba(231,76,60,.16);color:var(--danger)}
 
   #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:30;max-width:88vw;
          padding:11px 18px;border-radius:12px;background:var(--surface-alt);border:1px solid var(--line);
@@ -371,24 +373,51 @@
           <button class="btn small" type="button" id="mm-refresh">刷新状态</button>
           <button class="btn small" type="button" id="mm-sync">立即同步</button>
           <button class="btn small" type="button" id="mm-today">拉取今日词表</button>
+          <button class="btn small" type="button" id="mm-probe">探测令牌能力</button>
+        </div>
+
+        <!--
+          能力探测：一次调用逐条试每个端点，把"这个令牌到底能做什么"从猜测变成事实。
+          学习作用域令牌读不到助记/例句是常态，但释义（/interpretations）常常可以 ——
+          而释义正是"墨墨词在设备上没有中文"能否解决的关键。
+        -->
+        <div id="mm-probe-box" hidden>
+          <h3 class="mm-sub">令牌能力探测</h3>
+          <ul class="mm-list" id="mm-probe-list"></ul>
+          <p class="small muted" id="mm-probe-note"></p>
         </div>
 
         <label class="field" style="margin-top:12px"><span>API 令牌（只写，保存后不再回显）</span>
           <input type="password" id="mm-token" autocomplete="new-password" placeholder="粘贴墨墨开放 API 令牌"></label>
-        <label class="inline-check"><input type="checkbox" id="mm-push"><span>允许设备把新词推送到墨墨（复习计划 C）</span></label>
+        <label class="inline-check"><input type="checkbox" id="mm-push"><span>允许设备把学过的词回传墨墨（推送新词 + advance 回复习计划）</span></label>
         <div class="row-actions">
           <button class="btn primary" type="button" id="mm-save">保存并校验</button>
           <button class="btn danger" type="button" id="mm-clear">清除令牌</button>
         </div>
         <p class="small muted">
           「保存并校验」会带着令牌当场访问一次墨墨接口，正常需要 5–15 秒，请耐心等按钮恢复。
-          校验失败不一定代表令牌无效 —— 只有学习权限的令牌读不到助记 / 例句，属于正常现象。
+          校验失败不一定代表令牌无效 —— 只有学习权限的令牌读不到助记 / 例句，属于正常现象，
+          用上面的<strong>「探测令牌能力」</strong>可以看到逐条结果。<br>
+          <strong>关于「回传学习情况」</strong>：墨墨开放 API <strong>没有</strong>提交复习评分的接口，
+          所以设备上背完的词<strong>不会</strong>让墨墨 App 的「今日 N/M」增加。开启上面的开关后，
+          设备会把学过的词用 <code>advance_study</code> 排回复习计划，让云端继续安排它们。
         </p>
 
         <div id="mm-today-box" hidden>
           <h3 class="mm-sub" id="mm-today-head">今日词表</h3>
           <ul class="mm-list" id="mm-today-list"></ul>
           <p class="small muted" id="mm-today-note"></p>
+        </div>
+
+        <!-- 设备端学习记录：progress.json 只存每词最新状态，这里才能看到"今天背了什么" -->
+        <div id="mm-history-box">
+          <h3 class="mm-sub">设备端学习记录</h3>
+          <div class="row-actions">
+            <button class="btn small" type="button" id="mm-hist-refresh">刷新记录</button>
+            <button class="btn small" type="button" id="mm-hist-clear">清空记录</button>
+          </div>
+          <ul class="mm-list" id="mm-hist-list"></ul>
+          <p class="small muted" id="mm-hist-note"></p>
         </div>
       </div>
     </details>
@@ -1498,9 +1527,12 @@ $("mm-today").addEventListener("click", function () {
   });
 });
 
-/* 折叠时不去打扰设备：展开 / 页面回到前台时才拉一次状态。 */
+/* 折叠时不去打扰设备：展开时才拉一次状态，顺带把学习记录带出来。 */
 $("maimemo").addEventListener("toggle", function (event) {
-  if (event.currentTarget.open) { loadMaimemo(); }
+  if (event.currentTarget.open) {
+    loadMaimemo();
+    loadWordHistory();
+  }
 });
 
 /* 助记 / 例句是按词查询的，等词表里的词需要时再取；这里统一给出权限话术。 */
@@ -1509,6 +1541,193 @@ function mmEnrichNote(data) {
   if (data && data.from_cache) { return "来自设备缓存"; }
   return "";
 }
+
+/* ========================================================================
+   12b. 令牌能力探测 + 设备端学习记录（v1.4.0）
+   ======================================================================== */
+
+/* 每个端点用一句人话说清"它能干什么"，因为 esp_err_t 名字对用户没有意义。 */
+var MM_PROBE_LABELS = {
+  "study/get_study_progress": "账号进度（今日已学 / 计划）",
+  "study/get_today_items": "今日词表（设备背什么）",
+  "vocabulary": "拼写→ID 解析（推词 / 查词的前提）",
+  "interpretations": "释义（本地词库没有的词能否显示中文）",
+  "notes": "助记",
+  "phrases": "例句"
+};
+
+/*
+ * esp_err_t → 人话。这里最重要的是分清两种"不 ok"：
+ * ESP_ERR_NOT_SUPPORTED 是作用域不够（正常，尤其是只有学习权限的令牌），
+ * ESP_ERR_INVALID_STATE 才是令牌本身不被接受 —— 混为一谈会让用户以为令牌坏了。
+ */
+function mmProbeVerdict(item) {
+  if (item.ok) {
+    var detail = (typeof item.detail === "number" && item.detail >= 0)
+      ? "（" + item.detail + "）" : "";
+    return { text: "可用" + detail, cls: "ok" };
+  }
+  if (item.status === "ESP_ERR_NOT_SUPPORTED") {
+    return { text: "令牌无权（作用域限制，属正常）", cls: "warn" };
+  }
+  if (item.status === "ESP_ERR_INVALID_STATE") {
+    return { text: "令牌被拒绝，请重新生成", cls: "bad" };
+  }
+  if (item.status === "ESP_ERR_NOT_FOUND") {
+    return { text: "没有数据（不是权限问题）", cls: "" };
+  }
+  return { text: item.status || "失败", cls: "bad" };
+}
+
+function mmRenderProbe(data) {
+  var list = $("mm-probe-list");
+  var box = $("mm-probe-box");
+  if (!list || !box) { return; }
+  list.textContent = "";
+
+  var items = (data && data.endpoints) || [];
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    var verdict = mmProbeVerdict(item);
+    var row = el("li", "mm-word");
+    /* 未知路径也显示出来，否则设备以后加了端点本页会静默漏掉。 */
+    row.append(el("span", "sp", MM_PROBE_LABELS[item.endpoint] || item.endpoint));
+    var chips = el("div", "chips");
+    chips.append(el("span",
+                    "chip " + (verdict.cls === "ok" ? "mm-done"
+                              : verdict.cls === "bad" ? "mm-unknown" : "mm-plain"),
+                    verdict.text));
+    row.append(chips);
+    list.append(row);
+  }
+
+  var usable = (data && data.usable) || 0;
+  var total = (data && data.total) || items.length;
+  var note = "共探测 " + total + " 个端点，可用 " + usable + " 个。";
+  var hasMeaning = false;
+  for (var k = 0; k < items.length; k++) {
+    if (items[k].endpoint === "interpretations" && items[k].ok) { hasMeaning = true; }
+  }
+  if (hasMeaning) {
+    note += " 释义可读 —— 本地词库没有的墨墨词也能显示中文释义。";
+  } else if (items.length) {
+    note += " 释义不可读：本地词库没有的词只能显示拼写，建议换一个权限更宽的令牌。";
+  }
+  setText($("mm-probe-note"), note);
+  box.hidden = false;
+}
+
+$("mm-probe").addEventListener("click", function () {
+  if (MM_STATUS && !MM_STATUS.configured) {
+    toast("尚未配置墨墨令牌，请先在上方保存", "warn");
+    $("mm-token").focus();
+    return;
+  }
+  /* 逐条试六个端点，最坏情况是六次串行 HTTPS，所以给足超时。 */
+  mmSetBusy("mm-probe", true, "探测中…（最多 30 秒）", "探测令牌能力");
+  api("/api/v1/maimemo/probe", { method: "POST", timeoutMs: 60000 })
+    .then(function (data) {
+      mmRenderProbe(data || {});
+      toast("探测完成：可用 " + (((data && data.usable) || 0)) + " 个端点", "ok");
+    }).catch(function (err) {
+      reportError(err, "探测令牌能力");
+    }).then(function () {
+      mmSetBusy("mm-probe", false, "", "探测令牌能力");
+    });
+});
+
+var MM_HIST_MAX_ROWS = 30;
+
+function mmResultLabel(result) {
+  if (result === "known") { return "认识"; }
+  if (result === "fuzzy") { return "模糊"; }
+  if (result === "unknown") { return "不认识"; }
+  return result || "?";
+}
+
+function mmRenderHistory(data) {
+  var list = $("mm-hist-list");
+  if (!list) { return; }
+  list.textContent = "";
+
+  var items = (data && data.items) || [];
+  /* 设备按追加顺序返回（旧→新），倒过来显示更符合"最近发生了什么"。 */
+  var recent = items.slice().reverse().slice(0, MM_HIST_MAX_ROWS);
+  for (var i = 0; i < recent.length; i++) {
+    var item = recent[i];
+    var row = el("li", "mm-word");
+    row.append(el("span", "sp", item.spelling || "(空)"));
+    var chips = el("div", "chips");
+    chips.append(el("span",
+                    "chip " + (item.result === "known" ? "mm-done"
+                              : item.result === "unknown" ? "mm-unknown" : "mm-plain"),
+                    mmResultLabel(item.result)));
+    if (item.cloud) { chips.append(el("span", "chip mm-new", "墨墨")); }
+    chips.append(el("span", "chip mm-plain",
+                    item.at ? new Date(item.at * 1000).toLocaleString() : "—"));
+    row.append(chips);
+    list.append(row);
+  }
+
+  var count = (data && data.count) || 0;
+  var note;
+  if (!count) {
+    note = "还没有记录。设备上每评一张卡就会记一条。";
+  } else if (count > MM_HIST_MAX_ROWS) {
+    note = "共 " + count + " 条，这里显示最近 " + MM_HIST_MAX_ROWS + " 条。";
+  } else {
+    note = "共 " + count + " 条（设备端记录，最新在前）。";
+  }
+  note += " 墨墨开放 API 没有提交评分的接口，所以这些记录不会让墨墨 App 的「今日 N/M」增加；" +
+          "开启上面的回传开关后，设备会用 advance_study 把学过的词排回复习计划。";
+  setText($("mm-hist-note"), note);
+}
+
+function loadWordHistory() {
+  return api("/api/v1/words/history?limit=100", { timeoutMs: 8000 })
+    .then(function (data) { mmRenderHistory(data || {}); return data; })
+    .catch(function (err) {
+      /* 没插卡 / 还没背过时返回的是"没有数据"，不该弹错误横幅。 */
+      mmRenderHistory({ items: [], count: 0 });
+      return null;
+    });
+}
+
+$("mm-hist-refresh").addEventListener("click", function () {
+  mmSetBusy("mm-hist-refresh", true, "读取中…", "刷新记录");
+  loadWordHistory().then(function () {
+    mmSetBusy("mm-hist-refresh", false, "", "刷新记录");
+  });
+});
+
+$("mm-hist-clear").addEventListener("click", function () {
+  /* 不可逆，所以要二次确认；按钮本身也先"上膛"再执行。 */
+  var button = $("mm-hist-clear");
+  if (button.dataset.armed !== "1") {
+    button.dataset.armed = "1";
+    button.textContent = "再点一次确认清空";
+    setTimeout(function () {
+      button.dataset.armed = "";
+      button.textContent = "清空记录";
+    }, 4000);
+    return;
+  }
+  button.dataset.armed = "";
+  button.textContent = "清空记录";
+  mmSetBusy("mm-hist-clear", true, "清空中…", "清空记录");
+  api("/api/v1/words/history", {
+    method: "POST",
+    body: JSON.stringify({ clear: true }),
+    timeoutMs: 8000
+  }).then(function () {
+    toast("设备端学习记录已清空", "ok");
+    return loadWordHistory();
+  }).catch(function (err) {
+    reportError(err, "清空学习记录");
+  }).then(function () {
+    mmSetBusy("mm-hist-clear", false, "", "清空记录");
+  });
+});
 
 /* ========================================================================
    13. SSE：实时推送（EventSource 或带 token 的 fetch 流）+ 轮询兜底

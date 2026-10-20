@@ -142,6 +142,44 @@ esp_err_t word_cloud_refresh(void);
 size_t word_cloud_count(void);
 
 /**
+ * @brief Total number of words loaded from the book (v1.4.0).
+ *
+ * Used by the console to show which book is backing the cards.
+ */
+size_t word_count(void);
+
+/** @brief Name of the generated MaiMemo wordbook, without extension. */
+#define WORD_MAIMEMO_BOOK "maimemo"
+
+/**
+ * @brief Persist the current cloud queue as a wordbook on storage (v1.4.0).
+ *
+ * ## Why (the user's actual request)
+ *
+ * The daily queue comes from MaiMemo, but `/study/get_today_items` returns only
+ * a spelling. The card needs spelling + phonetic + meaning + example, and until
+ * now the only source was the local book, matched by spelling - so a word the
+ * local book does not contain (verified: `quagga`, `narwhal`, `committee` on a
+ * live account) was shown with **no meaning at all**.
+ *
+ * This writes the queue out as a normal wordbook (`words/maimemo.json`) with the
+ * content filled in as far as it could be obtained, so:
+ *   - the queue survives a reboot and works offline, and
+ *   - the phone/web console can inspect or edit what the device is studying.
+ *
+ * Content priority is "local book first, then the cloud": a word already in the
+ * CET-6 book keeps the curated phonetic/meaning/example without a network call,
+ * and only the leftovers are asked about. Run from a worker task - it writes the
+ * card and may do TLS.
+ *
+ * @param force true to rewrite even when nothing changed.
+ */
+esp_err_t word_cloud_export(bool force);
+
+/** @brief Path (relative to the app dir) of the generated MaiMemo wordbook. */
+#define WORD_MAIMEMO_BOOK_FILE "words/" WORD_MAIMEMO_BOOK ".json"
+
+/**
  * @brief Today's queue: due words first, then new words, capped by the daily count.
  *
  * @param out Array of at least @p max entries (NULL to only query the count).
@@ -205,6 +243,46 @@ const char *word_review_name(word_review_result_t result);
 
 /** @brief Parse a grade name; returns false when unknown. */
 bool word_review_from_name(const char *name, word_review_result_t *out);
+
+/* ---- Study history (v1.4.0) ---------------------------------------------- */
+
+/**
+ * One graded card, appended to `words/review_log.jsonl`.
+ *
+ * ## Why a log, when progress.json already exists
+ *
+ * `progress.json` keeps only the *latest* state per word, so it cannot answer
+ * "what did I study today, and how did it go?" - which is what "上传设备端的
+ * 学习情况" needs on the device side. MaiMemo's Open API has no endpoint that
+ * accepts a review grade, so the account cannot record it either; the honest
+ * place to keep it is here, where the web console and the HTTP API can read it.
+ */
+typedef struct {
+    uint32_t id;                  /**< word id, or WORD_ID_CLOUD */
+    char spelling[WORD_SPELLING_MAX];
+    uint8_t result;               /**< word_review_result_t */
+    bool cloud;                   /**< true when the card came from MaiMemo */
+    int64_t at;                   /**< Unix seconds (or uptime before NTP) */
+} word_review_log_entry_t;
+
+/** Append one graded card to the study history (best effort, non-fatal). */
+esp_err_t word_history_append(uint32_t id, const char *spelling,
+                              word_review_result_t result, bool cloud);
+
+/**
+ * @brief Read back the most recent entries, newest last.
+ *
+ * @param out Array of at least @p max entries.
+ * @param max Capacity of @p out (clamped internally).
+ * @param count Receives the number of entries written.
+ * @param today_only When true, only entries whose timestamp falls on the current
+ *                   local day are returned.
+ */
+esp_err_t word_history_read(word_review_log_entry_t *out, size_t max,
+                            size_t *count, bool today_only);
+
+/** @brief Drop the study history. */
+esp_err_t word_history_clear(void);
 
 /** @brief Publish the /api/v1/words/... routes (requirement 8.4). */
 esp_err_t word_service_register_http(void);

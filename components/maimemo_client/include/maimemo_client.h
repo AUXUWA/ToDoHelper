@@ -95,8 +95,34 @@ typedef struct {
 typedef struct {
     char mnemonic[256];  /**< 助记: the first note, concatenated if short */
     char example[256];   /**< 例句: the first phrase */
+    /**
+     * 释义 (v1.4.0): `/interpretations` is a **separate** endpoint from
+     * `/notes`, and on a study-scoped token it is often readable when the note
+     * endpoints are not. It is the only way a word that is absent from the local
+     * book can still be studied with a meaning on screen, so it has its own
+     * field and its own permission outcome.
+     */
+    char meaning[192];
     bool from_cache;     /**< true when served without touching the network */
 } maimemo_enrich_t;
+
+/**
+ * Outcome of one endpoint in maimemo_probe().
+ *
+ * The point of the probe is to turn "does my token allow X?" from a guess into
+ * an observed fact: the same account token that syncs the daily queue may or may
+ * not be allowed to read 释义/助记/例句, and the answer decides whether cloud
+ * cards can show content. Reported per endpoint rather than as one verdict
+ * because the scopes really are independent.
+ */
+typedef struct {
+    const char *path;    /**< Endpoint path, for display */
+    esp_err_t err;       /**< ESP_OK, ESP_ERR_NOT_SUPPORTED (scope), ... */
+    int detail;          /**< Endpoint-specific count (words/notes/...), or -1 */
+} maimemo_probe_result_t;
+
+/** How many endpoints maimemo_probe() reports on. */
+#define MAIMEMO_PROBE_MAX 6
 
 /**
  * @brief Is a token configured?
@@ -145,6 +171,23 @@ esp_err_t maimemo_fetch_progress(maimemo_progress_t *out);
  * @param out      Receives the enrichment; zeroed when unavailable.
  */
 esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out);
+
+/**
+ * @brief Cache-only enrichment lookup: **never touches the network** (v1.4.0).
+ *
+ * Serves whatever a previous maimemo_enrich() call already cached, so a card
+ * that has been viewed once keeps its meaning offline and without another round
+ * trip. Safe to call from any task, including the LVGL one - it only reads the
+ * in-PSRAM cache (loading it from the card once).
+ *
+ * Needed because filling every cloud word's content during a sync turned out to
+ * be far too expensive on this board: 64 words x several TLS calls, each ending
+ * in a whole-file cache rewrite, fragmented internal RAM down to 160 bytes and
+ * wedged the web server. Content is therefore filled per card, when shown.
+ *
+ * @return ESP_OK when the cache had something, ESP_ERR_NOT_FOUND otherwise.
+ */
+esp_err_t maimemo_enrich_cached(const char *spelling, maimemo_enrich_t *out);
 
 /**
  * @brief Plan C: add words to the MaiMemo study plan.
@@ -203,6 +246,87 @@ esp_err_t maimemo_sync_start(void);
 
 /** @brief Last known progress, without touching the network. */
 esp_err_t maimemo_get_cached_progress(maimemo_progress_t *out);
+
+/**
+ * @brief Plan D: fetch the 释义 for a spelling (`GET /interpretations`).
+ *
+ * ## Why this exists (v1.4.0)
+ *
+ * `/study/get_today_items` returns only `voc_id` + `voc_spelling` - no meaning.
+ * `GET /vocabulary?spelling=` returns only `{id, spelling}` too, so it can
+ * resolve an id but cannot supply content. The local CET-6 book covers a share
+ * of the account's words and nothing more, so a cloud word outside the book had
+ * no meaning at all on the card.
+ *
+ * `GET /interpretations?voc_id=` is the endpoint that actually carries 释义
+ * (`{"data":{"interpretations":[{"interpretation":"...","tags":[...]}]}}`),
+ * verified against the official CLI (`memo-api interp list -v <voc_id>`).
+ *
+ * Like the note/phrase readers this is permission-gated, and a study-scoped
+ * token may be refused; that maps to ESP_ERR_NOT_SUPPORTED and is cached by
+ * maimemo_enrich() so the question is asked at most once per word.
+ *
+ * @param spelling Word to look up.
+ * @param out      Receives the meaning; empty when unavailable.
+ */
+esp_err_t maimemo_fetch_meaning(const char *spelling, char *out, size_t len);
+
+/**
+ * @brief Plan D: mark words as due now (`POST /study/advance_study`).
+ *
+ * ## Why this exists (v1.4.0) - and what it cannot do
+ *
+ * **MaiMemo's Open API has no endpoint that submits a review grade.** The
+ * `study` surface is exactly `get_study_progress`, `get_today_items`,
+ * `query_study_records`, `add_words` and `advance_study` (verified against the
+ * official CLI's `study` command and its `study.proto`-derived types). There is
+ * therefore no way for the device to report "the user recognised this word" -
+ * the account's own "今日 N/M" counter will not move because of anything graded
+ * on this board. Claiming otherwise would be a lie in the UI.
+ *
+ * `advance_study` is the closest legitimate write: it makes the given words due
+ * for review now, so words studied on the device reappear in the account's plan
+ * (and in the phone app's queue) instead of being forgotten by the cloud. That
+ * is what "uploading the device's study state" can honestly mean.
+ *
+ * @param voc_ids Array of MaiMemo word ids (not spellings).
+ * @param count   Number of ids; the API accepts up to 1000.
+ * @param advanced Optional; receives the server's own `advanced_count`.
+ */
+esp_err_t maimemo_advance_words(const char **voc_ids, size_t count, int *advanced);
+
+/**
+ * @brief Plan D, by spelling: advance words the device has already studied.
+ *
+ * Resolves spellings to ids first (words MaiMemo does not know are skipped) and
+ * then calls maimemo_advance_words(). Honours the same opt-in switch as the
+ * push path, because it also mutates the user's cloud plan.
+ *
+ * @warning **Blocking TLS.** Worker/HTTP context only.
+ */
+esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *advanced);
+
+/**
+ * @brief Probe which endpoints the configured token may use. Blocking.
+ *
+ * Fills @p out with one entry per endpoint (up to @p max, MAIMEMO_PROBE_MAX is
+ * the intended size) and returns how many were written via @p count.
+ *
+ * Every endpoint is attempted even after a failure, because the scopes are
+ * independent: the observed real-world case is a token that reads the study
+ * endpoints and is refused on `/notes` and `/phrases`. This is the one call
+ * that answers "what can this token actually do?" without hand-written curl
+ * commands.
+ */
+esp_err_t maimemo_probe(maimemo_probe_result_t *out, size_t max, size_t *count);
+
+/**
+ * @brief Whether advancing studied words back to the plan is enabled.
+ *
+ * Shares `SYS_KEY_MAIMEMO_PUSH` with the add-words path: both mutate account
+ * data, so one opt-in covers both.
+ */
+bool maimemo_advance_enabled(void);
 
 /** @brief Register the /api/v1/maimemo/... routes. */
 esp_err_t maimemo_register_http(void);

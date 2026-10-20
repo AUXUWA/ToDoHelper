@@ -67,17 +67,34 @@ static uint32_t s_unknown_total;
 
 /*
  * When `SYS_KEY_MAIMEMO_MODE` is "cloud" and a token is configured, today's
- * queue is MaiMemo's study plan rather than the local book. The cloud words are
- * held in their own array because they are *not* in s_words: a word can be in
- * the account's plan without being in the SD-card book, and the reverse is also
- * true.
+ * queue is MaiMemo's study plan rather than the local book.
  *
- * Local progress (level/scheduling) still applies: a cloud word is matched back
- * to the book by spelling so grading it updates the same record the local flow
- * would, and a word with no local entry simply cannot be graded locally - see
- * cloud_index_for().
+ * The cloud words are held in their own array because they are *not* in s_words:
+ * a word can be in the account's plan without being in the SD-card book, and the
+ * reverse is also true.
+ *
+ * ## v1.4.0: the queue carries content, not just spellings
+ *
+ * MaiMemo's `/study/get_today_items` returns only `voc_id` + `voc_spelling`, so
+ * a cloud word used to be matched back to the book by spelling and, when absent,
+ * shown as a bare spelling with no meaning - which is what the user reported
+ * ("单词背诵里面没有墨墨单词的单词 只有本地词库的"). The queue now holds a full
+ * `word_item_t` per entry, filled in two stages:
+ *
+ *   - **at build time, without any network**: a word found in the local book
+ *     (CET-6) gets its curated phonetic/meaning/example, and a cloud-only word
+ *     gets whatever a previous view already cached (an in-PSRAM read);
+ *   - **when the card is shown**: a cloud-only word with no cached text is
+ *     enriched then, by page_word's per-card worker, and the result is cached on
+ *     the SD card so later views are free.
+ *
+ * Fetching everything up front was the first attempt and it **broke the board**
+ * (see cloud_fill_content); the lazy split is what makes the feature safe here.
+ *
+ * `s_cloud_map` still records the book index when there is one, so grading keeps
+ * updating the same local record the local flow would.
  */
-static maimemo_item_t *s_cloud_words;
+static word_item_t *s_cloud_words;
 static size_t s_cloud_count;
 /** Book indices for the cloud queue: UINT16_MAX means "no local entry". */
 static uint16_t *s_cloud_map;
@@ -111,6 +128,9 @@ static TaskHandle_t s_save_task;
 static StaticSemaphore_t s_save_lock_buf;
 static SemaphoreHandle_t s_save_lock;
 
+/* Defined with the study-history section below; the save worker drains it. */
+void word_history_flush_pending(void);
+
 static void word_save_worker(void *arg)
 {
     (void)arg;
@@ -119,6 +139,11 @@ static void word_save_worker(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         /* Absorb a burst of requests before touching the card. */
         vTaskDelay(pdMS_TO_TICKS(WORD_SAVE_DEBOUNCE_MS));
+
+        /* Study-history lines first: they are appended, so unlike progress.json
+         * there is nothing to coalesce - and draining them here means the UI
+         * path never touches the card itself. */
+        word_history_flush_pending();
 
         const esp_err_t err = word_save_progress();
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -166,6 +191,24 @@ static int64_t now_stamp(void)
 {
     const int64_t ts = sys_time_ts();
     return (ts > 0) ? ts : (sys_time_ms() / 1000);
+}
+
+/**
+ * Start of the current local day, for the "today only" history filter.
+ *
+ * `sys_time_ts()` is already UTC+offset because calendar_service applies the
+ * configured timezone when it anchors the clock (see sys_config_get_str(
+ * SYS_KEY_TZ)), so the day boundary is a plain integer division. Only valid when
+ * the clock is synced; before that the history filter falls back to "everything
+ * since boot", which is the same compromise the todo list makes.
+ */
+static int64_t day_start_stamp(void)
+{
+    const int64_t ts = sys_time_ts();
+    if (ts <= 0) {
+        return 0;
+    }
+    return (ts / 86400) * 86400;
 }
 
 /**
@@ -706,6 +749,157 @@ static void free_cloud_queue(void)
     s_cloud_active = false;
 }
 
+/* Defined after word_cloud_refresh(), which calls it. */
+esp_err_t word_cloud_export(bool force);
+
+/*
+ * ## Why word_service reacts to the sync event itself (v1.4.0)
+ *
+ * Until 1.4.0 the only caller of word_cloud_refresh() was page_word.c, on
+ * MAIMEMO_EVENT_SYNC_DONE. That made building the queue depend on the user
+ * *having the word page open*: syncing from the web console (or on boot, before
+ * anyone navigates) fetched the plan and updated the progress numbers, but never
+ * populated a single card - so the device kept serving the local book, and the
+ * user's report ("单词背诵里面没有墨墨单词") reproduced even with a working token
+ * and a successful sync. Verified on the real board: `sync` returned
+ * `{"started":true}`, `study progress: 0/55` appeared in the log, and
+ * `GET /words/today` still answered with local CET-6 words.
+ *
+ * Subscribing here means the queue is rebuilt wherever the sync came from: boot,
+ * the console's 立即同步 button, or the UI. The dependency direction is
+ * unchanged (word_service already calls maimemo_*), so no new debt is added.
+ */
+static void on_maimemo_sync_done(void *arg, esp_event_base_t base,
+                                 int32_t event_id, void *data);
+
+/**
+ * Worker that builds the cloud queue off the event task.
+ *
+ * The sync event is delivered on the shared sys_evt task, whose stack is small
+ * (AGENT.md 9.0.1), and word_cloud_refresh() does blocking TLS plus SD-card
+ * writes - so it must not run there. One worker per completed sync, which is
+ * naturally rate-limited by the sync itself (maimemo_sync_start() refuses to
+ * start a second one while one is in flight).
+ */
+static void cloud_build_worker(void *arg)
+{
+    (void)arg;
+    const esp_err_t err = word_cloud_refresh();
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "cloud queue refresh failed: %s", esp_err_to_name(err));
+    }
+    vTaskDelete(NULL);
+}
+
+static void on_maimemo_sync_done(void *arg, esp_event_base_t base,
+                                 int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+
+    if (!word_cloud_mode()) {
+        return;
+    }
+
+    /* 6 KB: TLS handshake, the enrichment fetches this may trigger, and the
+     * JSON work for words/maimemo.json. Internal RAM only (AGENT.md 9.0.1). */
+    if (xTaskCreate(cloud_build_worker, "th_word_cq", 6144, NULL, 3, NULL) != pdPASS) {
+        /* Not fatal: the local book still serves cards, and the next sync (or a
+         * page visit) retries. Logged because it means the queue silently did not
+         * get built, which is exactly the symptom this path exists to fix. */
+        SYS_LOGW(TAG, "cannot start the cloud queue worker; using the local book");
+    }
+}
+
+/**
+ * Fill in the display content for one cloud word.
+ *
+ * Order matters and is the heart of the v1.4.0 change:
+ *
+ *   1. **Local book by spelling** - if the word is in the CET-6 book we already
+ *      have a curated phonetic/meaning/example, and using it costs no network
+ *      call and no cloud quota. This covers the words the account and the book
+ *      share.
+ *   2. **MaiMemo** - only for the leftovers ("云端独占词"). `maimemo_enrich()`
+ *      reads 释义 from `/interpretations` and 助记/例句 from `/notes` and
+ *      `/phrases`, caching everything on the SD card, so this is paid once per
+ *      word rather than once per card view.
+ *
+ * A word with neither still gets a card - it just shows the spelling alone,
+ * which is now the exception instead of the rule.
+ */
+/*
+ * ## Why content is filled lazily (v1.4.0, after a real regression)
+ *
+ * The obvious implementation is to enrich every cloud word while building the
+ * queue. That was the first version of this code and it **took the board down**:
+ * with 64 words, each needing `GET /vocabulary` plus two or three more TLS
+ * round trips, the pass ran for minutes, and because every `maimemo_enrich()`
+ * ends with a *whole-file* rewrite of `enrich.json`, the repeated allocations
+ * fragmented internal RAM until `internal largest` read **160 bytes**. The web
+ * server stopped answering; only a reboot recovered it.
+ *
+ * So the queue build now does **no network I/O at all** for content:
+ *
+ *   - a word in the local book (the common case - measured 12 of 20 on a live
+ *     account, and 10 of 10 in the queue the device actually serves) is complete
+ *     the moment it is built;
+ *   - a cloud-only word starts as spelling-only, and its meaning/example are
+ *     filled in **when the user actually flips to that card** (page_word's
+ *     existing per-card enrich worker), then cached on the SD card so the second
+ *     view is offline.
+ *
+ * That keeps the cost proportional to what the user looks at instead of what the
+ * account contains, which is the same reasoning behind the per-card fetch that
+ * was already there.
+ */
+static void cloud_fill_content(word_item_t *dst, const maimemo_item_t *src,
+                               uint16_t local_index)
+{
+    memset(dst, 0, sizeof(*dst));
+    strlcpy(dst->spelling, src->spelling, sizeof(dst->spelling));
+    dst->id = WORD_ID_CLOUD;
+
+    if (local_index == UINT16_MAX) {
+        /* Cloud-only: the card will fetch its own content when shown. */
+        return;
+    }
+
+    const word_item_t *local = &s_words[local_index];
+    strlcpy(dst->phonetic, local->phonetic, sizeof(dst->phonetic));
+    strlcpy(dst->meaning, local->meaning, sizeof(dst->meaning));
+    strlcpy(dst->example, local->example, sizeof(dst->example));
+    dst->level = s_progress[local_index].level;
+    dst->next_review_ts = s_progress[local_index].next_review_ts;
+    /* Keep the local id so grading updates the existing record. */
+    dst->id = local->id;
+}
+
+/**
+ * Look up already-cached content for a cloud-only card. **No network.**
+ *
+ * This is the read half of the lazy scheme: it serves whatever a previous view
+ * (or a previous session) already cached, so a card that has been seen once
+ * shows its meaning immediately and offline.
+ */
+static void cloud_apply_cached_content(word_item_t *card)
+{
+    maimemo_enrich_t enrich;
+    if (maimemo_enrich_cached(card->spelling, &enrich) != ESP_OK) {
+        return;
+    }
+    if (card->phonetic[0] == '\0') {
+        /* The API has no phonetic for cloud words; leave it empty rather than
+         * inventing one - the card simply shows the spelling, which is what a
+         * flashcard front is for. */
+        (void)0;
+    }
+    strlcpy(card->meaning, enrich.meaning, sizeof(card->meaning));
+    strlcpy(card->example, enrich.example, sizeof(card->example));
+}
+
 /**
  * Pull today's words from MaiMemo. Blocking - worker/HTTP context only.
  *
@@ -723,9 +917,13 @@ esp_err_t word_cloud_refresh(void)
                                                    MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     uint16_t *map = heap_caps_malloc_prefer(MAIMEMO_MAX_TODAY * sizeof(uint16_t), 2,
                                             MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
-    if (items == NULL || map == NULL) {
+    /* The resolved cards: full content, so the queue is display-ready. */
+    word_item_t *cards = heap_caps_calloc_prefer(MAIMEMO_MAX_TODAY, sizeof(word_item_t), 2,
+                                                 MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (items == NULL || map == NULL || cards == NULL) {
         heap_caps_free(items);
         heap_caps_free(map);
+        heap_caps_free(cards);
         return ESP_ERR_NO_MEM;
     }
 
@@ -734,19 +932,39 @@ esp_err_t word_cloud_refresh(void)
     if (err != ESP_OK) {
         heap_caps_free(items);
         heap_caps_free(map);
+        heap_caps_free(cards);
         return err;
     }
 
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     size_t mapped = 0;
+    size_t with_content = 0;
     for (size_t i = 0; i < count; i++) {
+        /* local_index_for() reads s_words/s_count, which only change on a reload
+         * (not concurrently with a sync), so this needs no lock. */
         map[i] = local_index_for(items[i].spelling);
         if (map[i] != UINT16_MAX) {
             mapped++;
         }
+        const uint16_t local = map[i];
+        cloud_fill_content(&cards[i], &items[i], local);
+        /*
+         * Cloud-only cards: attach anything a previous view already cached. This
+         * is a pure PSRAM read (maimemo_enrich_cached never does I/O), so it is
+         * cheap enough to do for the whole queue - unlike the network fetch it
+         * replaces. It is what makes a word seen yesterday show its meaning
+         * today without re-asking.
+         */
+        if (local == UINT16_MAX) {
+            cloud_apply_cached_content(&cards[i]);
+        }
+        if (cards[i].meaning[0] != '\0') {
+            with_content++;
+        }
     }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     free_cloud_queue();
-    s_cloud_words = items;
+    s_cloud_words = cards;
     s_cloud_map = map;
     s_cloud_count = count;
     s_cloud_active = (count > 0);
@@ -757,9 +975,84 @@ esp_err_t word_cloud_refresh(void)
     s_queue_pos = 0;
     xSemaphoreGive(s_lock);
 
-    SYS_LOGI(TAG, "cloud queue: %u words (%u also in the local book)",
-             (unsigned)count, (unsigned)mapped);
+    heap_caps_free(items);   /* the cards now own the content */
+
+    SYS_LOGI(TAG, "cloud queue: %u words (%u from the local book, %u with a meaning)",
+             (unsigned)count, (unsigned)mapped, (unsigned)with_content);
+
+    /* Keep a copy on the card so the queue survives a reboot and works offline,
+     * and so the console can see what is being studied. Best effort: a storage
+     * failure must not fail the sync. */
+    if (count > 0) {
+        const esp_err_t werr = word_cloud_export(false);
+        if (werr != ESP_OK) {
+            SYS_LOGD(TAG, "memo wordbook not written: %s", esp_err_to_name(werr));
+        }
+    }
     return (count > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t word_cloud_export(bool force)
+{
+    (void)force;
+    if (!storage_available()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "name", "墨墨今日词表（设备同步）");
+    cJSON_AddNumberToObject(root, "version", 1);
+
+    cJSON *words = cJSON_AddArrayToObject(root, "words");
+    if (words == NULL) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const size_t count = s_cloud_count;
+    for (size_t i = 0; i < count; i++) {
+        const word_item_t *card = &s_cloud_words[i];
+        cJSON *entry = cJSON_CreateObject();
+        if (entry == NULL) {
+            continue;
+        }
+        /* id is per-card: a cloud-only word has no local id, so the queue index
+         * is used, which is stable for the day's list. */
+        cJSON_AddNumberToObject(entry, "id", (i + 1));
+        cJSON_AddStringToObject(entry, "spelling", card->spelling);
+        if (card->phonetic[0] != '\0') {
+            cJSON_AddStringToObject(entry, "phonetic", card->phonetic);
+        }
+        if (card->meaning[0] != '\0') {
+            cJSON_AddStringToObject(entry, "meaning", card->meaning);
+        }
+        if (card->example[0] != '\0') {
+            cJSON_AddStringToObject(entry, "example", card->example);
+        }
+        cJSON_AddItemToArray(words, entry);
+    }
+    xSemaphoreGive(s_lock);
+
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (text == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    (void)storage_mkdir_p(WORD_BOOK_DIR);
+    const esp_err_t err = storage_write_file(WORD_MAIMEMO_BOOK_FILE, text, strlen(text));
+    const size_t len = strlen(text);
+    free(text);
+
+    if (err == ESP_OK) {
+        SYS_LOGI(TAG, "memo wordbook written: %u cards, %u B", (unsigned)count,
+                 (unsigned)len);
+    }
+    return err;
 }
 
 /** How many cloud words are currently loaded.
@@ -776,6 +1069,11 @@ size_t word_cloud_count(void)
     const size_t count = s_cloud_count;
     xSemaphoreGive(s_lock);
     return count;
+}
+
+size_t word_count(void)
+{
+    return s_count;
 }
 
 static esp_err_t build_queue(void)
@@ -860,26 +1158,18 @@ esp_err_t word_get_today(word_item_t *out, size_t max, size_t *count)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Cloud queue: same shape as the local one, but with no local scheduling
-     * data for words outside the book (see word_next()). */
+    /*
+     * Cloud queue: the entries already carry full content (see cloud_fill_content),
+     * so this is a straight copy - the old code rebuilt each card from the local
+     * book here, which is exactly why a word outside the book came out blank.
+     */
     if (s_cloud_active) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         const size_t total = s_cloud_count;
         size_t copy = (total > max) ? max : total;
         if (out != NULL) {
             for (size_t i = 0; i < copy; i++) {
-                const uint16_t local = s_cloud_map[i];
-                memset(&out[i], 0, sizeof(out[i]));
-                if (local != UINT16_MAX) {
-                    const uint32_t id = s_words[local].id;
-                    out[i] = s_words[local];
-                    out[i].level = s_progress[local].level;
-                    out[i].next_review_ts = s_progress[local].next_review_ts;
-                    out[i].id = id;
-                } else {
-                    out[i].id = WORD_ID_CLOUD;
-                }
-                strlcpy(out[i].spelling, s_cloud_words[i].spelling, sizeof(out[i].spelling));
+                out[i] = s_cloud_words[i];
             }
         }
         xSemaphoreGive(s_lock);
@@ -924,33 +1214,15 @@ esp_err_t word_next(word_item_t *out)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
-    /* Cloud queue first (plan A): it is the account's plan, so it wins. A word
-     * that is not in the local book still gets a card - it just has no local
-     * scheduling record, which is honest: the account owns its scheduling. */
+    /* Cloud queue first (plan A): it is the account's plan, so it wins. The
+     * entry is already a fully populated card - including the cloud-only words,
+     * which is the v1.4.0 fix. */
     if (s_cloud_active) {
         if (s_queue_pos >= s_cloud_count) {
             s_queue_pos = 0;   /* wrap around so the page can keep flipping */
         }
         const size_t cloud_index = s_queue_pos++;
-        const uint16_t local = s_cloud_map[cloud_index];
-        memset(out, 0, sizeof(*out));
-        strlcpy(out->spelling, s_cloud_words[cloud_index].spelling, sizeof(out->spelling));
-        if (local != UINT16_MAX) {
-            const uint32_t id = s_words[local].id;
-            *out = s_words[local];
-            out->level = s_progress[local].level;
-            out->next_review_ts = s_progress[local].next_review_ts;
-            /* Keep the account's spelling, which is the string the user is
-             * actually being asked to recall. */
-            strlcpy(out->spelling, s_cloud_words[cloud_index].spelling,
-                    sizeof(out->spelling));
-            out->id = id;
-        } else {
-            /* No local record: give it a stable id derived from the cloud voc_id
-             * so grading can still be routed (word_review falls back to pushing
-             * to the account when the id is unknown locally). */
-            out->id = WORD_ID_CLOUD;
-        }
+        *out = s_cloud_words[cloud_index];
         xSemaphoreGive(s_lock);
         return ESP_OK;
     }
@@ -1048,16 +1320,38 @@ esp_err_t word_review(uint32_t id, word_review_result_t result)
             break;
         }
     }
+
+    /*
+     * A card that came from the cloud plan but is not in the local book. There
+     * is no local scheduling record, so grading it means "tell the account" -
+     * which, per maimemo_client.h, the Open API cannot actually accept as a
+     * grade. What we *can* do honestly is record it in the study history, so the
+     * console shows the user studied it here; the caller's uplink path is what
+     * puts it back into the cloud plan. The old code only logged, which is why a
+     * graded cloud card left no trace anywhere.
+     *
+     * The spelling is copied out while the lock is held (s_cloud_words is
+     * replaced wholesale by a sync, so a pointer taken here could dangle).
+     */
     if (index == (size_t)-1) {
+        char cloud_spelling[WORD_SPELLING_MAX] = { 0 };
+        const bool was_cloud_only = (s_cloud_active && id == WORD_ID_CLOUD);
+        if (was_cloud_only) {
+            for (size_t i = 0; i < s_cloud_count; i++) {
+                if (s_cloud_words[i].id == WORD_ID_CLOUD) {
+                    strlcpy(cloud_spelling, s_cloud_words[i].spelling,
+                            sizeof(cloud_spelling));
+                    break;
+                }
+            }
+        }
         xSemaphoreGive(s_lock);
-        /* Plan C: a card that came from the cloud plan but is not in the local
-         * book. There is no local record to schedule, so grading it means "tell
-         * the account". This is fire-and-forget: the caller is an LVGL callback
-         * and must not wait for TLS, and maimemo_push_unknown() itself no-ops
-         * unless the user enabled pushing. */
-        if (s_cloud_active && id == WORD_ID_CLOUD) {
-            SYS_LOGD(TAG, "graded a cloud-only card ('%s' = %s), not scheduled locally",
-                     word_review_name(result), "no local record");
+
+        if (was_cloud_only) {
+            SYS_LOGD(TAG, "graded a cloud-only card '%s' (%s): history only, no local record",
+                     cloud_spelling, word_review_name(result));
+            (void)word_history_append(WORD_ID_CLOUD, cloud_spelling, result, true);
+            (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_REVIEWED, &id, sizeof(id));
         }
         return ESP_ERR_NOT_FOUND;
     }
@@ -1065,11 +1359,20 @@ esp_err_t word_review(uint32_t id, word_review_result_t result)
     schedule(&s_progress[index], result, now);
     const int64_t next = s_progress[index].next_review_ts;
     const uint8_t level = s_progress[index].level;
+    char spelling[WORD_SPELLING_MAX];
+    strlcpy(spelling, s_words[index].spelling, sizeof(spelling));
+    /* A word matched back to the book may still have arrived through the cloud
+     * queue; the history marks that so the console can tell the two apart. */
+    const bool from_cloud = s_cloud_active;
     xSemaphoreGive(s_lock);
 
     SYS_LOGD(TAG, "word #%lu graded '%s' -> level %u, next in %lld s",
              (unsigned long)id, word_review_name(result), level,
              (long long)(next - now));
+
+    /* Study history for the console: progress.json only keeps the latest state
+     * per word, so it cannot answer "what did I study today". */
+    (void)word_history_append(id, spelling, result, from_cloud);
 
     (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_REVIEWED, &id, sizeof(id));
     (void)sys_notify("word_reviewed", NULL);
@@ -1161,6 +1464,279 @@ esp_err_t word_reset_progress(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Study history (v1.4.0)                                                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * `words/review_log.jsonl`: one JSON object per graded card, appended.
+ *
+ * ## Why JSONL and not a JSON array
+ *
+ * The file grows forever and is only ever appended to, so rewriting it (as a
+ * JSON array would require) costs O(n) flash writes per grade - on a card where
+ * a single FAT write is already the slowest thing the word page does. Appending
+ * one line is O(1), and a truncated final line (power lost mid-write) is
+ * simply skipped by the reader instead of corrupting the whole file.
+ *
+ * It is also the artefact behind "上传设备端学习情况": MaiMemo's Open API has no
+ * endpoint that accepts a review grade, so this log is the record. The web
+ * console reads it through GET /api/v1/words/history.
+ */
+#define WORD_HISTORY_FILE "words/review_log.jsonl"
+/** Size past which the log is reported as worth clearing (see the flush path). */
+#define WORD_HISTORY_MAX_READ (128 * 1024)
+
+static bool s_history_full;
+
+/*
+ * ## Why appends are queued instead of written inline
+ *
+ * `word_history_append()` is reached from `word_review()`, i.e. from an **LVGL
+ * widget callback**, and those run with the adapter lock held (AGENT.md
+ * §9.0.1.1). `storage_append_file()` is a synchronous fopen/fwrite/fclose - a
+ * FAT write - so doing it inline would stall rendering for the duration of a
+ * card write on every single grade. That is the same mistake `word_review` made
+ * before `word_save_progress_async()` existed, and the fix is the same shape:
+ * build the line (cheap, in RAM) and let the existing debounced save worker
+ * drain the queue.
+ *
+ * The queue is a small fixed ring: a study session cannot allocate without
+ * bound, and if it ever overflows the oldest line is dropped (the newest grades
+ * are the ones worth keeping).
+ */
+#define WORD_HISTORY_QUEUE 16
+#define WORD_HISTORY_LINE_MAX 192
+
+static char s_history_queue[WORD_HISTORY_QUEUE][WORD_HISTORY_LINE_MAX];
+static size_t s_history_head;   /**< next slot to write */
+static size_t s_history_len;    /**< entries currently queued */
+static StaticSemaphore_t s_history_lock_buf;
+static SemaphoreHandle_t s_history_lock;
+
+/** Format one JSONL line into @p out. Returns the length, or 0 on failure. */
+static size_t history_format_line(char *out, size_t len, uint32_t id,
+                                  const char *spelling, word_review_result_t result,
+                                  bool cloud)
+{
+    /* Built by hand rather than with cJSON: this runs in an LVGL callback, and
+     * cJSON would allocate several nodes per card for a five-field line. The
+     * spelling is the only string, and it is a single ASCII word (see the
+     * book format), so no escaping is needed - but it is length-clamped anyway
+     * so a corrupt book cannot overflow the queue slot. */
+    char safe[WORD_SPELLING_MAX];
+    strlcpy(safe, spelling, sizeof(safe));
+    for (char *p = safe; *p != '\0'; p++) {
+        /* Defensive: keep the line parseable even if a book contains a quote or
+         * a backslash. Innocuous for real spellings. */
+        if (*p == '"' || *p == '\\') {
+            *p = '_';
+        }
+    }
+
+    const int written = snprintf(out, len, "{\"id\":%lu,\"w\":\"%s\",\"r\":\"%s\",\"t\":%lld%s}\n",
+                                 (unsigned long)id, safe, word_review_name(result),
+                                 (long long)now_stamp(), cloud ? ",\"cloud\":true" : "");
+    if (written <= 0 || (size_t)written >= len) {
+        return 0;
+    }
+    return (size_t)written;
+}
+
+esp_err_t word_history_append(uint32_t id, const char *spelling,
+                              word_review_result_t result, bool cloud)
+{
+    if (spelling == NULL || spelling[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_history_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char line[WORD_HISTORY_LINE_MAX];
+    const size_t len = history_format_line(line, sizeof(line), id, spelling, result, cloud);
+    if (len == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    xSemaphoreTake(s_history_lock, portMAX_DELAY);
+    if (s_history_len == WORD_HISTORY_QUEUE) {
+        /* Full: drop the oldest so the newest grades survive. A session that
+         * reaches this has been grading faster than the card can be written for
+         * many seconds, which is already pathological. */
+        s_history_head = (s_history_head + 1) % WORD_HISTORY_QUEUE;
+        s_history_len--;
+    }
+    const size_t slot = (s_history_head + s_history_len) % WORD_HISTORY_QUEUE;
+    memcpy(s_history_queue[slot], line, len);
+    s_history_queue[slot][len] = '\0';
+    s_history_len++;
+    xSemaphoreGive(s_history_lock);
+
+    /* Wake the (already existing) writer. Never creates a task here: this is an
+     * LVGL callback and the board only has ~13 KB of contiguous internal heap
+     * (AGENT.md §9.0.7 ③). */
+    return word_save_progress_async();
+}
+
+/** Drain queued history lines onto the card. Worker context. */
+void word_history_flush_pending(void)
+{
+    if (s_history_lock == NULL || !storage_available()) {
+        return;
+    }
+
+    for (;;) {
+        char line[WORD_HISTORY_LINE_MAX];
+        size_t len = 0;
+
+        xSemaphoreTake(s_history_lock, portMAX_DELAY);
+        if (s_history_len > 0) {
+            strlcpy(line, s_history_queue[s_history_head], sizeof(line));
+            s_history_head = (s_history_head + 1) % WORD_HISTORY_QUEUE;
+            s_history_len--;
+            len = strlen(line);
+        }
+        xSemaphoreGive(s_history_lock);
+
+        if (len == 0) {
+            return;   /* queue drained */
+        }
+
+        const esp_err_t err = storage_append_file(WORD_HISTORY_FILE, line, len);
+        if (err != ESP_OK) {
+            SYS_LOGW(TAG, "cannot append to the study history: %s", esp_err_to_name(err));
+            return;   /* keep the rest queued for the next wake */
+        }
+
+        /*
+         * Size check, memory-only and at most once per session.
+         *
+         * Compaction would mean reading and rewriting the whole file, which must
+         * not happen on a grading path; the cap is therefore recorded and the
+         * file left alone, with the console able to clear it explicitly
+         * (POST /api/v1/words/history). Silent unbounded growth would be worse
+         * than a stale log, so it is at least logged once.
+         */
+        if (!s_history_full) {
+            size_t size = 0;
+            if (storage_exists(WORD_HISTORY_FILE, &size) == ESP_OK &&
+                size > (size_t)WORD_HISTORY_MAX_READ) {
+                s_history_full = true;
+                SYS_LOGW(TAG, "study history is %u B; clear it from the web console "
+                              "to reclaim space", (unsigned)size);
+            }
+        }
+    }
+}
+
+
+esp_err_t word_history_read(word_review_log_entry_t *out, size_t max,
+                            size_t *count, bool today_only)
+{
+    if (out == NULL || count == NULL || max == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+    if (!storage_available()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Write out anything still queued before reading.
+     *
+     * Appends are deferred to the save worker (see word_history_append), so a
+     * card graded seconds ago may still be in RAM. A reader that skipped this
+     * would show a stale history and look broken precisely when the user is
+     * checking that grading works. This runs on the HTTP worker, not on LVGL.
+     */
+    word_history_flush_pending();
+
+    char *text = NULL;
+    size_t len = 0;
+    if (storage_read_text(WORD_HISTORY_FILE, &text, &len) != ESP_OK || text == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (len == 0) {
+        free(text);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * Only the tail is wanted (newest entries), and the file is read whole
+     * because it is bounded by WORD_HISTORY_MAX_READ in practice. Walking it
+     * twice would double the parsing for no gain.
+     */
+    const int64_t day_start = today_only ? day_start_stamp() : 0;
+    size_t written = 0;
+
+    char *cursor = text;
+    while (cursor != NULL && *cursor != '\0' && written < max) {
+        char *newline = strchr(cursor, '\n');
+        if (newline != NULL) {
+            *newline = '\0';
+        }
+
+        cJSON *entry = cJSON_Parse(cursor);
+        if (entry != NULL) {   /* a torn tail simply fails to parse and is skipped */
+            word_review_log_entry_t parsed = { 0 };
+            const cJSON *id = cJSON_GetObjectItemCaseSensitive(entry, "id");
+            const cJSON *w = cJSON_GetObjectItemCaseSensitive(entry, "w");
+            const cJSON *r = cJSON_GetObjectItemCaseSensitive(entry, "r");
+            const cJSON *t = cJSON_GetObjectItemCaseSensitive(entry, "t");
+            const cJSON *cloud = cJSON_GetObjectItemCaseSensitive(entry, "cloud");
+
+            if (cJSON_IsNumber(id)) {
+                parsed.id = (uint32_t)id->valuedouble;
+            }
+            if (cJSON_IsString(w)) {
+                strlcpy(parsed.spelling, w->valuestring, sizeof(parsed.spelling));
+            }
+            if (cJSON_IsString(r)) {
+                word_review_result_t grade = WORD_REVIEW_UNKNOWN;
+                if (word_review_from_name(r->valuestring, &grade)) {
+                    parsed.result = (uint8_t)grade;
+                }
+            }
+            if (cJSON_IsNumber(t)) {
+                parsed.at = (int64_t)t->valuedouble;
+            }
+            parsed.cloud = cJSON_IsBool(cloud) && cJSON_IsTrue(cloud);
+
+            const bool keep = (parsed.spelling[0] != '\0') &&
+                              (!today_only || parsed.at >= day_start);
+            if (keep) {
+                out[written++] = parsed;
+            }
+            cJSON_Delete(entry);
+        }
+
+        if (newline == NULL) {
+            break;
+        }
+        cursor = newline + 1;
+    }
+
+    free(text);
+    *count = written;
+    return (written > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t word_history_clear(void)
+{
+    s_history_full = false;
+
+    /* Drop anything still queued, or the save worker would write it back into
+     * the file this call is about to delete. */
+    if (s_history_lock != NULL) {
+        xSemaphoreTake(s_history_lock, portMAX_DELAY);
+        s_history_head = 0;
+        s_history_len = 0;
+        xSemaphoreGive(s_history_lock);
+    }
+    return storage_delete_file(WORD_HISTORY_FILE);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Init                                                                      */
 /* ------------------------------------------------------------------------ */
 
@@ -1172,6 +1748,13 @@ esp_err_t word_service_init(void)
 
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
     if (s_lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* The study-history queue needs its own lock: word_history_append() is
+     * called from LVGL callbacks while the save worker drains it. */
+    s_history_lock = xSemaphoreCreateMutexStatic(&s_history_lock_buf);
+    if (s_history_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1189,6 +1772,26 @@ esp_err_t word_service_init(void)
     esp_err_t http_err = word_service_register_http();
     if (http_err != ESP_OK) {
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
+    }
+
+    /*
+     * Build the cloud queue on every completed MaiMemo sync, whoever started it
+     * (boot, the web console, or the UI). Registered once and never removed:
+     * word_service lives for the lifetime of the firmware. Failure is not fatal -
+     * the local book still works, which is the documented offline fallback.
+     *
+     * **sys_event_subscribe(), not esp_event_handler_register().** The project
+     * posts through a *custom* event loop (`sys_event_post_to` ->
+     * `esp_event_post_to(s_loop, ...)`), so registering on the ESP-IDF default
+     * loop silently never fires. That cost a full debug round on the board: the
+     * sync completed (`study progress: 0/55` in the log) and the handler simply
+     * never ran, with no error anywhere - this helper is the only correct way in.
+     */
+    const esp_err_t sub_err = sys_event_subscribe(
+        MAIMEMO_EVENT, MAIMEMO_EVENT_SYNC_DONE, on_maimemo_sync_done, NULL, NULL);
+    if (sub_err != ESP_OK) {
+        SYS_LOGW(TAG, "cannot subscribe to MaiMemo sync events: %s",
+                 esp_err_to_name(sub_err));
     }
 
     SYS_LOGI(TAG, "ready (book '%s', %u words, %u/day)", s_book, (unsigned)s_count,
