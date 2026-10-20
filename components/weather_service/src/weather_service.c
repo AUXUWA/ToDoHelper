@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "storage_manager.h"
+#include "sys_net.h"
 #include "sys_utils.h"
 
 static const char *TAG = "weather";
@@ -336,13 +337,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-esp_err_t weather_http_get_json(const char *url, char **out)
+static esp_err_t weather_http_get_json_locked(const char *url, char **out)
 {
-    if (url == NULL || out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out = NULL;
-
     http_body_t ctx = { 0 };
     const esp_http_client_config_t cfg = {
         .url = url,
@@ -384,6 +380,36 @@ esp_err_t weather_http_get_json(const char *url, char **out)
 
     *out = ctx.buf;
     return ESP_OK;
+}
+
+esp_err_t weather_http_get_json(const char *url, char **out)
+{
+    if (url == NULL || out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out = NULL;
+
+    /*
+     * One HTTPS at a time (see components/sys_utils/include/sys_net.h).
+     *
+     * A TLS handshake allocates a lot (mbedTLS sizes the session buffers from
+     * MBEDTLS_SSL_IN_CONTENT_LEN / OUT_CONTENT_LEN, 16 KB each), and the
+     * internal heap is what the WiFi PHY needs a ~30 KB contiguous block of.
+     * Two handshakes at once made mbedTLS fail with -0x008D
+     * (PSA_ERROR_INSUFFICIENT_MEMORY) and the request then sat in a 60 s
+     * backoff window.
+     *
+     * The lock is taken around the request only - no SD writes, no LVGL calls.
+     */
+    const esp_err_t lock_err = sys_net_lock(SYS_NET_LOCK_DEFAULT_MS);
+    if (lock_err != ESP_OK) {
+        SYS_LOGW(TAG, "another request is holding the network lock");
+        return lock_err;
+    }
+
+    const esp_err_t err = weather_http_get_json_locked(url, out);
+    sys_net_unlock();
+    return err;
 }
 
 void weather_wmo_to_condition(int code, char *text, size_t text_len,

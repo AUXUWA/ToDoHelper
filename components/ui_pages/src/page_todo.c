@@ -60,6 +60,25 @@ static const char *TAG = "page_todo";
  */
 #define TODO_RENDER_MAX_ROWS 30
 
+/**
+ * 行距：行高（UI_LIST_ROW_HEIGHT = 56）+ 列表的行间距（s_list 的 pad_row 8 px）。
+ *
+ * 视口里放得下几行、滚动时窗口往哪挪，全靠这个数。行高是固定的：勾选框
+ * 44 px 加上下各 6 px 内边距正好 56 px，所以这个数是准的（第一次布局之后
+ * 还会用实测行高再校准一次，见 s_row_h）。
+ */
+#define TODO_ROW_GAP    8
+#define TODO_ROW_PITCH  (UI_LIST_ROW_HEIGHT + TODO_ROW_GAP)
+
+/** 视口上下各多渲染一行：滚动时这一行已经在屏外，不会看到空白。 */
+#define TODO_WINDOW_BUFFER 1
+
+/** 同时存活的行数上限（可视行数 + 上下缓冲）。 */
+#define TODO_WINDOW_MAX_ROWS 10
+
+/** 视口高度还量不出来时按这个值算（480 - 40 状态栏 - 页内边距）。 */
+#define TODO_FALLBACK_VIEW_H 435
+
 /** 筛选档位数量，与 s_filter_tabs[] 一致。 */
 #define TODO_FILTER_COUNT 4
 
@@ -111,6 +130,7 @@ typedef struct {
     lv_obj_t *title;
     lv_obj_t *due;       /**< 到期徽标 */
     lv_obj_t *badge;     /**< 同步徽标 */
+    lv_obj_t *del_row;   /**< 删除按钮 */
     uint8_t done_state;  /**< 上次写入的完成态 */
     uint8_t prio_state;  /**< 上次写入的优先级档（0 普通 / 1 重要 / 2 紧急） */
     uint8_t due_state;   /**< 上次写入的到期档（0 = 无到期日） */
@@ -122,10 +142,46 @@ static todo_row_t *s_rows;
 static size_t s_rows_cap;
 static size_t s_row_count;
 
+/*
+ * 只渲染视口内的行。
+ *
+ * 以前一次把 30 行全建出来（240 个 LVGL 控件），其中 5/6 永远看不见；现在
+ * 只建视口里那几行加上上下各一行缓冲，滚动时窗口跟着挪。窗口之外的行用两个
+ * 空的占位对象把高度补出来，所以列表的总高度、滚动条长度、每一行的位置都跟
+ * 「全部行都在」时一模一样 —— 用户看到的内容一个字节都没变。
+ */
+
+/** 当前快照：滚动时要按它重画，所以不能像以前那样画完就释放。 */
+static todo_item_t *s_items;
+static size_t s_item_count;
+
+/** 当前渲染的窗口：[s_win_start, s_win_start + s_row_count)。 */
+static size_t s_win_start;
+
+/** 窗口上方 / 下方的占位对象（空对象，只占高度）。 */
+static lv_obj_t *s_gap_top;
+static lv_obj_t *s_gap_bottom;
+
+/** 占位对象上一次写入的高度（-1 = 没写过 / 已隐藏）。 */
+static int32_t s_gap_top_h = -1;
+static int32_t s_gap_bottom_h = -1;
+
+/** 视口（列表可见区）高度，量一次用一阵。 */
+static int32_t s_view_h;
+
+/** 实测行高：第一次布局之后才知道，用来校准行距。 */
+static int32_t s_row_h = UI_LIST_ROW_HEIGHT;
+
+/** 现在的行距（实测行高 + 行间距）。 */
+static int32_t row_pitch(void)
+{
+    return (s_row_h > 0) ? (s_row_h + TODO_ROW_GAP) : TODO_ROW_PITCH;
+}
+
 /**
  * Make sure the row table can hold @p need entries. Returns false on OOM.
  *
- * The table is only grown from render_list(), which knows the final row count
+ * The table is only grown from render_window(), which knows the final row count
  * up front. Reserving per row (the old code did) copied the whole table again
  * for every row — O(n^2) memcpy for a 256 item list.
  */
@@ -147,7 +203,11 @@ static bool rows_reserve(size_t need)
         return false;
     }
     if (s_rows != NULL) {
-        memcpy(grown, s_rows, s_row_count * sizeof(todo_row_t));
+        const size_t keep = (s_row_count < need) ? s_row_count : need;
+        memcpy(grown, s_rows, keep * sizeof(todo_row_t));
+        if (need > keep) {
+            memset(grown + keep, 0, (need - keep) * sizeof(todo_row_t));
+        }
         heap_caps_free(s_rows);
     }
     s_rows = grown;
@@ -216,10 +276,28 @@ static todo_due_bucket_t due_badge_text(int64_t due_ts, char *out, size_t out_le
     }
 }
 
+/**
+ * 事件里的 user data 是行在窗口里的序号，不是待办 id。
+ *
+ * 滚动时同一批行控件会被换成另一批待办（只渲染视口内的行），所以 id 不能
+ * 写死在事件里 —— 每次都从行表里读当前这一行对应的 id 才是对的。
+ */
+static uint32_t row_event_id(lv_event_t *e)
+{
+    const size_t slot = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    if (s_rows == NULL || slot >= s_row_count) {
+        return 0;
+    }
+    return s_rows[slot].id;
+}
+
 /** Tapping a row is navigation only: it opens the read-only detail page. */
 static void row_open_cb(lv_event_t *e)
 {
-    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const uint32_t id = row_event_id(e);
+    if (id == 0) {
+        return;
+    }
     page_todo_detail_set_id(id);
     (void)ui_nav_push(UI_PAGE_TODO_DETAIL);
 }
@@ -328,19 +406,40 @@ static void row_apply(todo_row_t *r, const todo_item_t *item)
     }
 }
 
-/** Build one row from scratch and remember its widgets. */
-static void row_create(const todo_item_t *item)
+/**
+ * 建一行（从零开始），并记住它的控件。
+ *
+ * 每个 lv_obj_* 的返回值都要检查：分配失败就把半行删掉、返回 false，让调用
+ * 方停下来并给用户一句提示 —— 而不是拿着空指针往下走（Load access fault）。
+ *
+ * @param item 这一行要显示的待办。
+ * @param slot 这一行在窗口里的序号（事件里带的 user data 就是它）。
+ * @return false 表示内存不够，这一行没建成。
+ */
+static bool row_create(const todo_item_t *item, size_t slot)
 {
-    if (s_row_count >= s_rows_cap) {
-        /* render_list() reserved the table up front; this can only happen if
-         * that reservation failed. */
-        return;
+    lv_obj_t *row = NULL;
+    lv_obj_t *prio = NULL;
+    lv_obj_t *checkbox = NULL;
+    lv_obj_t *title = NULL;
+    lv_obj_t *due = NULL;
+    lv_obj_t *badge = NULL;
+    lv_obj_t *del = NULL;
+    lv_obj_t *del_label = NULL;
+
+    if (s_rows == NULL || slot >= s_rows_cap) {
+        /* render_window() 预留过行表；走到这里说明那次预留失败了。 */
+        return false;
     }
-    todo_row_t *r = &s_rows[s_row_count];
+    todo_row_t *r = &s_rows[slot];
     memset(r, 0, sizeof(*r));
     r->id = item->id;
 
-    lv_obj_t *row = lv_obj_create(s_list);
+    row = lv_obj_create(s_list);
+    if (row == NULL) {
+        SYS_LOGE(TAG, "row %u: no memory for the row", (unsigned)slot);
+        return false;
+    }
     r->row = row;
     lv_obj_remove_style_all(row);
     lv_obj_set_width(row, LV_PCT(100));
@@ -358,7 +457,10 @@ static void row_create(const todo_item_t *item)
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 优先级色条：纯色小方块，零位图。普通优先级是不着色的透明占位。 */
-    lv_obj_t *prio = lv_obj_create(row);
+    prio = lv_obj_create(row);
+    if (prio == NULL) {
+        goto fail;
+    }
     r->prio = prio;
     lv_obj_remove_style_all(prio);
     lv_obj_set_size(prio, 8, 24);
@@ -369,67 +471,102 @@ static void row_create(const todo_item_t *item)
     /* The checkbox *is* a control: marking a todo done is one tap.
      * 44x44 (UI_TOUCH_MIN)：34x34 时手指落在下缘会滑到标题上，变成
      * 「打开详情页」而不是勾选。 */
-    lv_obj_t *checkbox = lv_checkbox_create(row);
+    checkbox = lv_checkbox_create(row);
+    if (checkbox == NULL) {
+        goto fail;
+    }
     r->checkbox = checkbox;
     lv_checkbox_set_text(checkbox, "");
     lv_obj_set_size(checkbox, UI_TOUCH_MIN, UI_TOUCH_MIN);
     lv_obj_add_flag(checkbox, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(checkbox, row_toggle_cb, LV_EVENT_VALUE_CHANGED,
-                        (void *)(uintptr_t)item->id);
+                        (void *)(uintptr_t)slot);
 
-    lv_obj_t *title = lv_label_create(row);
+    title = lv_label_create(row);
+    if (title == NULL) {
+        goto fail;
+    }
     r->title = title;
     lv_obj_set_flex_grow(title, 1);
     lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_font(title, ui_font(UI_FONT_BODY), 0);
 
     /* 到期徽标：无到期日时隐藏。 */
-    lv_obj_t *due = lv_label_create(row);
+    due = lv_label_create(row);
+    if (due == NULL) {
+        goto fail;
+    }
     r->due = due;
     lv_obj_set_style_text_font(due, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(due, UI_COLOR_TEXT_MUTED, 0);
     lv_obj_add_flag(due, LV_OBJ_FLAG_HIDDEN);
 
     /* 同步徽标：已同步时不显示。 */
-    lv_obj_t *badge = lv_label_create(row);
+    badge = lv_label_create(row);
+    if (badge == NULL) {
+        goto fail;
+    }
     r->badge = badge;
     lv_obj_set_style_text_font(badge, ui_font(UI_FONT_SMALL), 0);
     lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
 
     /* 删除按钮：同样要 >= 44px（原来是 52x34）。 */
-    lv_obj_t *del = lv_button_create(row);
+    del = lv_button_create(row);
+    if (del == NULL) {
+        goto fail;
+    }
+    r->del_row = del;
     lv_obj_set_size(del, 52, UI_TOUCH_MIN);
     lv_obj_set_style_bg_color(del, UI_COLOR_DANGER, 0);
     lv_obj_set_style_radius(del, UI_CARD_RADIUS - 4, 0);
     lv_obj_set_style_shadow_width(del, 0, 0);
-    lv_obj_t *del_label = lv_label_create(del);
+    del_label = lv_label_create(del);
+    if (del_label == NULL) {
+        goto fail;
+    }
     lv_label_set_text(del_label, "删除");
     lv_obj_set_style_text_font(del_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(del_label, UI_COLOR_ON_PRIMARY, 0);
     lv_obj_center(del_label);
     lv_obj_add_event_cb(del, row_delete_cb, LV_EVENT_CLICKED,
-                        (void *)(uintptr_t)item->id);
+                        (void *)(uintptr_t)slot);
 
     /* Tapping the row (or its title) opens the read-only detail page. */
     lv_obj_add_flag(title, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(title, row_open_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)item->id);
-    lv_obj_add_event_cb(row, row_open_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)item->id);
+    lv_obj_add_event_cb(title, row_open_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)slot);
+    lv_obj_add_event_cb(row, row_open_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)slot);
 
     row_apply(r, item);
-    s_row_count++;
+    return true;
+
+fail:
+    SYS_LOGE(TAG, "row %u: out of memory, row dropped", (unsigned)slot);
+    if (r->row != NULL) {
+        /* 半行不能留在列表里：删掉它，剩下的控件跟着一起没了。 */
+        lv_obj_delete(r->row);
+        r->row = NULL;
+    }
+    return false;
 }
 
 /** Drop every row (structural change, or an empty list). */
 static void rows_clear(void)
 {
-    if (s_list != NULL) {
-        lv_obj_clean(s_list);
-    }
     if (s_rows != NULL) {
+        for (size_t i = 0; i < s_row_count; i++) {
+            if (s_rows[i].row != NULL) {
+                lv_obj_delete(s_rows[i].row);
+            }
+        }
         memset(s_rows, 0, s_row_count * sizeof(todo_row_t));
     }
     s_row_count = 0;
-    s_empty = NULL;   /* the empty label lived in the list, it is gone now */
+    s_win_start = 0;
+    if (s_empty != NULL) {
+        /* 空状态标签住在列表里，它跟着一起没了。 */
+        lv_obj_delete(s_empty);
+        s_empty = NULL;
+    }
 }
 
 /** Create the "nothing here yet" label (once). */
@@ -439,6 +576,9 @@ static void list_empty_show(void)
         return;
     }
     s_empty = lv_label_create(s_list);
+    if (s_empty == NULL) {
+        return;
+    }
     lv_label_set_text(s_empty, "还没有待办。\n请在电脑网页端新增（浏览器打开设备地址）。");
     lv_obj_set_style_text_font(s_empty, ui_font(UI_FONT_BODY), 0);
     lv_obj_set_style_text_color(s_empty, UI_COLOR_TEXT_MUTED, 0);
@@ -446,27 +586,128 @@ static void list_empty_show(void)
 }
 
 /**
- * Build (or update) the row list from a snapshot.
+ * 建一个只占高度的空对象（窗口之外的行用它占位）。
  *
- * The snapshot is already sorted by todo_manager (未完成 → 优先级 → 截止日 →
- * id), so cutting the tail off is exactly "drop the least urgent ones".
+ * 没有背景、没有边框，也不接收触摸：它唯一的作用是让列表的总高度跟
+ * 「全部行都在」时一模一样，滚动条长度因此跟以前一样。
  */
-static void render_list(const todo_item_t *items, size_t count)
+static lv_obj_t *gap_create(void)
 {
-    if (s_list == NULL) {
+    lv_obj_t *gap = lv_obj_create(s_list);
+    if (gap == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(gap);
+    lv_obj_set_width(gap, LV_PCT(100));
+    lv_obj_set_height(gap, 0);
+    lv_obj_remove_flag(gap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(gap, LV_OBJ_FLAG_HIDDEN);
+    return gap;
+}
+
+/**
+ * 让列表的总高度跟「全部行都在」时一模一样。
+ *
+ * 窗口上方缺 start 行、下方缺 (total - start - slots) 行，这两段高度由两个
+ * 占位对象补出来。算式是照着 flex 的排版来的：行与行之间有一个 TODO_ROW_GAP
+ * 的间距，所以占位对象的高度要减掉这个间距（而且最后一个占位对象如果高度
+ * 归零就整个藏起来 —— 藏起来之后 flex 不再给它留间距，总高度才对得上）。
+ *
+ * 高度没变就不写（滚动事件每个像素都来一次，无脑重设样式会让整页重排）。
+ */
+static void window_gaps(size_t start, size_t slots, size_t total)
+{
+    if (s_gap_top == NULL || s_gap_bottom == NULL) {
         return;
     }
 
-    const size_t visible = (count > TODO_RENDER_MAX_ROWS) ? TODO_RENDER_MAX_ROWS : count;
+    if (slots == 0 || total == 0) {
+        if (!lv_obj_has_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (!lv_obj_has_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_gap_top_h = -1;
+        s_gap_bottom_h = -1;
+        return;
+    }
 
-    /* 底部提示：被截断的条数。只在文案真的变了时才写。 */
+    if (start > 0) {
+        const int32_t h = (int32_t)(start * (size_t)row_pitch()) - TODO_ROW_GAP;
+        if (lv_obj_has_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (h != s_gap_top_h) {
+            s_gap_top_h = h;
+            lv_obj_set_height(s_gap_top, h);
+        }
+    } else {
+        if (!lv_obj_has_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_gap_top_h = -1;
+    }
+
+    const size_t rest = total - start - slots;
+    if (rest > 0) {
+        const int32_t h = (int32_t)(rest * (size_t)row_pitch()) - TODO_ROW_GAP;
+        if (lv_obj_has_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (h != s_gap_bottom_h) {
+            s_gap_bottom_h = h;
+            lv_obj_set_height(s_gap_bottom, h);
+        }
+    } else {
+        if (!lv_obj_has_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_gap_bottom_h = -1;
+    }
+}
+
+/**
+ * 把窗口里的每一行画成对应的那条待办。
+ *
+ * 行控件是复用的：窗口挪动时同一批控件换成另一批待办，所以这里只改内容，
+ * 不重建控件（铁律二：先比较再写）。
+ */
+static void window_paint(size_t start, size_t slots, size_t total)
+{
+    for (size_t i = 0; i < slots; i++) {
+        const size_t idx = start + i;
+        if (idx >= total || s_items == NULL) {
+            break;
+        }
+        todo_row_t *r = &s_rows[i];
+        r->id = s_items[idx].id;
+        row_apply(r, &s_items[idx]);
+    }
+}
+
+/**
+ * 画列表：只画视口里的那几行。
+ *
+ * @param measure true = 重新量视口高度（数据变了的时候），false = 沿用上次
+ *                量到的高度（滚动的时候用，免得每滚一个像素就重排一次）。
+ */
+static void render_window(bool measure)
+{
+    if (s_list == NULL || s_items == NULL) {
+        return;
+    }
+
+    const size_t total = (s_item_count > TODO_RENDER_MAX_ROWS) ? TODO_RENDER_MAX_ROWS : s_item_count;
+
+    /* 底部提示：被截断的条数（是清单本身的截断，与渲染窗口无关）。 */
     if (s_more != NULL) {
-        if (count > visible) {
+        if (s_item_count > total) {
             /* 中文按 UTF-8 每字 3 字节，整句加上数字最多约 70 字节；
              * 缓冲区给足，否则编译器会报 format-truncation。 */
             char buf[96];
             snprintf(buf, sizeof(buf), "还有 %u 条未显示（在电脑网页端查看全部）",
-                     (unsigned)(count - visible));
+                     (unsigned)(s_item_count - total));
             if (strcmp(buf, lv_label_get_text(s_more)) != 0) {
                 lv_label_set_text(s_more, buf);
             }
@@ -483,48 +724,89 @@ static void render_list(const todo_item_t *items, size_t count)
         }
     }
 
-    if (visible == 0) {
+    if (total == 0) {
         if (s_row_count != 0) {
             rows_clear();
         }
+        window_gaps(0, 0, 0);
         list_empty_show();
         return;
     }
 
-    /*
-     * Fast path: the id sequence is unchanged, so every row can be updated in
-     * place. This is the common case - toggling done, or a sync state arriving
-     * over SSE - and it now costs a handful of style writes instead of destroying
-     * and re-creating the whole list.
-     */
-    bool same_shape = (s_row_count == visible);
-    if (same_shape) {
-        for (size_t i = 0; i < visible; i++) {
-            if (s_rows[i].id != items[i].id) {
-                same_shape = false;
-                break;
+    if (measure) {
+        /* 视口多高？量一次就够，滚动时不再量。 */
+        lv_obj_update_layout(s_list);
+        const int32_t h = lv_obj_get_height(s_list);
+        if (h > 0) {
+            s_view_h = h;
+        }
+        if (s_row_count > 0 && s_rows[0].row != NULL) {
+            const int32_t rh = lv_obj_get_height(s_rows[0].row);
+            if (rh > 0) {
+                s_row_h = rh;
             }
         }
     }
+    if (s_view_h <= 0) {
+        s_view_h = TODO_FALLBACK_VIEW_H;
+    }
 
-    if (same_shape) {
-        for (size_t i = 0; i < visible; i++) {
-            row_apply(&s_rows[i], &items[i]);
+    /* 视口里放得下几行 —— 再加上下各一行缓冲。 */
+    size_t visible = (size_t)((s_view_h + row_pitch() - 1) / row_pitch());
+    size_t win = visible + 2 * TODO_WINDOW_BUFFER;
+    if (win > TODO_WINDOW_MAX_ROWS) {
+        win = TODO_WINDOW_MAX_ROWS;
+    }
+    size_t slots = (win < total) ? win : total;
+
+    /* 窗口起点：视口里第一条行往上留一行缓冲。 */
+    size_t first = 0;
+    const int32_t scroll_y = lv_obj_get_scroll_y(s_list);
+    if (scroll_y > 0) {
+        first = (size_t)(scroll_y / row_pitch());
+    }
+    size_t start = (first > TODO_WINDOW_BUFFER) ? first - TODO_WINDOW_BUFFER : 0;
+    if (start + slots > total) {
+        start = total - slots;
+    }
+
+    if (measure) {
+        /* 行的个数变了才重建控件；只是换了内容就原地改。 */
+        if (slots != s_row_count) {
+            rows_clear();
+            if (!rows_reserve(slots)) {
+                return;
+            }
+            for (size_t i = 0; i < slots; i++) {
+                if (!row_create(&s_items[start + i], i)) {
+                    /* 内存不够：不再往下建，给用户一句提示。 */
+                    ui_toast("列表显示不完整：内存不足");
+                    break;
+                }
+                s_row_count++;
+            }
+            /* 占位对象要排在所有行后面（flex 按子对象顺序排版）。 */
+            if (s_gap_bottom != NULL) {
+                lv_obj_move_to_index(s_gap_bottom, -1);
+            }
         }
-        return;
+    } else {
+        /* 滚动路径：控件已经在，只挪窗口，不重建。 */
+        if (s_row_count == 0) {
+            return;
+        }
+        if (start + s_row_count > total) {
+            start = total - s_row_count;
+        }
+        if (start == s_win_start) {
+            /* 窗口没动：内容也不用重画（滚动事件每个像素都来一次）。 */
+            return;
+        }
     }
 
-    /* Structural change (add / delete / reorder / filter switch): rebuild. */
-    rows_clear();
-
-    /* One reservation for the whole list: the old per-row reserve() copied the
-     * table again for every row. */
-    if (!rows_reserve(visible)) {
-        return;
-    }
-    for (size_t i = 0; i < visible; i++) {
-        row_create(&items[i]);
-    }
+    s_win_start = start;
+    window_gaps(start, s_row_count, total);
+    window_paint(start, s_row_count, total);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -670,7 +952,10 @@ static void filter_bar_create(lv_obj_t *parent)
 static void row_toggle_cb(lv_event_t *e)
 {
     lv_obj_t *checkbox = lv_event_get_target(e);
-    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const uint32_t id = row_event_id(e);
+    if (id == 0) {
+        return;
+    }
     const bool done = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
 
     esp_err_t err = todo_set_done(id, done);
@@ -713,7 +998,10 @@ static void delete_confirm_cb(lv_event_t *e)
 /** 删除按钮：一按先问一句，误触不再等于永久丢失（需求 B11）。 */
 static void row_delete_cb(lv_event_t *e)
 {
-    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    const uint32_t id = row_event_id(e);
+    if (id == 0) {
+        return;
+    }
 
     /* 把标题带进确认文案，用户才看得出要删的是哪一条。 */
     char text[256];
@@ -738,6 +1026,9 @@ static void row_delete_cb(lv_event_t *e)
 static void readonly_hint_create(lv_obj_t *parent)
 {
     lv_obj_t *hint = lv_label_create(parent);
+    if (hint == NULL) {
+        return;
+    }
     lv_obj_set_width(hint, LV_PCT(100));
     lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_WRAP);
     lv_label_set_text(hint, TODO_READONLY_HINT);
@@ -756,6 +1047,9 @@ static void readonly_hint_create(lv_obj_t *parent)
  * 取数统一走 todo_list_filtered()：排序口径与 todo_list() 一致
  * （未完成 → 优先级 → 截止日 → id），所以「只渲染前 30 行」截掉的正是
  * 最不紧急的那几条。
+ *
+ * 快照这次**不立刻释放**：滚动时要按它重画窗口里的行（只渲染视口内的行），
+ * 所以它得留到下一次刷新或者离开本页（on_hide）为止。
  */
 static void refresh(void)
 {
@@ -766,9 +1060,25 @@ static void refresh(void)
     }
 
     render_stats(count);
-    render_list(items, count);
 
-    todo_free_list(items);
+    if (s_items != NULL) {
+        todo_free_list(s_items);
+    }
+    s_items = items;
+    s_item_count = count;
+
+    render_window(true);
+}
+
+/**
+ * 列表滚动了：窗口跟着挪。
+ *
+ * 只换内容、不重建控件（窗口外面那几行用占位对象顶着，滚动条长度不变）。
+ */
+static void list_scroll_cb(lv_event_t *e)
+{
+    (void)e;
+    render_window(false);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -782,6 +1092,9 @@ static esp_err_t todo_create(lv_obj_t *parent)
     filter_bar_create(parent);
 
     s_stats = lv_label_create(parent);
+    if (s_stats == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     lv_obj_set_style_text_font(s_stats, ui_font(UI_FONT_SMALL), 0);
     lv_label_set_text(s_stats, "");
 
@@ -799,8 +1112,23 @@ static esp_err_t todo_create(lv_obj_t *parent)
     lv_obj_add_flag(s_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
 
+    /* 窗口上下的占位对象：把窗口之外的行的高度补出来，滚动条长度不变。
+     * 上面的那个必须是列表的第一个子对象，下面的那个排在所有行后面
+     * （行是后来才建的，建完要把占位对象挪到末尾）。 */
+    s_gap_top = gap_create();
+    s_gap_bottom = gap_create();
+    if (s_gap_top == NULL || s_gap_bottom == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 滚动：窗口跟着挪，只换内容。 */
+    lv_obj_add_event_cb(s_list, list_scroll_cb, LV_EVENT_SCROLL, NULL);
+
     /* 渲染上限的提示：被截断的条数在这里说明白。 */
     s_more = lv_label_create(parent);
+    if (s_more == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     lv_obj_set_width(s_more, LV_PCT(100));
     lv_label_set_long_mode(s_more, LV_LABEL_LONG_MODE_WRAP);
     lv_label_set_text(s_more, "");
@@ -813,7 +1141,8 @@ static esp_err_t todo_create(lv_obj_t *parent)
      * done on the PC web page, so its slot now carries that hint instead. */
     readonly_hint_create(parent);
 
-    refresh();
+    /* 这里**不**取数：ui_core 建完页面紧接着就会调 on_show()，那边取一次就够
+     * （以前这里取一次、on_show 又取一次，白白多跑一遍全量快照 + 30 行重画）。 */
 
     /* Data can change from the HTTP task, so only refresh through events. */
     (void)ui_event_bind(TODO_EVENT, TODO_EVENT_LIST_CHANGED, UI_PAGE_TODO, 0);
@@ -824,6 +1153,17 @@ static esp_err_t todo_create(lv_obj_t *parent)
 static esp_err_t todo_on_show(void)
 {
     refresh();
+    return ESP_OK;
+}
+
+static esp_err_t todo_on_hide(void)
+{
+    /* 离开本页就把快照放了：滚动时要用它重画窗口里的行，别的页面用不上。 */
+    if (s_items != NULL) {
+        todo_free_list(s_items);
+        s_items = NULL;
+        s_item_count = 0;
+    }
     return ESP_OK;
 }
 
@@ -840,6 +1180,7 @@ const ui_page_t page_todo = {
     .name = "todo",
     .create = todo_create,
     .on_show = todo_on_show,
+    .on_hide = todo_on_hide,
     .on_event = todo_on_event,
 };
 

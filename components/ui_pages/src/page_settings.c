@@ -134,23 +134,198 @@ typedef struct {
     void (*on_change)(int32_t value);
 } setting_slider_t;
 
+/**
+ * 滑块的新值：先在内存里生效，落盘交给一次性任务。
+ *
+ * 一次拖动会产生上百个 LV_EVENT_VALUE_CHANGED，每一个都直接 nvs_commit
+ * 就是上百次 flash 擦写 —— 写的时候 IDF 会关掉 flash 缓存，整个界面停住，
+ * 用户看到的是「滑块拖不动」（AGENT.md 9.0.1.1 铁律一）。
+ *
+ * 所以回调里只做两件事：把新值用到 RAM 上（亮度立刻生效），以及把新值记在
+ * 这里；去抖定时器在用户停手 600 ms 之后把值交给一次性任务去写 NVS。
+ * 跟同一个文件里的时区按钮（tz_apply_task）是同一个写法。
+ */
+typedef struct {
+    int32_t brightness;
+    int32_t idle_brightness;
+    int32_t idle_timeout;
+    bool brightness_dirty;
+    bool idle_brightness_dirty;
+    bool idle_timeout_dirty;
+} slider_pending_t;
+
+static slider_pending_t s_pending;
+
+/** 去抖定时器：页面自己拥有（on_hide 暂停），见 slider_save_tick。 */
+static lv_timer_t *s_save_timer;
+
+/**
+ * 上一次落盘里**哪几个键写失败了**（位掩码）。
+ *
+ * 由落盘任务写、由 LVGL 任务读，所以用原子量而不是普通变量
+ * （两个任务真的会同时碰它）。
+ *
+ * 为什么要有它：NVS 提交可能失败（分区满、被别人占着），
+ * 而「写失败」如果不告诉用户，就等于用户刚调的值**静默丢了** ——
+ * 亮度立刻生效了（那是内存里的值），但下次开机会回到旧值。
+ * 这里把失败记下来，LVGL 任务下一拍把它变回「脏」并提示用户。
+ */
+#define SLIDER_SAVE_FAILED_BRIGHTNESS    (1u << 0)
+#define SLIDER_SAVE_FAILED_IDLE_BRIGHT   (1u << 1)
+#define SLIDER_SAVE_FAILED_IDLE_TIMEOUT  (1u << 2)
+static uint32_t s_save_failed_mask;
+
+/** 落盘请求：一次性任务拿着它去写 NVS。 */
+typedef struct {
+    int32_t brightness;
+    int32_t idle_brightness;
+    int32_t idle_timeout;
+    bool save_brightness;
+    bool save_idle_brightness;
+    bool save_idle_timeout;
+} slider_save_req_t;
+
+/**
+ * 一次性任务：真正写 NVS。
+ *
+ * NVS 提交是 flash 写，写期间 flash 缓存被关，PSRAM 随即不可访问 ——
+ * 所以这个任务的栈必须在内部 RAM（AGENT.md 9.0.1）。写完自己收尾。
+ */
+static void slider_save_task(void *arg)
+{
+    slider_save_req_t *req = (slider_save_req_t *)arg;
+    uint32_t failed = 0;
+    if (req != NULL) {
+        if (req->save_brightness) {
+            if (sys_config_set_i32(SYS_KEY_BRIGHTNESS, req->brightness) != ESP_OK) {
+                failed |= SLIDER_SAVE_FAILED_BRIGHTNESS;
+            }
+        }
+        if (req->save_idle_brightness) {
+            if (sys_config_set_i32(SYS_KEY_IDLE_BRIGHT, req->idle_brightness) != ESP_OK) {
+                failed |= SLIDER_SAVE_FAILED_IDLE_BRIGHT;
+            }
+        }
+        if (req->save_idle_timeout) {
+            if (sys_config_set_i32(SYS_KEY_IDLE_TIMEOUT, req->idle_timeout) != ESP_OK) {
+                failed |= SLIDER_SAVE_FAILED_IDLE_TIMEOUT;
+            } else {
+                /* 看门狗的超时值是从 NVS 读的：新值落盘之后重新 arm 一次，
+                 * 它才会用上新值。 */
+                (void)th_bsp_idle_init();
+            }
+        }
+        free(req);
+    }
+    /*
+     * 把失败告诉 LVGL 任务（那里才有脏标记和 toast）。
+     * 用原子写：这个变量两个任务都会碰。
+     */
+    __atomic_store_n(&s_save_failed_mask, failed, __ATOMIC_RELEASE);
+    vTaskDelete(NULL);
+}
+
+/**
+ * 把记下来的值交给一次性任务落盘（在 LVGL 任务里调用，本身不做 flash 写）。
+ */
+static void slider_save_flush(void)
+{
+    if (!s_pending.brightness_dirty && !s_pending.idle_brightness_dirty &&
+        !s_pending.idle_timeout_dirty) {
+        return;
+    }
+
+    slider_save_req_t *req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+        SYS_LOGE(TAG, "no memory for the slider save request");
+        return;   /* 脏标记还在，下一拍再试 */
+    }
+    req->brightness = s_pending.brightness;
+    req->idle_brightness = s_pending.idle_brightness;
+    req->idle_timeout = s_pending.idle_timeout;
+    req->save_brightness = s_pending.brightness_dirty;
+    req->save_idle_brightness = s_pending.idle_brightness_dirty;
+    req->save_idle_timeout = s_pending.idle_timeout_dirty;
+
+    /* 先清脏标记：req 里已经是这一次要写的值，之后再有新值会重新置位。 */
+    s_pending.brightness_dirty = false;
+    s_pending.idle_brightness_dirty = false;
+    s_pending.idle_timeout_dirty = false;
+
+    /* 3072 B 内部栈：跟 tz_apply_task 一样，写 flash 的任务栈不能放 PSRAM。 */
+    if (xTaskCreate(slider_save_task, "th_slider", 3072, req, 3, NULL) != pdPASS) {
+        /* 建不出任务就把脏标记放回去，下一拍再试。 */
+        s_pending.brightness_dirty = req->save_brightness;
+        s_pending.idle_brightness_dirty = req->save_idle_brightness;
+        s_pending.idle_timeout_dirty = req->save_idle_timeout;
+        free(req);
+        ui_toast("设置保存失败：无法创建任务");
+    }
+}
+
+/** 去抖定时器：用户停手 600 ms 之后才落盘（一次拖动只写一次 NVS）。 */
+static void slider_save_tick(lv_timer_t *timer)
+{
+    (void)timer;
+
+    /*
+     * 上一次落盘有没有失败？失败了就把它变回「脏」，下一拍再试一次，
+     * 并且告诉用户 —— 不然用户刚调的值就静默丢了（亮度立刻生效了，
+     * 但那是内存里的值，下次开机还是旧的）。
+     */
+    const uint32_t failed = __atomic_exchange_n(&s_save_failed_mask, 0u, __ATOMIC_ACQ_REL);
+    if (failed != 0u) {
+        if ((failed & SLIDER_SAVE_FAILED_BRIGHTNESS) != 0u) {
+            s_pending.brightness_dirty = true;
+        }
+        if ((failed & SLIDER_SAVE_FAILED_IDLE_BRIGHT) != 0u) {
+            s_pending.idle_brightness_dirty = true;
+        }
+        if ((failed & SLIDER_SAVE_FAILED_IDLE_TIMEOUT) != 0u) {
+            s_pending.idle_timeout_dirty = true;
+        }
+        SYS_LOGE(TAG, "the settings could not be written to NVS (%s)",
+                 failed == SLIDER_SAVE_FAILED_BRIGHTNESS ? "brightness" : "another key");
+        ui_toast("设置保存失败，将重试");
+    }
+
+    slider_save_flush();
+}
+
+/** 重新计时：每次拖动都调用，所以落盘只发生在停手之后。 */
+static void slider_save_arm(void)
+{
+    if (s_save_timer != NULL) {
+        lv_timer_reset(s_save_timer);
+    }
+}
+
 static void brightness_changed(int32_t value)
 {
+    /* 立刻生效：屏幕马上变亮（只改叠加层，不碰 flash）。 */
     (void)th_bsp_set_brightness((uint8_t)value);
-    (void)sys_config_set_i32(SYS_KEY_BRIGHTNESS, value);
+    s_pending.brightness = value;
+    s_pending.brightness_dirty = true;
+    slider_save_arm();
 }
 
 static void idle_brightness_changed(int32_t value)
 {
-    (void)sys_config_set_i32(SYS_KEY_IDLE_BRIGHT, value);
-    /* Only affects the next idle entry, so nothing to apply right now. */
+    /* 只影响下一次进待机，所以现在什么都不用做。 */
+    s_pending.idle_brightness = value;
+    s_pending.idle_brightness_dirty = true;
+    slider_save_arm();
 }
 
 static void idle_timeout_changed(int32_t value)
 {
-    (void)sys_config_set_i32(SYS_KEY_IDLE_TIMEOUT, value);
-    /* Re-arm the watchdog so the new value takes effect immediately. */
-    (void)th_bsp_idle_init();
+    /* 超时值是从 NVS 读的，这里只记下来；落盘之后由一次性任务重新 arm。
+     * 顺便报一次活动：原来每次改超时都会重置待机倒计时，这里保持一致
+     * （th_bsp_report_activity() 只动内存，不碰 flash）。 */
+    th_bsp_report_activity();
+    s_pending.idle_timeout = value;
+    s_pending.idle_timeout_dirty = true;
+    slider_save_arm();
 }
 
 static void slider_changed_cb(lv_event_t *e)
@@ -258,6 +433,15 @@ static void tz_apply_task(void *arg)
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "timezone change failed: %s", esp_err_to_name(err));
     }
+    /*
+     * 一次性任务必须自己收尾。
+     *
+     * FreeRTOS 的任务函数**不能直接返回**：返回等于「任务结束了，但栈还没还回去」，
+     * 调度器会踩到一块已经失效的栈 —— 真机上的表现是点一下时区按钮设备就卡死
+     * （网页连不上、串口不出字，只能复位）。这是 v1.6.0 就有的老 bug，
+     * 本轮上机时被「点时区按钮 → 设备卡死」顺带查出来的。
+     */
+    vTaskDelete(NULL);
 }
 
 static void tz_clicked_cb(lv_event_t *e)
@@ -1064,6 +1248,14 @@ static esp_err_t settings_create(lv_obj_t *parent)
     s_idle_bright.value = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 100);
     s_idle_timeout.value = sys_config_get_i32_or(SYS_KEY_IDLE_TIMEOUT, 30);
 
+    /* 滑块的新值先记在这儿，等去抖定时器交给一次性任务落盘。 */
+    s_pending.brightness = s_brightness.value;
+    s_pending.idle_brightness = s_idle_bright.value;
+    s_pending.idle_timeout = s_idle_timeout.value;
+    s_pending.brightness_dirty = false;
+    s_pending.idle_brightness_dirty = false;
+    s_pending.idle_timeout_dirty = false;
+
     setting_slider_t *defs[] = { &s_brightness, &s_idle_bright, &s_idle_timeout };
     s_slider_count = 0;
     for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]) && s_slider_count < SETTINGS_MAX_SLIDERS;
@@ -1264,6 +1456,12 @@ static esp_err_t settings_create(lv_obj_t *parent)
         lv_timer_pause(s_slider_timer);
     }
 
+    /* 滑块落盘的去抖定时器：同样由页面拥有，on_hide() 暂停。 */
+    s_save_timer = lv_timer_create(slider_save_tick, 600, NULL);
+    if (s_save_timer != NULL) {
+        lv_timer_pause(s_save_timer);
+    }
+
     /* The NTP outcome is delivered on the LVGL task by ui_core, so the toast can
      * be shown without the page ever blocking on the network. */
     (void)ui_event_subscribe(CALENDAR_EVENT, CALENDAR_EVENT_SYNC_RESULT,
@@ -1279,6 +1477,9 @@ static esp_err_t settings_on_show(void)
     if (s_slider_timer != NULL) {
         lv_timer_resume(s_slider_timer);
     }
+    if (s_save_timer != NULL) {
+        lv_timer_resume(s_save_timer);
+    }
     return ESP_OK;
 }
 
@@ -1286,6 +1487,11 @@ static esp_err_t settings_on_hide(void)
 {
     if (s_slider_timer != NULL) {
         lv_timer_pause(s_slider_timer);
+    }
+    if (s_save_timer != NULL) {
+        /* 刚拖完就离开页面：先把值落盘，别把用户刚调的值丢掉。 */
+        slider_save_flush();
+        lv_timer_pause(s_save_timer);
     }
     return ESP_OK;
 }

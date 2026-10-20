@@ -1026,7 +1026,9 @@ static esp_err_t home_create(lv_obj_t *parent)
         lv_obj_set_width(tile, LV_PCT(23));
     }
 
-    home_refresh();
+    /* 这里**不**取数：ui_core 建完页面紧接着就会调 on_show()，那边取一次就够
+     * （以前这里取一次、on_show 又取一次，白白多跑一遍 word_stats() + 一次
+     * 清单快照）。 */
     SYS_LOGD(TAG, "home built with %u tiles and 3 status cards",
              (unsigned)(sizeof(s_tiles) / sizeof(s_tiles[0])));
     return ESP_OK;

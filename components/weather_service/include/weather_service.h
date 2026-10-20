@@ -115,6 +115,20 @@ esp_err_t weather_set_location(double lat, double lon, const char *label);
  */
 esp_err_t weather_detect_location(void);
 
+/**
+ * @brief Resolve the location from the public IP address, without blocking.
+ *
+ * The request is handed to the weather worker (DNS + TLS + one HTTP request,
+ * up to 12 s), so the caller returns immediately. This is the entry point a
+ * UI callback must use: calling the blocking weather_detect_location() from
+ * an LVGL event callback freezes the whole interface (AGENT.md 9.0.1.1).
+ *
+ * The outcome comes back as an event: WEATHER_EVENT_UPDATED when the new
+ * reading is in place, WEATHER_EVENT_REFRESH_FAILED (payload: esp_err_t)
+ * when it did not work out. The caller does not have to wait for either.
+ */
+esp_err_t weather_detect_location_async(void);
+
 /** @brief Geolocation endpoint used by weather_detect_location(). */
 const char *weather_get_geo_endpoint(void);
 

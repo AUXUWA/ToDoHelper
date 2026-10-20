@@ -36,24 +36,42 @@ static lv_obj_t *s_icon_fallback;
 static void refresh(void);
 
 /**
+ * A "重新定位" tap is waiting for its reading.
+ *
+ * The location runs in the background (the blocking version froze the panel
+ * for up to 12 s), so the "已定位到 ..." toast has to wait for the answer.
+ * The flag keeps that toast tied to the user's own tap: the 900 s periodic
+ * refresh also posts WEATHER_EVENT_UPDATED, and it must not claim the user.
+ */
+static bool s_detect_pending;
+
+/**
  * "重新定位": re-derive the city from the public IP.
  *
  * The manual city entry is gone. The panel has no IME, so typing a Chinese city
  * name on it was never practical, and the public IP already tells us where we are
  * (FR3 location priority 2, now the only path - see weather_detect_location()).
+ *
+ * The call is the **async** one. The blocking weather_detect_location() is a
+ * full HTTPS round trip (DNS + TLS + request, 12 s timeout) and this runs in an
+ * LVGL event callback, so the blocking version froze the whole panel for up to
+ * 12 s on every tap - AGENT.md 9.0.1.1 rule 1 ("no network calls in a callback").
+ *
+ * The reading comes back through WEATHER_EVENT_UPDATED, which this page already
+ * handles (weather_on_event -> refresh()); s_detect_pending is what keeps the
+ * "已定位到 ..." toast tied to the user's own tap and not to the 900 s timer.
  */
 static void city_clicked_cb(lv_event_t *e)
 {
     (void)e;
 
     ui_toast("正在通过 IP 定位…");
-    esp_err_t err = weather_detect_location();
+    s_detect_pending = true;
+    const esp_err_t err = weather_detect_location_async();
     if (err != ESP_OK) {
+        s_detect_pending = false;
         ui_toast("定位失败：%s", esp_err_to_name(err));
-        return;
     }
-    refresh();
-    ui_toast("已定位到 %s", weather_get_city());
 }
 
 /* ------------------------------------------------------------------------ */
@@ -268,10 +286,18 @@ static esp_err_t weather_on_event(int32_t event_id, void *data)
         if (data != NULL) {
             memcpy(&err, data, sizeof(err));
         }
+        /* The user's own tap failed: the toast below already covers the error,
+         * and the pending flag has to be cleared or the next successful
+         * refresh would claim the tap that failed. */
+        s_detect_pending = false;
         /* Offline is a normal state, not an error dialog (requirement 15). */
         ui_toast("刷新失败(%s)，显示缓存", esp_err_to_name(err));
     }
     refresh();
+    if (event_id == WEATHER_EVENT_UPDATED && s_detect_pending) {
+        s_detect_pending = false;
+        ui_toast("已定位到 %s", weather_get_city());
+    }
     return ESP_OK;
 }
 

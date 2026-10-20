@@ -46,6 +46,29 @@
 
 static const char *TAG = "app";
 
+/**
+ * How long the newest boot log line must have been published before the
+ * hand-over to the home page.
+ *
+ * The splash refreshes its log view every 250 ms (SPLASH_TICK_MS in
+ * components/ui_pages/src/page_splash.c), so a line that is older than that
+ * has been rendered on the panel.
+ */
+#define BOOT_LOG_ON_SCREEN_MS 300
+
+/**
+ * Upper bound of the hand-over wait (roadmap v1.8.0 F1).
+ *
+ * The old code slept for a fixed 3 s here: 46 % of the whole boot, spent
+ * looking at a screen that did not change, because every module had already
+ * finished. Now the wait ends as soon as the boot log is on the screen, and
+ * it never lasts longer than this - the home page comes up either way.
+ */
+#define BOOT_HANDOVER_MAX_MS 1000
+
+/** Poll interval of the hand-over wait. */
+#define BOOT_HANDOVER_POLL_MS 20
+
 typedef struct {
     const char *name;
     esp_err_t (*init)(void);
@@ -150,6 +173,50 @@ static void log_reset_reason(void)
     SYS_LOGI(TAG, "reset reason: %s (%d)", name, (int)reason);
 }
 
+/**
+ * Has the newest boot log line been on the splash long enough?
+ *
+ * The project has no "the home page is ready" flag to ask for: ui_core knows
+ * which page is on screen (ui_page_current()) and sys_status knows what the
+ * services published, but neither of them says "the boot log the user is
+ * supposed to read is on the panel".
+ *
+ * The log's own metadata is the honest proxy: sys_log_recent_info_t::uptime_ms
+ * is the moment the line was published, and the splash draws the newest line
+ * every 250 ms, so a line that is older than that has been rendered.
+ */
+static bool boot_log_on_screen(void)
+{
+    sys_log_recent_info_t info;
+    char line[SYS_LOG_RECENT_LINE_LEN];
+    if (!sys_log_recent_get(0, line, sizeof(line), &info)) {
+        return false;   /* nothing published yet */
+    }
+    const uint32_t now = (uint32_t)sys_time_ms();
+    return (uint32_t)(now - info.uptime_ms) >= BOOT_LOG_ON_SCREEN_MS;
+}
+
+/**
+ * Wait until the boot log has been on the screen, but never longer than
+ * @p max_wait_ms.
+ *
+ * The hand-over to the home page must not depend on this: a missing log line
+ * (or a slow splash) only costs the user the reading time, never the home
+ * page.
+ */
+static void wait_for_boot_log(uint32_t max_wait_ms)
+{
+    const int64_t deadline = sys_time_ms() + (int64_t)max_wait_ms;
+    while (!boot_log_on_screen()) {
+        if (sys_time_ms() >= deadline) {
+            SYS_LOGD(TAG, "boot log not on screen after %u ms; home page anyway",
+                     (unsigned)max_wait_ms);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(BOOT_HANDOVER_POLL_MS));
+    }
+}
+
 void app_main(void)
 {
     /* First, so every later line is filtered by our level/quiet-tag policy. */
@@ -209,43 +276,47 @@ void app_main(void)
     sys_heap_log("ui_pages");
 
     /*
-     * Show the splash before the slow, optional services come up and keep it up for
-     * a fixed 3 s so the boot log is readable (user request).
+     * Show the splash before the slow, optional services come up, and keep it
+     * up while they come up: their log lines then scroll on the panel, which
+     * is the whole point of the boot-log screen.
      *
-     * The hand-off deliberately happens BEFORE run_modules(true), so the splash's
-     * log-refresh lv_timer is not alive while the modules initialise. That
-     * ordering was once suspected of causing the startup abort(); it did not.
-     * The real cause was internal RAM exhaustion inside a module's JSON parse,
-     * fixed by sys_json_use_psram() above - see AGENT.md 9.0.5.
+     * The hand-over to the home page is a **bounded wait**, not a fixed sleep
+     * (roadmap v1.8.0 F1). The old `vTaskDelay(pdMS_TO_TICKS(3000))` was pure
+     * dead time: nothing at all ran during those 3 s - the services only came
+     * up afterwards - so the panel showed a frozen log for 46 % of the boot.
+     *
+     * The hand-over happens AFTER run_modules(true) on purpose: the home page
+     * reads the shared status snapshot (sys_status), so it is created with the
+     * services already behind it instead of filling in a second later. The
+     * previous revision of this file handed over first and bought the
+     * readable log with a plain 3 s delay instead.
      */
 
     ESP_ERROR_CHECK(ui_page_switch(UI_PAGE_SPLASH));
 
+    /* The hook for services that must be up before the splash. No module is
+     * marked that way today, so this is a no-op; it stays because the module
+     * table is where that changes. */
     (void)run_modules(false);
 
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    (void)run_modules(true);
+
+    /* Wait until the boot log has actually been on the screen - but never
+     * longer than BOOT_HANDOVER_MAX_MS: the home page comes up either way. */
+    wait_for_boot_log(BOOT_HANDOVER_MAX_MS);
 
     if (ui_page_switch(UI_PAGE_HOME) != ESP_OK) {
         SYS_LOGE(TAG, "home page unavailable");
     }
 
-    (void)run_modules(true);
-
     /*
-     * Plan A: once WiFi and the word service are up, pull today's plan and the
-     * real progress from MaiMemo in the background. This is deliberately after
-     * the UI is interactive: the fetch is blocking TLS and the user should never
-     * wait for a network round trip to see their home screen. It no-ops when no
-     * token is configured or cloud mode is off, so the offline path is unaffected.
+     * Plan A: today's plan and the real progress are pulled from MaiMemo in
+     * the background - but **not** from here. That request is triggered by the
+     * "the station got an address" event (roadmap v1.8.0 D3): at boot there is
+     * no address yet, so a request sent now can only fail (no DNS) and pays
+     * for a full TLS handshake for nothing. The client owns that trigger
+     * (components/maimemo_client), so no token or mode is read here either.
      */
-    if (word_cloud_mode()) {
-        esp_err_t sync_err = maimemo_sync_start();
-        if (sync_err != ESP_OK) {
-            SYS_LOGW(TAG, "maimemo sync not started: %s", esp_err_to_name(sync_err));
-        } else {
-            SYS_LOGI(TAG, "maimemo sync started (cloud queue)");
-        }
-    }
 
     /* Do not touch the status bar from here: ui_core owns it, and LVGL must only
      * be driven from the LVGL task or under the lock. Ask for a refresh instead. */

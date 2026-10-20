@@ -13,6 +13,7 @@
 
 #include "esp_netif_sntp.h"
 #include "esp_heap_caps.h"
+#include "sys_status.h"
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -226,6 +227,24 @@ static esp_err_t sntp_start(void)
     return ESP_OK;
 }
 
+/**
+ * Does the station have an IPv4 address?
+ *
+ * The check has to look at the **value**, not at the length:
+ * `wifi_manager` publishes "0.0.0.0" while there is no address yet
+ * (that is `s_ip`'s initial value), so "not empty" is not enough.
+ * Same rule as weather_service's `weather_network_up()` and
+ * word_service's `have_ip()` - AGENT.md 9.0.1.4 item 5.
+ */
+static bool have_ip(void)
+{
+    sys_status_t st;
+    if (sys_status_get(&st) != ESP_OK) {
+        return false;
+    }
+    return st.wifi_ip[0] != '\0' && strcmp(st.wifi_ip, "0.0.0.0") != 0;
+}
+
 /* Start SNTP as soon as we have connectivity, whenever that happens. */
 static void connectivity_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -235,6 +254,15 @@ static void connectivity_handler(void *arg, esp_event_base_t base, int32_t id, v
 
     const bool *online = (const bool *)data;
     if (online == NULL || !*online) {
+        return;
+    }
+    /*
+     * The event means "the station got an address" (wifi_manager posts it
+     * from the IP_EVENT_STA_GOT_IP handler), so the SNTP query can go out.
+     * The address itself is the actual precondition - check it too, because
+     * a query without an address cannot leave the box at all.
+     */
+    if (!have_ip()) {
         return;
     }
     if (calendar_time_synced()) {
@@ -452,10 +480,16 @@ esp_err_t calendar_service_init(void)
         SYS_LOGW(TAG, "connectivity subscription failed: %s", esp_err_to_name(err));
     }
 
-    /* If WiFi is already connected, start immediately instead of waiting for
-     * the next connectivity event. */
-    sys_status_t st;
-    if (sys_status_get(&st) == ESP_OK && (st.wifi_connected || st.online)) {
+    /* If the station already has an address, start immediately instead of
+     * waiting for the next connectivity event.
+     *
+     * The old check was `st.wifi_connected || st.online` - both of which
+     * become true when the AP is **associated**, i.e. before DHCP has handed
+     * out an address. The first NTP query then could not leave the box at
+     * all, and the clock only became trustworthy ~32 s after boot (the SNTP
+     * server needs a retry to answer). Now the precondition is the address
+     * itself, so the first query is the one that works. */
+    if (have_ip()) {
         (void)sntp_start();
     }
 

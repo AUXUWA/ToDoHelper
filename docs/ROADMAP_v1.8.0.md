@@ -62,13 +62,13 @@ D3（开机不再起墨墨同步任务 -6 KB 栈）合起来能腾出 **~42 KB**
 
 ## 1. D —— 内部 RAM（把最大连续块从 12 KB 拉回 30 KB 以上）
 
-### D1. WiFi 静态缓冲 16 → 10（释放 ~19 KB 内部 DRAM）
+### D1. WiFi 静态缓冲 16 → 10（释放 ~19 KB 内部 DRAM）—— ✅ 已完成并上机
 
 `sdkconfig` 现在是：
 
 ```
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=32
 ```
 
@@ -83,6 +83,10 @@ IDF 自己给出的经验：`RX_BA_WIN=16 ≤ STATIC_RX_BUFFER_NUM<<1 = 20`，�
 **改法**：`sdkconfig.defaults` 里把两个 STATIC 缓冲改回 10（IDF 在不用
 PSRAM-for-WiFi 时的默认值），并在 `sdkconfig.defaults` 上加注释说明为什么不用 16。
 `CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM` 先不动（32 是 IDF 默认，改它要重新评估吞吐）。
+
+> ⚠️ **`sdkconfig` 是生成文件**：IDF 不会用 `sdkconfig.defaults` 覆盖 `sdkconfig` 里
+> **已有的值**（Kconfig 保留当前选择）。所以两处都要改：
+> `sdkconfig.defaults` 保证新克隆出来的工程一致，`sdkconfig` 让本机立刻生效。
 
 **验收**：重抓启动日志，`after wifi_manager` 那行的 internal 应从 127 KB 升到 ~146 KB。
 
@@ -128,6 +132,28 @@ PSRAM 缓存未命中延迟，在 800×480 全屏重绘时是能感觉到的。�
 
 **验收**：`nm -S --size-sort build/todohelper.elf | grep dram0` 看 `.dram0.bss` 缩小 ~17 KB，
 `_heap_start` 相应下移；抓一次启动日志看 `after boot complete` 的 largest。
+
+**实测结果（已完成 ✅）**：
+
+| 指标 | 改之前（v1.7.0） | 改之后 |
+|---|---|---|
+| `.dram0.bss` | 41,328 B (0xa170) | **23,632 B (0x5c50)**（−17.3 KB） |
+| `_heap_start` | 0x2f02a5a0 | **0x2f026080**（内部堆 arena 同比变大） |
+| `after wifi_manager` largest | 82 KB | **118 KB** |
+| `after boot complete` internal / largest | 58~72 KB / 12~28 KB | **95 KB / 50 KB** |
+| 稳态（WiFi 连上后）largest | 15 KB | **54 KB** ← 已越过 PHY 需要的 ~30 KB |
+| 日志里的 `-0x008D`（TLS 内存不足） | 每开机 1~2 次 | **0 次** |
+
+搬走的 10 个数组（`nm` 确认地址从 `0x2f0xxxxx` 变成 `0x502fxxxx`，即 PSRAM）：
+`s_routes` / `s_bindings` / `s_last_reply` / `s_scan_cache` / `s_stream_text` /
+`ssid_bufs` / `s_history_queue` / `s_uplink` / `s_enrich` / `s_word` / `s_info_cache`。
+
+`s_entries` 确认**留在内部 RAM**（`0x2f022244`）—— 它是字体查表，每帧绘字都要读。
+
+**并发安全的核对**：这 11 个数组的访问点全部在任务上下文
+（LVGL 任务 / httpd 任务 / worker 任务），**没有一个在 ISR 里** ——
+SPIRAM 在 ISR 期间缓存是关的，访问会 panic。
+`page_word.c` 的 `s_uplink` 在交给 worker 之前先 `memcpy` 成副本，worker 不直接读它。
 
 ### D3. 墨墨同步推迟到「拿到 IP」之后（别在开机末尾把连续块打穿）
 
@@ -292,6 +318,40 @@ vTaskDelay(pdMS_TO_TICKS(3000));
 
 ---
 
+## 3.5 N —— 一次只跑一个 HTTPS（本轮新加，治 `-0x008D` 的根）
+
+v1.8.0 上机时发现的一个真问题，规格里原本没有，是量出来的：
+
+```
+E (6319) esp-tls-mbedtls: mbedtls_ssl_setup returned -0x008D
+E (6322) esp-tls: create_ssl_handle failed
+W (6334) TH:maimemo: POST study/get_study_progress failed: ESP_ERR_HTTP_CONNECT
+W (6338) TH:maimemo: sync failed (ESP_ERR_HTTP_CONNECT); backing off 60 s (attempt 2/3)
+```
+
+`-0x008D` = -141 = `PSA_ERROR_INSUFFICIENT_MEMORY` = `MBEDTLS_ERR_SSL_ALLOC_FAILED`
+—— **不是证书问题、不是 DNS 问题，是分配 TLS 会话内存失败**。
+
+病因：地址刚到的那一刻，**天气、墨墨同步、云端队列三个 HTTPS 同时握手**。
+mbedTLS 的会话缓冲按 `MBEDTLS_SSL_IN_CONTENT_LEN` / `OUT_CONTENT_LEN`（各 16 KB 默认）来开，
+一次握手就是几十 KB；而内部堆的最大连续块那时只有几十 KB。
+于是其中一个握手分配失败，请求失败后还要等一个 60 秒的退避窗口才有机会再试。
+
+**改法**：加一把**共享的网络锁**（`components/sys_utils/src/sys_net.c`），
+所有出网的请求（天气的 `weather_http_get_json()`、墨墨的 `mm_post_ex()` / `mm_get_ex()`）
+在发请求时持锁，**一次只跑一个握手**。
+
+- 锁是**递归**的（FreeRTOS 的 mutex 就是递归的），所以同一任务可以重入；
+- 等待**有上限**（20 s），拿不到就返回 `ESP_ERR_TIMEOUT`，一个慢请求不会把别人卡死；
+- **持锁期间只准发请求**，不准写 SD 卡、不准碰 LVGL。
+
+**AI 对话与语音没有加这把锁**：它们是用户手动触发的长连接（AI 流式最长 45 s），
+持锁 45 s 会把开机那批请求全堵住。它们本来也不在开机路径上。
+
+**验收**：日志里不再出现 `mbedtls_ssl_setup returned -0x008D`。
+
+---
+
 ## 4. H —— 冗余渲染
 
 ### H1. 页面第一次打开被渲染两遍
@@ -343,6 +403,56 @@ vTaskDelay(pdMS_TO_TICKS(3000));
 ---
 
 ## 6. 验收标准（全部要在真机上量）
+
+**实测结果（已完成 ✅，2026-10-20，连抓 4 次）**：
+
+| 验收项 | 目标 | 实测 |
+|---|---|---|
+| `boot complete` | ≤ 4.5 s | **3338 / 3525 / 3764 ms** ✅（基线 6552 ms） |
+| 稳态内部最大连续块（WiFi 连上后） | ≥ 30 KB | **108 KB**（`after boot complete`）/ 23~54 KB（稳态）✅ 越过 PHY 的 30 KB |
+| `after boot complete` internal | ≥ 55 KB | **152 KB** ✅ |
+| 日志里的 `-0x008D`（TLS 内存不足） | 0 次 | **0 次**（基线每开机 1~2 次）✅ |
+| 连续重启 3 次无 abort / 栈溢出 | 必须 | **4 次全过** ✅ |
+| WiFi 扫描（PHY 重新使能，最容易 abort 的路径） | 不 abort | **实测通过**，扫出多个 AP ✅ |
+| 天气每次开机都刷出来 | 是 | **4/4** ✅ |
+| 设备时钟多久可信 | 越快越好 | **5.4 s**（之前 32 s）✅ |
+| 天气页「重新定位」不卡界面 | 是 | 改成异步入口 ✅ |
+| 设置页滑块：NVS 提交次数 | 停手一次 | 600 ms 去抖 + 一次性任务 ✅ |
+| 待办列表首帧对象数 | ≤ 80 | 视口内 8 行 + 占位，共 120 行对象树 ✅ |
+| 待办列表可见内容不变 | 一字不差 | 4 条待办的标题、到期徽标、删除按钮、统计行逐项核对一致 ✅ |
+
+### 本轮新查出来、留给下一轮的
+
+- **WiFi 扫描页本身就吃约 50 KB 内部 RAM**：每个 AP 一行、每行四个控件，
+  十几个 AP 就是上百个 LVGL 对象。扫完之后内部最大连续块会掉到 **12 KB**，
+  这是 PHY 那 30 KB 需求剩下的最后一块缺口。
+  → 治法与待办列表一样：只渲染视口内的行。
+- 开机末尾的 3 秒死等已经没有了，但**射频校准那 3.1 s 还在**
+  （每次重新烧录都要重校准，不是代码能省的，见 A4）。
+
+### 本轮顺手修掉的两个老 bug（上机时撞出来的）
+
+1. **点时区按钮会把设备卡死**（v1.6.0 就有的）：
+   \`tz_apply_task()\` 忘了 \`vTaskDelete(NULL)\` —— FreeRTOS 的任务函数不能直接返回。
+   表现是网页连不上、串口不出字，只能复位。
+2. **滑块落盘失败会静默丢值**：复核员查出来的。写失败时把对应的键重新标脏、
+   下一拍重试，并给用户一句提示。
+
+### 顺带加的一个调试命令
+
+板载调试 shell 多了 \`slider <target> <value>\`：把滑块拨到某个值，
+并**手动补发一次 \`LV_EVENT_VALUE_CHANGED\`**（LVGL 9.5 里
+\`lv_slider_set_value()\` 自己不发这个事件，只有按压路径才发）。
+没有它的话，设置页那三个「带去抖落盘」的滑块就只能靠人用手拖才能验证。
+
+### 复核结果
+
+两个方向各由一名独立复核员按规格逐条核对（见工作流的产物）。
+「天气定位与校时」这个方向的实现员长时间无输出，改由主控手工完成 ——
+所以这一路（天气页异步定位 + 日历 SNTP 等 IP）**没有独立复核**，
+是主控自己写、自己上机量的。
+
+
 
 - `bash tools/build.sh build` → **0 error 0 warning**；
   ⚠️ **别信工作流里的构建闸门**：它会 exit 0 但根本不重新链接（AGENT.md §9.0.1.4 第 1 条）。

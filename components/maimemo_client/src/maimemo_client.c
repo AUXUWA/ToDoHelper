@@ -47,6 +47,7 @@
 #include "maimemo_client.h"
 #include "storage_manager.h"
 #include "sys_keys.h"
+#include "sys_net.h"
 #include "sys_utils.h"
 
 static const char *TAG = "maimemo";
@@ -94,6 +95,48 @@ static esp_timer_handle_t s_sync_retry_timer;
 /** How many requests this round has already made. */
 static uint32_t s_sync_attempts;
 static bool s_initialized;
+
+/*
+ * wifi_manager's event base.
+ *
+ * maimemo_client deliberately does **not** depend on the wifi_manager
+ * component (the same reasoning as word_service, see
+ * components/word_service/src/word_service.c): an L3 -> L3 edge is what the
+ * project avoids. The single symbol that is needed is declared here -
+ * `ESP_EVENT_DEFINE_BASE(WIFI_MGR_EVENT)` in wifi_manager.c defines it as a
+ * global `const char *` whose value is "WIFI_MGR_EVENT".
+ *
+ * A wifi_manager that is not linked in is a **link error**, never a silent
+ * misbehaviour - which is the failure mode we want.
+ */
+extern esp_event_base_t const WIFI_MGR_EVENT;
+
+/**
+ * Whether the station had an address at the last WiFi event.
+ *
+ * The trigger for the automatic sync is the **transition**: the address
+ * appeared. A scan (which also posts a WIFI_MGR event) never starts a
+ * request, and a disconnect clears the flag again.
+ */
+static bool s_had_ip;
+
+/**
+ * Cached "a token is configured" flag.
+ *
+ * The WiFi event callback runs on the shared event task and must not touch the
+ * flash (AGENT.md 9.0.1.1 iron rule 1) - and maimemo_has_token() reads NVS.
+ * The cache is refreshed when the token is stored or cleared.
+ */
+static bool s_token_cached;
+
+/**
+ * Cached "the user wants the cloud book" flag (same reason as above).
+ *
+ * The automatic sync exists for the cloud book (plan A): with the local book
+ * there is nothing to pull, so the request would be pure waste. This is the
+ * same setting word_service reads (SYS_KEY_MAIMEMO_MODE), read once at init.
+ */
+static bool s_cloud_mode_cached;
 
 /** Last successful progress, kept so the UI can paint without the network. */
 static maimemo_progress_t s_progress;
@@ -209,6 +252,14 @@ static bool s_token_rejected;
 #define MM_SYNC_NET_SETTLE_MS 2000
 /** 一次同步最多等「一次只允许一个请求」这把锁多久。 */
 #define MM_SYNC_REQ_LOCK_MS 30000
+/**
+ * 拿到地址却没能起动 worker 时的重试间隔。
+ *
+ * 起不来只有一个原因：内部堆这一刻没有 6 KB 的连续空间（FreeRTOS 的任务栈
+ * 只能来自内部 RAM）。几秒后再试一次就够了 —— 那时候 WiFi 已经把地址拿到，
+ * 驱动也不再申请内存了。
+ */
+#define MM_SYNC_RETRY_SHORT_MS 5000
 
 /**
  * 第 @p streak 轮失败之后要等多久。
@@ -376,10 +427,30 @@ static bool mm_token(char *out, size_t len)
     return out[0] != '\0';
 }
 
+/**
+ * Refresh the cached configuration flags.
+ *
+ * Reads the flash, so it may only run in a task context - never from an event
+ * callback (AGENT.md 9.0.1.1 iron rule 1).
+ *
+ * The token flag is what the automatic sync asks before it touches the
+ * network; the mode flag says whether the automatic sync has anything to do
+ * at all (the local book needs no plan from MaiMemo).
+ */
+static void mm_cache_config(void)
+{
+    char mode[16];
+    s_cloud_mode_cached =
+        (sys_config_get_str(SYS_KEY_MAIMEMO_MODE, mode, sizeof(mode)) == ESP_OK) &&
+        (strcmp(mode, "cloud") == 0);
+    s_token_cached = maimemo_has_token();
+}
+
 esp_err_t maimemo_set_token(const char *token)
 {
     if (token == NULL || token[0] == '\0') {
         (void)sys_config_erase(SYS_KEY_MAIMEMO_TOKEN);
+        s_token_cached = false;
         /* 令牌被换掉（或者清空）= 「用户改了配置」，退避与锁存一起清掉，
          * 下一次请求重新从头来过。 */
         mm_record_outcome(MM_FAIL_NONE, ESP_OK);
@@ -391,6 +462,7 @@ esp_err_t maimemo_set_token(const char *token)
      * truncated paste without revealing the secret. */
     const esp_err_t err = sys_config_set_str(SYS_KEY_MAIMEMO_TOKEN, token);
     if (err == ESP_OK) {
+        s_token_cached = true;
         /* 换了令牌就等于「用户改了配置」：之前那次 401 不再作数，
          * 自动路径可以重新试一次（新令牌对不对，让这一次请求去回答）。 */
         mm_record_outcome(MM_FAIL_NONE, ESP_OK);
@@ -584,9 +656,29 @@ static esp_err_t mm_post_ex(const char *path, const char *body, cJSON **out_root
     const char *payload = (body != NULL) ? body : "{}";
     esp_http_client_set_post_field(client, payload, (int)strlen(payload));
 
+    /*
+     * One HTTPS at a time (see components/sys_utils/include/sys_net.h).
+     *
+     * A TLS handshake allocates a lot (mbedTLS sizes the session buffers from
+     * MBEDTLS_SSL_IN_CONTENT_LEN / OUT_CONTENT_LEN, 16 KB each), and the
+     * internal heap on this board is what the WiFi PHY needs a ~30 KB
+     * contiguous block of. Two handshakes at once (the weather refresh and
+     * this sync used to overlap right after the address arrived) made mbedTLS
+     * fail with -0x008D = PSA_ERROR_INSUFFICIENT_MEMORY, and the request then
+     * sat in a 60 s backoff window.
+     *
+     * The lock is taken around the request only - no SD writes, no LVGL calls.
+     */
+    const esp_err_t lock_err = sys_net_lock(SYS_NET_LOCK_DEFAULT_MS);
+    if (lock_err != ESP_OK) {
+        SYS_LOGW(TAG, "another request is holding the network lock");
+        return lock_err;
+    }
+
     const esp_err_t err = esp_http_client_perform(client);
     const int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    sys_net_unlock();
 
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "POST %s failed: %s", path, esp_err_to_name(err));
@@ -744,9 +836,29 @@ static esp_err_t mm_get_ex(const char *path, const char *query, cJSON **out_root
     }
     esp_http_client_set_header(client, "Authorization", auth);
 
+    /*
+     * One HTTPS at a time (see components/sys_utils/include/sys_net.h).
+     *
+     * A TLS handshake allocates a lot (mbedTLS sizes the session buffers from
+     * MBEDTLS_SSL_IN_CONTENT_LEN / OUT_CONTENT_LEN, 16 KB each), and the
+     * internal heap on this board is what the WiFi PHY needs a ~30 KB
+     * contiguous block of. Two handshakes at once (the weather refresh and
+     * this sync used to overlap right after the address arrived) made mbedTLS
+     * fail with -0x008D = PSA_ERROR_INSUFFICIENT_MEMORY, and the request then
+     * sat in a 60 s backoff window.
+     *
+     * The lock is taken around the request only - no SD writes, no LVGL calls.
+     */
+    const esp_err_t lock_err = sys_net_lock(SYS_NET_LOCK_DEFAULT_MS);
+    if (lock_err != ESP_OK) {
+        SYS_LOGW(TAG, "another request is holding the network lock");
+        return lock_err;
+    }
+
     const esp_err_t err = esp_http_client_perform(client);
     const int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    sys_net_unlock();
 
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "GET %s failed: %s", path, esp_err_to_name(err));
@@ -1201,7 +1313,10 @@ static void mm_sync_retry_cb(void *arg)
         /* A request is on the wire right now: that round covers the retry. */
         return;
     }
-    if (!maimemo_has_token()) {
+    /* The cached flag, not maimemo_has_token(): this is a timer callback, and
+     * the flash does not belong in a callback (AGENT.md 9.0.1.1 iron rule 1).
+     * The cache is refreshed whenever the token is stored or cleared. */
+    if (!s_token_cached) {
         return;
     }
     const esp_err_t err = mm_sync_launch();
@@ -1234,6 +1349,98 @@ static void mm_sync_cancel_retry(void)
     if (s_sync_retry_timer != NULL) {
         (void)esp_timer_stop(s_sync_retry_timer);
     }
+}
+
+/**
+ * Start a sync round **without touching the flash**.
+ *
+ * This is maimemo_sync_start() minus the NVS read for the token: the caller
+ * has already checked the cached flags. That is what makes it usable from an
+ * event callback (AGENT.md 9.0.1.1 iron rule 1).
+ *
+ * The work itself is not here: mm_sync_launch() only creates the worker task,
+ * and the request happens in that task.
+ */
+static esp_err_t mm_sync_start_now(void)
+{
+    if (__atomic_load_n(&s_sync_on_wire, __ATOMIC_ACQUIRE) > 0) {
+        return ESP_ERR_INVALID_STATE;   /* a request is on the wire */
+    }
+
+    /* A new round supersedes a pending retry. */
+    mm_sync_cancel_retry();
+    s_sync_attempts = 0;
+
+    return mm_sync_launch();
+}
+
+/**
+ * The station got an address: start the automatic sync.
+ *
+ * This is the trigger that replaces the unconditional boot sync (roadmap
+ * v1.8.0 D3).
+ *
+ * The old boot sync ran while there was **no address yet**: the host name
+ * could not even be resolved, so the attempt was doomed - it still paid for a
+ * DNS lookup and a full TLS handshake, got a 401, and took 11 KB out of the
+ * largest internal block right at the end of the boot. Now the request starts
+ * when there is something to send it to.
+ *
+ * Two gates, both from the RAM cache (no flash here):
+ *   - a token has to be configured, otherwise there is nothing to ask with;
+ *   - the cloud book has to be selected, because the local book needs no plan
+ *     from MaiMemo. That is the same condition the old boot call used
+ *     (`word_cloud_mode()` in app_main), so the request volume is unchanged.
+ */
+static void mm_sync_on_address(void)
+{
+    if (!s_token_cached || !s_cloud_mode_cached) {
+        return;
+    }
+
+    const esp_err_t err = mm_sync_start_now();
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "sync not started: %s", esp_err_to_name(err));
+        /* No memory for the worker right now: try again in a few seconds
+         * instead of losing the round (the retry timer is the same one the
+         * backoff uses). */
+        mm_sync_arm_retry(MM_SYNC_RETRY_SHORT_MS);
+        return;
+    }
+    SYS_LOGI(TAG, "sync started (the station got an address)");
+}
+
+/**
+ * A WiFi event arrived.
+ *
+ * The subscription covers **every** event of that base rather than one
+ * hard-coded id: the id would have to be copied out of wifi_manager.h into
+ * this file (a silent breakage if the enum ever changes), while the thing we
+ * actually care about - "is there an address now?" - is published by
+ * wifi_manager in sys_status *before* it posts its events.
+ *
+ * So the trigger is the **transition**: the address appeared. A scan (which
+ * also posts a WIFI_MGR event) therefore never starts a request, and a
+ * disconnect clears the flag again.
+ *
+ * The handler runs on the shared event task, so it stays light: it reads the
+ * RAM status snapshot and starts the worker task. No flash, no network here.
+ */
+static void mm_on_wifi_event(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+
+    const bool now = mm_have_ip();
+    const bool had = s_had_ip;
+    s_had_ip = now;
+
+    if (!now || had) {
+        return;   /* no address, or nothing changed since the last event */
+    }
+    mm_sync_on_address();
 }
 
 /** Worker body of the asynchronous sync. */
@@ -1324,19 +1531,9 @@ esp_err_t maimemo_sync_start(void)
     if (!maimemo_has_token()) {
         return ESP_ERR_NOT_FOUND;
     }
-    if (__atomic_load_n(&s_sync_on_wire, __ATOMIC_ACQUIRE) > 0) {
-        return ESP_ERR_INVALID_STATE;   /* a request is on the wire */
-    }
-
-    /* A new round supersedes a pending retry. */
-    mm_sync_cancel_retry();
-    s_sync_attempts = 0;
-
-    const esp_err_t err = mm_sync_launch();
-    if (err != ESP_OK) {
-        return err;
-    }
-    return ESP_OK;
+    /* The token check above is the only flash access: it happens here, in a
+     * task context (the console's "sync now" button). */
+    return mm_sync_start_now();
 }
 
 esp_err_t maimemo_verify_token(void)
@@ -2413,6 +2610,45 @@ esp_err_t maimemo_client_init(void)
     esp_err_t http_err = maimemo_register_http();
     if (http_err != ESP_OK) {
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
+    }
+
+    /*
+     * The automatic sync is triggered by the network, not by the boot
+     * (roadmap v1.8.0 D3).
+     *
+     * At boot there is no address yet: the host name cannot even be resolved,
+     * so a request sent then is doomed - and it still pays for a DNS lookup
+     * and a full TLS handshake, while taking 6 KB of internal task stack plus
+     * the TLS session out of the largest internal block exactly at the end of
+     * the boot. So the trigger is "the station got an address".
+     *
+     * The cached flags are read here (a task context, so the NVS read is
+     * allowed); the event callback itself only reads RAM.
+     */
+    mm_cache_config();
+
+    /*
+     * **sys_event_subscribe(), not esp_event_handler_register().** The project
+     * posts through a *custom* event loop (sys_event_post_to() ->
+     * esp_event_post_to(s_loop, ...)), so registering on the ESP-IDF default
+     * loop silently never fires.
+     *
+     * The subscription covers every event of the base; the handler reacts to
+     * the moment the address appears (see mm_on_wifi_event).
+     */
+    const esp_err_t wifi_sub = sys_event_subscribe(WIFI_MGR_EVENT, ESP_EVENT_ANY_ID,
+                                                   mm_on_wifi_event, NULL, NULL);
+    if (wifi_sub != ESP_OK) {
+        SYS_LOGW(TAG, "cannot subscribe to the WiFi events: %s",
+                 esp_err_to_name(wifi_sub));
+    }
+
+    /* The address may already be there (a warm boot, or a reconnect that
+     * finished before this module came up): no event will come, so ask for
+     * the sync now. */
+    s_had_ip = mm_have_ip();
+    if (s_had_ip) {
+        mm_sync_on_address();
     }
 
     SYS_LOGI(TAG, "ready (token=%s, push=%s)", maimemo_has_token() ? "set" : "unset",

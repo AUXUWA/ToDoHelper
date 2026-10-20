@@ -333,6 +333,7 @@ static void cmd_help(dbg_out_t *o)
         "  widgets [filter] [depth] dump the object tree under the screen\n"
         "  click <target>           press a widget (by label text or index)\n"
         "  text <target> <value>    set a label's text\n"
+        "  slider <target> <value>  move a slider (fires VALUE_CHANGED, like a tap)\n"
         "  page <id|name>           switch page (0..10 or splash/home/...)\n"
         "  tap <x> <y>              report which widget is at a screen point\n"
         "  idle <enter|exit>        force idle-face enter/leave\n"
@@ -638,6 +639,7 @@ typedef struct {
     const char *target;
     int index;
     bool do_text;
+    bool do_slider;
     const char *value;
 } click_args_t;
 
@@ -659,6 +661,43 @@ static void ui_click_cb(void *arg)
         }
         lv_label_set_text(obj, c->value);
         out_printf(c->out, "set %s text to '%s'\n", class_name_of(obj), c->value);
+        return;
+    }
+
+    if (c->do_slider) {
+        /*
+         * Move a slider without a finger.
+         *
+         * `click` cannot do it: an LVGL slider changes its value in its press
+         * handler, which reads the pointer position from the input device -
+         * a synthesised event carries no coordinates, so the value stays put.
+         * That makes the settings page (brightness / idle brightness / idle
+         * timeout) the one widget family the shell cannot exercise, and those
+         * sliders are the ones with a **debounced NVS write** behind them
+         * (roadmap v1.8.0 E2) - exactly the path that has to be verified
+         * without a human dragging a finger.
+         *
+         * lv_slider_set_value() fires LV_EVENT_VALUE_CHANGED, which is what the
+         * page's callback is registered for, so the whole chain (callback ->
+         * debounce timer -> one-shot task -> NVS) runs as it would on a touch.
+         */
+        if (!lv_obj_check_type(obj, &lv_slider_class)) {
+            out_printf(c->out, "'%s' is a %s, not a slider\n", c->target,
+                       class_name_of(obj));
+            return;
+        }
+        const int32_t value = (int32_t)atoi(c->value);
+        lv_slider_set_value(obj, value, LV_ANIM_OFF);
+        /*
+         * LVGL 9.5: lv_slider_set_value() does **not** send LV_EVENT_VALUE_CHANGED -
+         * only the press path does (lv_slider.c, the helper that computes the
+         * value from the pointer). So the event has to be sent by hand,
+         * otherwise the page's callback never runs and the shell would look
+         * like it moved a slider that did nothing.
+         */
+        lv_obj_send_event(obj, LV_EVENT_VALUE_CHANGED, NULL);
+        out_printf(c->out, "set slider to %d (now %d)\n", (int)value,
+                   (int)lv_slider_get_value(obj));
         return;
     }
 
@@ -1131,6 +1170,21 @@ static void dbg_exec(char *line, dbg_out_t *out)
         if (!run_on_lvgl(ui_click_cb, &args, 5000)) {
             out_printf(out, "LVGL task did not respond\n");
         }
+    } else if (strcmp(cmd, "slider") == 0) {
+        if (a1 == NULL || argc < 3) {
+            out_printf(out, "usage: slider <label-or-class> <value> [index]\n");
+            return;
+        }
+        click_args_t args = {
+            .out = out,
+            .target = a1,
+            .index = (argc >= 4) ? atoi(argv[3]) : 0,
+            .do_slider = true,
+            .value = argv[2],
+        };
+        if (!run_on_lvgl(ui_click_cb, &args, 5000)) {
+            out_printf(out, "LVGL task did not respond\n");
+        }
     } else if (strcmp(cmd, "page") == 0) {
         ui_page_id_t id;
         if (a1 == NULL || !page_from_name(a1, &id)) {
@@ -1174,10 +1228,26 @@ static void dbg_exec(char *line, dbg_out_t *out)
         if (a1 == NULL) {
             out_printf(out, "usage: cfg get <key> | cfg set <key> <value>\n");
         } else if (strcmp(a1, "get") == 0 && a2 != NULL) {
+            /*
+             * NVS 里同一个键可以是字符串也可以是整数，而工程两种都用：
+             * 设置页的三个滑块写的是 i32（SYS_KEY_BRIGHTNESS …），
+             * 别的配置写的是字符串。只读字符串的话，滑块的值读回来是
+             * 「未设置」—— 一度让人以为去抖落盘没生效。
+             * → 字符串读不到就按整数再读一次。
+             */
             char value[256];
-            const esp_err_t err = sys_config_get_str(a2, value, sizeof(value));
-            out_printf(out, "%s = %s (%s)\n", a2,
-                       (err == ESP_OK) ? value : "(unset)", esp_err_to_name(err));
+            esp_err_t err = sys_config_get_str(a2, value, sizeof(value));
+            if (err == ESP_OK) {
+                out_printf(out, "%s = %s (%s)\n", a2, value, esp_err_to_name(err));
+            } else {
+                int32_t number = 0;
+                const esp_err_t err_i = sys_config_get_i32(a2, &number);
+                if (err_i == ESP_OK) {
+                    out_printf(out, "%s = %d (i32)\n", a2, (int)number);
+                } else {
+                    out_printf(out, "%s = (unset) (%s)\n", a2, esp_err_to_name(err));
+                }
+            }
         } else if (strcmp(a1, "set") == 0 && a2 != NULL && argc > 3) {
             const esp_err_t err = sys_config_set_str(a2, argv[3]);
             out_printf(out, "set %s = %s -> %s\n", a2, argv[3], esp_err_to_name(err));
