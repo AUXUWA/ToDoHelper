@@ -40,6 +40,22 @@ esp_err_t th_bsp_led_set(th_bsp_led_state_t state)
 static bool s_sd_mounted;
 static char s_sd_mount_point[24];
 
+/**
+ * 挂载 SD 卡时重试几次。
+ *
+ * 卡偶尔会「没准备好」：上电之后 esp_vfs_fat_sdmmc_sdcard_init() 超时
+ * （真机日志 312 次开机里有 2 次：ESP_ERR_TIMEOUT）。
+ * 后果**是用户看得见的**：卡上放着中文字库（fonts/ui_cjk.ttf），
+ * 挂不上 → FreeType 用不了 → 退回内嵌的 GB2312 一级子集 →
+ * **生僻字变成方块**。
+ *
+ * 所以这里宁可多试几次：IDF 在挂载失败时会把 SDMMC host 反初始化
+ * （vfs_fat_sdmmc.c 的 call_host_deinit），所以重试是安全的。
+ */
+#define TH_BSP_SD_MOUNT_ATTEMPTS 3
+/** 两次尝试之间歇多久（毫秒）。 */
+#define TH_BSP_SD_MOUNT_RETRY_MS 500
+
 esp_err_t th_bsp_sdcard_mount(void)
 {
     if (s_sd_mounted) {
@@ -51,7 +67,18 @@ esp_err_t th_bsp_sdcard_mount(void)
 
     /* format_if_mount_failed stays false: silently reformatting a user's card
      * would destroy data, and requirement 12 only asks for a graceful fallback. */
-    esp_err_t err = bsp_sdcard_mount(&cfg, &card);
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= TH_BSP_SD_MOUNT_ATTEMPTS; attempt++) {
+        err = bsp_sdcard_mount(&cfg, &card);
+        if (err == ESP_OK) {
+            break;
+        }
+        SYS_LOGW(TAG, "SD mount attempt %d/%d failed: %s", attempt,
+                 TH_BSP_SD_MOUNT_ATTEMPTS, esp_err_to_name(err));
+        if (attempt < TH_BSP_SD_MOUNT_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(TH_BSP_SD_MOUNT_RETRY_MS));
+        }
+    }
     if (err != ESP_OK) {
         SYS_LOGI(TAG, "SD mount failed: %s", esp_err_to_name(err));
         return err;

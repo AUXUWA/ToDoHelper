@@ -110,6 +110,23 @@ CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL=y
 CONFIG_ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD=y
 CONFIG_TODOHELPER_FONT_FREETYPE=y
 
+# FreeType 字形缓存：256 → 32。
+#
+# 这个缓存装的是**每一个用过的汉字的位图**（28 px 的汉字约 784 B，48 px 约 2.3 KB），
+# 而 LVGL 用的是 C 库的 malloc（CONFIG_LV_USE_CLIB_MALLOC=y），
+# 所以这些位图全部落在内部堆里（≤4096 B 的分配优先内部，见上面
+# CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL）。
+#
+# 真机实测（同一个固件，只改这一个数，绕开所有页面各走三遍）：
+#   256 → 内部堆 290 KB 掉到 **0 KB**（最大连续块 0 KB），设备直接崩；
+#   64  → 绕完三遍只剩 54~64 KB，最大连续块 5~17 KB；
+#   32  → 绕完三遍还剩 76~88 KB，最大连续块 22~35 KB（过了 PHY 需要的 ~30 KB）。
+#
+# 代价：缓存小了，被挤掉的字形要重新渲染（FreeType 每个汉字约 100~200 µs）。
+# 一屏 30~40 个汉字 → 每帧多几毫秒，滚动略慢但不掉帧；
+# 而「逛一遍页面就把内存吃光、然后崩掉」是不能接受的。
+CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=32
+
 # Display / UI
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_FS=y
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_DECODER=y
