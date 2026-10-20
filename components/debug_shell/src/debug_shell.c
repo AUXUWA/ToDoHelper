@@ -473,8 +473,8 @@ static void cmd_audio(dbg_out_t *o, const char *arg)
     }
 
     const int ms = atoi(arg);
-    if (ms < 200 || ms > 10000) {
-        out_printf(o, "usage: audio [record_ms]  (200..10000)\n");
+    if (ms < 200 || ms > 5000) {
+        out_printf(o, "usage: audio [record_ms]  (200..5000)\n");
         return;
     }
 
@@ -487,8 +487,11 @@ static void cmd_audio(dbg_out_t *o, const char *arg)
     vTaskDelay(pdMS_TO_TICKS((uint32_t)ms));
     (void)voice_service_stop_record();
 
-    /* Wait for the capture task to finish and publish the result. */
-    for (int i = 0; i < 50 && voice_service_is_recording(); i++) {
+    /* Wait for the capture task to finish and publish the result.
+     * The wait is bounded: the capture is over by then (it is capped at
+     * VOICE_MAX_RECORD_MS), and a device that never finishes must not keep
+     * the HTTP server busy. */
+    for (int i = 0; i < 20 && voice_service_is_recording(); i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 

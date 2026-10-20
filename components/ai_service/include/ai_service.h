@@ -76,6 +76,9 @@ esp_err_t ai_service_set_api_key(const char *key);
 /** @brief True when an API key is configured. The key itself is never exposed. */
 bool ai_service_has_api_key(void);
 
+/** @brief True when the conversation history is saved to storage. */
+bool ai_service_save_history_enabled(void);
+
 /** @brief Set and persist the system prompt (role definition). */
 esp_err_t ai_service_set_system_prompt(const char *prompt);
 

@@ -76,6 +76,15 @@ static SemaphoreHandle_t s_init_sem;
  */
 #define VOICE_HTTP_TASK_STACK 8192
 
+/**
+ * The microphone and the speaker are **one** ES8389 chip behind two
+ * esp_codec_dev handles, and opening either one rewrites the chip's register
+ * configuration (the work mode, the gains). So recording and playing at the
+ * same time would have the two paths fight over the chip.
+ * This mutex makes them take turns.
+ */
+static SemaphoreHandle_t s_codec_lock;
+
 static int16_t *s_pcm;          /* VOICE_MAX_SAMPLES mono samples, in PSRAM */
 static size_t s_pcm_count;
 static uint32_t s_pcm_ms;
@@ -271,9 +280,17 @@ static void record_task(void *arg)
         .bits_per_sample = VOICE_CODEC_BITS,
     };
 
+    /* One chip, two paths: take turns with the player. */
+    if (s_codec_lock != NULL) {
+        (void)xSemaphoreTake(s_codec_lock, pdMS_TO_TICKS(5000));
+    }
+
     if (esp_codec_dev_open(mic, &fs) != ESP_OK) {
         SYS_LOGE(TAG, "codec open for capture failed");
         s_recording = false;
+        if (s_codec_lock != NULL) {
+            xSemaphoreGive(s_codec_lock);
+        }
         vTaskDelete(NULL);
         return;
     }
@@ -341,6 +358,9 @@ static void record_task(void *arg)
     }
 
     esp_codec_dev_close(mic);
+    if (s_codec_lock != NULL) {
+        xSemaphoreGive(s_codec_lock);
+    }
     s_pcm_count = produced;
     s_pcm_ms = (uint32_t)((produced * 1000) / VOICE_SAMPLE_RATE);
     s_pcm_peak = peak;
@@ -461,7 +481,18 @@ static esp_err_t play_mono_pcm(const int16_t *mono, size_t count)
         .bits_per_sample = VOICE_CODEC_BITS,
     };
 
+    /* Same chip as the microphone: take turns with the recorder. */
+    if (s_codec_lock != NULL) {
+        if (xSemaphoreTake(s_codec_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            SYS_LOGW(TAG, "playback gave up waiting for the codec");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
     if (esp_codec_dev_open(spk, &fs) != ESP_OK) {
+        if (s_codec_lock != NULL) {
+            xSemaphoreGive(s_codec_lock);
+        }
         return ESP_FAIL;
     }
     (void)esp_codec_dev_set_out_vol(spk, 70);
@@ -478,6 +509,9 @@ static esp_err_t play_mono_pcm(const int16_t *mono, size_t count)
     }
 
     esp_codec_dev_close(spk);
+    if (s_codec_lock != NULL) {
+        xSemaphoreGive(s_codec_lock);
+    }
     s_playing = false;
 
     (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, NULL, 0);
@@ -959,6 +993,10 @@ esp_err_t voice_service_init(void)
 {
     if (s_initialized) {
         return ESP_OK;
+    }
+
+    if (s_codec_lock == NULL) {
+        s_codec_lock = xSemaphoreCreateMutex();
     }
 
     (void)sys_config_get_str_or(SYS_KEY_ASR_URL, s_asr_url, sizeof(s_asr_url), "");

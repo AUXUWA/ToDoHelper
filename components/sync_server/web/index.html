@@ -2148,6 +2148,9 @@ function aiRender(state) {
   stamp.textContent = (hasKey ? "Key 已配置" : "未配置 Key") + " · " + (state.model || "?");
   $("ai-model").value = state.model || "deepseek-chat";
   if (state.history_rounds) { $("ai-rounds").value = state.history_rounds; }
+  /* The checkbox has to reflect the device's real state, otherwise every
+     "save" would write the checkbox's (default: off) value back. */
+  $("ai-save-hist").checked = !!state.save_history;
   /* 提示词是「写一次就不回显」的：改了它会清空设备上的对话历史，
      所以这里只提示，不自动填。 */
   $("ai-prompt").placeholder = $("ai-prompt").placeholder ||

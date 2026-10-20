@@ -190,6 +190,13 @@ static void api_key_flag_set(bool has_key)
     }
 }
 
+bool ai_service_save_history_enabled(void)
+{
+    bool enabled = false;
+    (void)sys_config_get_bool(SYS_KEY_AI_SAVE_HIST, &enabled);
+    return enabled;
+}
+
 bool ai_service_has_api_key(void)
 {
     if (s_initialized) {

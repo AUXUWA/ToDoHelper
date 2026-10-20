@@ -535,11 +535,13 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     cJSON_Delete(root);
 
     /* The API key is deliberately not echoed back. */
-    char data[160];
+    char data[200];
     snprintf(data, sizeof(data),
-             "{\"model\":\"%s\",\"has_api_key\":%s,\"history_rounds\":%u,\"state\":\"%s\"}",
+             "{\"model\":\"%s\",\"has_api_key\":%s,\"history_rounds\":%u,"
+             "\"save_history\":%s,\"state\":\"%s\"}",
              ai_service_get_model(), ai_service_has_api_key() ? "true" : "false",
              (unsigned)ai_service_get_history_rounds(),
+             ai_service_save_history_enabled() ? "true" : "false",
              ai_service_state_name(ai_service_get_state()));
     return http_reply_ok(req, data);
 }
@@ -560,9 +562,11 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 {
     char data[192];
     snprintf(data, sizeof(data),
-             "{\"model\":\"%s\",\"has_api_key\":%s,\"history_rounds\":%u,\"state\":\"%s\"}",
+             "{\"model\":\"%s\",\"has_api_key\":%s,\"history_rounds\":%u,"
+             "\"save_history\":%s,\"state\":\"%s\"}",
              ai_service_get_model(), ai_service_has_api_key() ? "true" : "false",
              (unsigned)ai_service_get_history_rounds(),
+             ai_service_save_history_enabled() ? "true" : "false",
              ai_service_state_name(ai_service_get_state()));
     return http_reply_ok(req, data);
 }
