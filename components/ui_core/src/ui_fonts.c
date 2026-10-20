@@ -315,8 +315,9 @@ void ui_fonts_init(void)
         if (s_fonts[i] == NULL) {
             s_fonts[i] = builtin_font((ui_font_role_t)i);
         }
-        /* 让 ftstats 能报出各字号的字形缓存情况（内置字体会被自动忽略）。 */
-        ui_font_mem_track(s_fonts[i]);
+        /* 只有 FreeType 字体有字形缓存 —— 是不是 FreeType 字体，这里最清楚
+         * （s_using_freetype 就是那条路的开关），不要让 ui_font_mem 去猜。 */
+        ui_font_mem_track(s_fonts[i], s_using_freetype);
     }
 }
 
@@ -335,6 +336,11 @@ void ui_fonts_reload(void)
     }
 
 #if CONFIG_TODOHELPER_FONT_FREETYPE
+    /* Forget the fonts first: this puts the original glyph callbacks back
+     * (the fonts must still be alive for that) and drops the tracked
+     * pointers, which would dangle once the handles are released. */
+    ui_font_mem_forget_all();
+
     /* Release the FreeType handles so a replaced file can be re-opened. The
      * adapter owns the underlying objects and drops them from its list here. */
     for (int i = 0; i < UI_FONT_ROLE_MAX; i++) {
@@ -343,11 +349,9 @@ void ui_fonts_reload(void)
             s_ft_handles[i] = NULL;
         }
     }
-#endif
-
-    /* The fonts are gone now - the pointers the memory manager still holds
-     * would dangle. */
+#else
     ui_font_mem_forget_all();
+#endif
 
     memset(s_fonts, 0, sizeof(s_fonts));
     s_initialized = false;

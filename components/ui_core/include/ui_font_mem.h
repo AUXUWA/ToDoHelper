@@ -55,11 +55,16 @@ void ui_font_mem_set_cache_cnt(uint32_t cnt);
 uint32_t ui_font_mem_cache_cnt(void);
 
 /**
- * @brief 登记一个 FreeType 字体，好让 @ref ui_font_mem_stats 能报缓存情况
+ * @brief 登记一个字体，好让 @ref ui_font_mem_stats 能报缓存情况
  *
- * 只有 FreeType 字体才有缓存；内置字体（flash 里的字表）会被自动忽略。
+ * @param font        要登记的字体
+ * @param is_freetype 这个字体是不是 FreeType 字体
+ *
+ * **只有 FreeType 字体才有缓存**。判断这件事交给调用方（它知道自己是
+ * 从哪条路拿到的字体）—— 靠读 `font->dsc` 的头几个字节去猜类型是
+ * 跨类型读内置字体的数据结构，不该这么干。
  */
-void ui_font_mem_track(const lv_font_t *font);
+void ui_font_mem_track(const lv_font_t *font, bool is_freetype);
 
 /**
  * @brief 忘掉所有登记过的字体

@@ -175,9 +175,17 @@ static void wrap_font(const lv_font_t *font)
     if (f->dsc == NULL) {
         return;
     }
+    /* Already wrapped? Then the "original" callback would be the wrapper
+     * itself and the font would recurse into the stack. */
+    if (f->get_glyph_dsc == wrapped_get_glyph_dsc) {
+        return;
+    }
+    /* The caller already told us this is a FreeType font, so reading its
+     * descriptor is not a cross-type read - and the magic number is a cheap
+     * sanity check that the two sides agree. */
     const lv_freetype_font_dsc_t *dsc = (const lv_freetype_font_dsc_t *)f->dsc;
     if (dsc->magic_num != LV_FREETYPE_FONT_DSC_MAGIC_NUM) {
-        return; /* not a FreeType font */
+        return; /* not a FreeType font after all */
     }
 
     for (int i = 0; i < UI_FONT_MEM_MAX_FONTS; i++) {
@@ -251,10 +259,10 @@ uint32_t ui_font_mem_cache_cnt(void)
     return ctx ? ctx->max_glyph_cnt : 0;
 }
 
-void ui_font_mem_track(const lv_font_t *font)
+void ui_font_mem_track(const lv_font_t *font, bool is_freetype)
 {
-    if (font == NULL) {
-        return;
+    if (font == NULL || !is_freetype) {
+        return; /* only FreeType fonts have a glyph cache */
     }
 
     for (int i = 0; i < UI_FONT_MEM_MAX_FONTS; i++) {
@@ -275,10 +283,26 @@ void ui_font_mem_track(const lv_font_t *font)
 void ui_font_mem_forget_all(void)
 {
     /*
-     * The fonts are about to be freed (a reload drops the FreeType handles),
-     * so the tracked pointers would dangle. The wrappers live inside the font
-     * structs, so they go away with them.
+     * Put the original callbacks back before dropping the bookkeeping.
+     *
+     * The wrappers live inside the font structs, so forgetting the fonts
+     * without restoring the originals would leave a font whose "original"
+     * callback is the wrapper - and wrapping it again would make it call
+     * itself. Restore first, then forget.
+     *
+     * The fonts must still be alive when this runs.
      */
+    for (int i = 0; i < UI_FONT_MEM_MAX_FONTS; i++) {
+        if (s_wrapped[i].font == NULL) {
+            continue;
+        }
+        lv_font_t *f = (lv_font_t *)s_wrapped[i].font;
+        if (f->get_glyph_dsc == wrapped_get_glyph_dsc) {
+            f->get_glyph_dsc = s_wrapped[i].orig_get_glyph_dsc;
+            f->get_glyph_bitmap = s_wrapped[i].orig_get_glyph_bitmap;
+        }
+    }
+
     memset(s_tracked, 0, sizeof(s_tracked));
     memset(s_wrapped, 0, sizeof(s_wrapped));
 }
@@ -297,8 +321,8 @@ uint32_t ui_font_mem_stats(ui_font_cache_stat_t *out, uint32_t max)
             continue;
         }
 
-        /* Only FreeType fonts have a cache node; the built-in fonts are flash
-         * tables and have nothing to report. */
+        /* Only FreeType fonts get tracked (see ui_font_mem_track), so this
+         * descriptor really is a lv_freetype_font_dsc_t - no guessing. */
         const lv_freetype_font_dsc_t *dsc = (const lv_freetype_font_dsc_t *)font->dsc;
         if (dsc->magic_num != LV_FREETYPE_FONT_DSC_MAGIC_NUM) {
             continue;

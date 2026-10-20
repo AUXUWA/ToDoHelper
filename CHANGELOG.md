@@ -12,6 +12,30 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.8.7] — 2026-10-21
+
+**独立复核（第三轮）查出的两处。** 纯修 bug（按 `AGENT.md §8.1` 的判据是 **PATCH**）。
+
+### Fixed
+
+- **「是不是 FreeType 字体」不该靠读 `font->dsc` 的头几个字节去猜。**
+  `ui_font_mem_stats()` 原来把 `font->dsc` 强转成 `lv_freetype_font_dsc_t`
+  再看 magic 号来区分字体类型 —— 内置字体时读到的是
+  `lv_font_fmt_txt_dsc_t` 的头几个字节，**跨类型读**。
+  现在由调用方（`ui_fonts.c`，它知道自己是走的哪条路）直接告诉
+  `ui_font_mem_track(font, is_freetype)`，不用猜。
+- **同一个字体被包装两次会无限递归。**
+  `wrap_font()` 原来只靠 `s_tracked` 的查重挡着（隐式约定）。一旦查重失效，
+  `orig_get_glyph_dsc` 就等于包装函数自己 → 递归到栈溢出。
+  现在 `wrap_font()` 自己检查（已经是包装过的就直接返回），
+  并且 `ui_font_mem_forget_all()` **先把原始回调装回去**再清 bookkeeping ——
+  免得留下一个「原始回调就是包装函数」的字体。
+  （`ui_fonts_reload()` 里的调用顺序也跟着改了：先 forget、后释放句柄，
+  因为装回原始回调时字体还必须活着。）
+
+真机复验：整屏重画稳态 24.2 ms；页面巡游两遍后内部堆空闲 150 KB、
+最大连续块 86 KB、最低水位 109 KB。
+
 ## [1.8.6] — 2026-10-21
 
 **独立复核（第二轮）查出的两处，外加一处更正。**
