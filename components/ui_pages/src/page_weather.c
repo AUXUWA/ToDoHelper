@@ -32,6 +32,18 @@ static lv_obj_t *s_cond_label;
 static lv_obj_t *s_detail_label;
 static lv_obj_t *s_icon;
 static lv_obj_t *s_icon_fallback;
+
+/**
+ * 天气页的「外壳」与「内容」。
+ *
+ * 外壳（抬头、卡片容器、按钮条）只建一次；内容（卡片里的读数：城市/温度/
+ * 天气/图标/更新时间）**页面隐藏时销毁、回来时重建**（ROADMAP v1.8.3 §1）。
+ *
+ * 重建用的是 weather_get() —— 内存里的缓存读数，不发网络请求。
+ */
+static lv_obj_t *s_weather_body;   /**< 卡片里的内容容器（外壳，不销毁） */
+static lv_obj_t *s_weather_top;    /**< 卡片里的上半部分（城市+温度 | 图标） */
+
 /** Defined below; the "重新定位" button refreshes the card once IP location lands. */
 static void refresh(void);
 
@@ -166,16 +178,26 @@ static void refresh_clicked_cb(lv_event_t *e)
 /* Page                                                                      */
 /* ------------------------------------------------------------------------ */
 
-static esp_err_t weather_create(lv_obj_t *parent)
-{
-    (void)page_header_create(parent, "天气");
+/** 销毁内容（定义在下面：建到一半失败时要先把它清干净）。 */
+static void weather_content_clear(void);
 
-    lv_obj_t *body = NULL;
-    if (ui_card_create(parent, NULL, &body) == NULL) {
-        return ESP_ERR_NO_MEM;
+/**
+ * 建天气页的「内容」：卡片里的读数。
+ *
+ * 顺序跟改动前完全一样（上半部分 → 更新时间），所以重建出来的观感一个字节
+ * 都不差；样式、文案、字号也都照抄。
+ */
+static void weather_content_build(void)
+{
+    if (s_weather_body == NULL || s_weather_top != NULL) {
+        return;
     }
 
-    lv_obj_t *top = lv_obj_create(body);
+    lv_obj_t *top = lv_obj_create(s_weather_body);
+    if (top == NULL) {
+        return;
+    }
+    s_weather_top = top;
     lv_obj_remove_style_all(top);
     lv_obj_set_width(top, LV_PCT(100));
     lv_obj_set_height(top, LV_SIZE_CONTENT);
@@ -186,6 +208,10 @@ static esp_err_t weather_create(lv_obj_t *parent)
     lv_obj_remove_flag(top, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *left = lv_obj_create(top);
+    if (left == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_remove_style_all(left);
     lv_obj_set_size(left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(left, LV_FLEX_FLOW_COLUMN);
@@ -193,21 +219,37 @@ static esp_err_t weather_create(lv_obj_t *parent)
     lv_obj_remove_flag(left, LV_OBJ_FLAG_SCROLLABLE);
 
     s_city_label = lv_label_create(left);
+    if (s_city_label == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_set_style_text_font(s_city_label, ui_font(UI_FONT_TITLE), 0);
     lv_obj_set_style_text_color(s_city_label, UI_COLOR_TEXT, 0);
     lv_label_set_text(s_city_label, "正在定位…");
 
     s_temp_label = lv_label_create(left);
+    if (s_temp_label == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_set_style_text_font(s_temp_label, ui_font(UI_FONT_HUGE), 0);
     lv_obj_set_style_text_color(s_temp_label, UI_COLOR_TEXT, 0);
     lv_label_set_text(s_temp_label, "--°");
 
     s_cond_label = lv_label_create(left);
+    if (s_cond_label == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_set_style_text_font(s_cond_label, ui_font(UI_FONT_BODY), 0);
     lv_obj_set_style_text_color(s_cond_label, UI_COLOR_PRIMARY, 0);
     lv_label_set_text(s_cond_label, "");
 
     lv_obj_t *right = lv_obj_create(top);
+    if (right == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_remove_style_all(right);
     lv_obj_set_size(right, 110, 110);
     lv_obj_center(right);
@@ -218,6 +260,10 @@ static esp_err_t weather_create(lv_obj_t *parent)
         lv_obj_align(s_icon, LV_ALIGN_CENTER, 0, 0);
     }
     s_icon_fallback = lv_label_create(right);
+    if (s_icon_fallback == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_set_style_text_font(s_icon_fallback, ui_font(UI_FONT_TITLE), 0);
     lv_obj_set_style_text_color(s_icon_fallback, UI_COLOR_TEXT_MUTED, 0);
     lv_obj_align(s_icon_fallback, LV_ALIGN_CENTER, 0, 0);
@@ -228,12 +274,50 @@ static esp_err_t weather_create(lv_obj_t *parent)
     lv_label_set_text(s_icon_fallback, "");
     lv_obj_add_flag(s_icon_fallback, LV_OBJ_FLAG_HIDDEN);
 
-    s_detail_label = lv_label_create(body);
+    s_detail_label = lv_label_create(s_weather_body);
+    if (s_detail_label == NULL) {
+        weather_content_clear();
+        return;
+    }
     lv_obj_set_width(s_detail_label, LV_PCT(100));
     lv_label_set_long_mode(s_detail_label, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_detail_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_detail_label, UI_COLOR_TEXT_MUTED, 0);
     lv_label_set_text(s_detail_label, "");
+}
+
+/**
+ * 销毁天气页的「内容」（页面隐藏时）。
+ *
+ * 只删自己建的东西：上半部分（城市/温度/天气/图标都在它里面）和更新时间那
+ * 一行。卡片容器（外壳）留着 —— 外壳重建只会让页面闪一下。
+ */
+static void weather_content_clear(void)
+{
+    if (s_weather_top != NULL) {
+        lv_obj_delete(s_weather_top);
+        s_weather_top = NULL;
+    }
+    if (s_detail_label != NULL) {
+        lv_obj_delete(s_detail_label);
+        s_detail_label = NULL;
+    }
+    /* 这几个是上半部分的后代，已经跟着一起被删掉了。 */
+    s_city_label = NULL;
+    s_temp_label = NULL;
+    s_cond_label = NULL;
+    s_icon = NULL;
+    s_icon_fallback = NULL;
+}
+
+static esp_err_t weather_create(lv_obj_t *parent)
+{
+    (void)page_header_create(parent, "天气");
+
+    /* 外壳：卡片（内容容器）只建一次。 */
+    if (ui_card_create(parent, NULL, &s_weather_body) == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
     lv_obj_t *bar = lv_obj_create(parent);
     lv_obj_remove_style_all(bar);
@@ -264,6 +348,9 @@ static esp_err_t weather_create(lv_obj_t *parent)
         lv_obj_add_event_cb(btn, buttons[i].cb, LV_EVENT_CLICKED, NULL);
     }
 
+    /* 内容：卡片里的读数。隐藏时销毁，回来时按缓存重建。 */
+    weather_content_build();
+
     refresh();
 
     (void)ui_event_bind(WEATHER_EVENT, WEATHER_EVENT_UPDATED, UI_PAGE_WEATHER, 0);
@@ -275,7 +362,21 @@ static esp_err_t weather_create(lv_obj_t *parent)
 
 static esp_err_t weather_on_show(void)
 {
+    /* 内容在 on_hide 里被销毁了：按 weather_get() 的缓存读数重建
+     * （纯内存，不发网络请求）。 */
+    weather_content_build();
     refresh();
+    return ESP_OK;
+}
+
+/**
+ * 页面被切走：把「内容」销毁掉，把内部堆还回去（ROADMAP v1.8.3 §1）。
+ *
+ * 外壳（抬头、卡片、按钮条）留着 —— 它们很少，重建只会让页面闪一下。
+ */
+static esp_err_t weather_on_hide(void)
+{
+    weather_content_clear();
     return ESP_OK;
 }
 
@@ -306,5 +407,6 @@ const ui_page_t page_weather = {
     .name = "weather",
     .create = weather_create,
     .on_show = weather_on_show,
+    .on_hide = weather_on_hide,
     .on_event = weather_on_event,
 };

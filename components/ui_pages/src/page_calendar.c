@@ -55,6 +55,20 @@ static lv_obj_t *s_detail_title;
 static lv_obj_t *s_detail_list;
 static lv_obj_t *s_detail_hint;     /**< shown when no day is selected */
 
+/** The page container: the parent of every object of this page. */
+static lv_obj_t *s_parent;
+/** Slot of the content block (grid + detail panel) among the page's children. */
+static int32_t s_content_index;
+/**
+ * Week rows the grid was last laid out with.
+ *
+ * The row count decides how tall a day cell is, so a rebuild has to use the
+ * very same number - otherwise the grid would change its height behind the
+ * user's back. It is derived from the month on screen (s_year / s_month) and
+ * kept here so the rebuild does not have to recompute it.
+ */
+static int s_week_rows;
+
 /**
  * Day cells.
  *
@@ -359,6 +373,9 @@ static void render_grid(void)
      * 轨道按它重算，空出来的那一行就不再白吃高度（见 cal_grid_rows 的注释）。
      */
     const int week_rows = (int)((first_wday + (int)count + CAL_COLS - 1) / CAL_COLS);
+    /* Remember it: a rebuild of the grid has to use the same row count, or the
+     * day cells would come back at a different height. */
+    s_week_rows = week_rows;
     {
         static const int32_t cols[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
                                         LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
@@ -729,8 +746,249 @@ static lv_obj_t *header_button_create(lv_obj_t *parent, const char *text,
     return btn;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Content block (month grid + selected-day panel)                          */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * The grid and the panel under it are the *content* of this page: they are
+ * destroyed when the page is hidden and rebuilt when it comes back
+ * (ROADMAP v1.8.3 §1). The chrome around them - the header with the clock and
+ * the two action buttons, and the month row with 上月 / 下月 - is built once and
+ * stays.
+ *
+ * The grid is the reason this page is worth splitting: it holds 31 day cells
+ * (a button, a label and a due dot each) plus the weekday header, which makes
+ * it the biggest batch of objects on the page. ui_core only *hides* the page
+ * container, so without this the cells would stay in the heap forever and
+ * shred the internal heap into unusable fragments.
+ *
+ * The rebuild uses the state that was kept in RAM:
+ *   - the month on screen (s_year / s_month) and the selected day
+ *     (s_selected_day), so the user comes back to the same day of the same
+ *     month;
+ *   - the week row count (s_week_rows), so the grid comes back with exactly
+ *     the same height;
+ *   - the todo list, which todo_list() serves from the manager's RAM cache.
+ * Nothing is read from the SD card and no request is made on the way back in.
+ */
+
+/**
+ * Destroy the content block.
+ *
+ * Only the objects this file created are touched; the header and the month
+ * row stay exactly where they are.
+ */
+static void content_destroy(void)
+{
+    if (s_grid != NULL) {
+        /* The weekday header and the day cells are children of the grid. */
+        lv_obj_delete(s_grid);
+        s_grid = NULL;
+    }
+    /* The cell handles are gone with the grid. */
+    memset(s_cells, 0, sizeof(s_cells));
+
+    if (s_detail != NULL) {
+        /* The title, the line list and the hint are children of the panel. */
+        lv_obj_delete(s_detail);
+        s_detail = NULL;
+    }
+    s_detail_title = NULL;
+    s_detail_list = NULL;
+    s_detail_hint = NULL;
+}
+
+/**
+ * Build the content block and put it back in its original place.
+ *
+ * The page container is a flex column, so the order of its children *is* the
+ * vertical order of the page: the grid sits above the detail panel.
+ *
+ * @return false when the objects could not be created (out of memory).
+ */
+static bool content_create(lv_obj_t *parent)
+{
+    if (parent == NULL) {
+        return false;
+    }
+    if (s_grid != NULL) {
+        /* Already built (first visit): nothing to do. */
+        return true;
+    }
+
+    /* Weekday header + day cells share one grid, so the columns always line up. */
+    s_grid = lv_obj_create(parent);
+    if (s_grid == NULL) {
+        return false;
+    }
+    lv_obj_remove_style_all(s_grid);
+    lv_obj_set_width(s_grid, LV_PCT(100));
+    lv_obj_set_flex_grow(s_grid, 1);
+    lv_obj_set_style_bg_color(s_grid, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(s_grid, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_grid, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_grid, 6, 0);
+    lv_obj_set_style_pad_row(s_grid, 2, 0);
+    lv_obj_set_style_pad_column(s_grid, 4, 0);
+    lv_obj_remove_flag(s_grid, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* The same week row count as the last layout, so the day cells come back
+     * at the same height (see s_week_rows). */
+    static const int32_t cols[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
+                                    LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
+                                    LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
+    lv_obj_set_grid_dsc_array(s_grid, cols, cal_grid_rows(s_week_rows));
+
+    for (int i = 0; i < CAL_COLS; i++) {
+        lv_obj_t *head = lv_label_create(s_grid);
+        if (head == NULL) {
+            content_destroy();
+            return false;
+        }
+        lv_label_set_text(head, s_week_names[i]);
+        lv_obj_set_style_text_font(head, ui_font(UI_FONT_SMALL), 0);
+        /* Weekend columns read as weekend before any date is picked. */
+        const bool weekend = (i == 0 || i == 6);
+        lv_obj_set_style_text_color(head, weekend ? UI_COLOR_WARNING : UI_COLOR_TEXT_MUTED, 0);
+        lv_obj_set_grid_cell(head, LV_GRID_ALIGN_CENTER, i, 1, LV_GRID_ALIGN_CENTER, 0, 1);
+    }
+
+    for (int i = 0; i < CAL_MAX_DAYS; i++) {
+        cal_cell_t *cell = &s_cells[i];
+
+        /*
+         * A real button stretched across its whole grid cell.
+         *
+         * The cell used to be a bare label sized to its text, so a 16 px digit was
+         * the entire touch target - the device reported it as hard to hit. The
+         * grid uses ALIGN_STRETCH and the button fills the cell, giving roughly
+         * 60x40 px per day; LV_GRID_ALIGN_CENTER would shrink it back to content.
+         */
+        lv_obj_t *btn = lv_button_create(s_grid);
+        if (btn == NULL) {
+            /* Out of memory: stop here instead of walking on with a half-built
+             * cell. The empty cells stay hidden (render_grid() skips them). */
+            content_destroy();
+            return false;
+        }
+        cell->btn = btn;
+        lv_obj_remove_style_all(btn);
+        lv_obj_set_style_radius(btn, 6, 0);
+        lv_obj_set_style_pad_all(btn, 2, 0);
+        lv_obj_set_style_bg_color(btn, UI_COLOR_PRIMARY, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_outline_color(btn, UI_COLOR_PRIMARY, 0);
+        lv_obj_set_style_outline_width(btn, 0, 0);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(btn, day_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(i + 1));
+
+        lv_obj_t *label = lv_label_create(btn);
+        if (label == NULL) {
+            content_destroy();
+            return false;
+        }
+        cell->label = label;
+        /* UI_FONT_SMALL, not UI_FONT_BODY: the six week rows share the grid
+         * height, and in the tightest layout (a day with three todos selected)
+         * a row is only ~20 px high - the ~25 px line box of the 20 px font would
+         * make the digits touch the due dot. 16 px fits. */
+        lv_obj_set_style_text_font(label, ui_font(UI_FONT_SMALL), 0);
+        lv_obj_set_style_text_color(label, UI_COLOR_TEXT, 0);
+        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 0);
+
+        /* Due marker: a small dot in the lower part of the cell. */
+        lv_obj_t *dot = lv_obj_create(btn);
+        if (dot == NULL) {
+            content_destroy();
+            return false;
+        }
+        cell->dot = dot;
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 6, 6);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, 0);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, 0);
+    }
+
+    /*
+     * Bottom of the page: the panel with the selected day's todos.
+     *
+     * It is always on screen (no more swapping with an action bar) and it is
+     * sized by its content, with an upper bound, so it can never squeeze the
+     * grid below the height the date numbers need - see the budget note at the
+     * top of this file.
+     */
+    s_detail = lv_obj_create(parent);
+    if (s_detail == NULL) {
+        content_destroy();
+        return false;
+    }
+    lv_obj_remove_style_all(s_detail);
+    lv_obj_set_width(s_detail, LV_PCT(100));
+    lv_obj_set_height(s_detail, LV_SIZE_CONTENT);
+    /* Upper bound: a day with a lot of todos must not eat the grid. */
+    lv_obj_set_style_max_height(s_detail, CAL_DETAIL_MAX_HEIGHT, 0);
+    lv_obj_set_flex_flow(s_detail, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_bg_color(s_detail, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_opa(s_detail, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_detail, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_pad_hor(s_detail, 10, 0);
+    lv_obj_set_style_pad_ver(s_detail, 3, 0);
+    lv_obj_set_style_pad_row(s_detail, 2, 0);
+    lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_detail_title = lv_label_create(s_detail);
+    if (s_detail_title == NULL) {
+        content_destroy();
+        return false;
+    }
+    lv_obj_set_width(s_detail_title, LV_PCT(100));
+    lv_label_set_long_mode(s_detail_title, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(s_detail_title, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_detail_title, UI_COLOR_PRIMARY, 0);
+    lv_label_set_text(s_detail_title, "");
+    lv_obj_add_flag(s_detail_title, LV_OBJ_FLAG_HIDDEN);
+
+    /* The todo lines, one per row. */
+    s_detail_list = lv_obj_create(s_detail);
+    if (s_detail_list == NULL) {
+        content_destroy();
+        return false;
+    }
+    lv_obj_remove_style_all(s_detail_list);
+    lv_obj_set_width(s_detail_list, LV_PCT(100));
+    lv_obj_set_height(s_detail_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_detail_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_detail_list, 1, 0);
+    lv_obj_remove_flag(s_detail_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_detail_list, LV_OBJ_FLAG_HIDDEN);
+
+    /* Shown while no day is selected. */
+    s_detail_hint = lv_label_create(s_detail);
+    if (s_detail_hint == NULL) {
+        content_destroy();
+        return false;
+    }
+    lv_obj_set_width(s_detail_hint, LV_PCT(100));
+    lv_label_set_long_mode(s_detail_hint, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(s_detail_hint, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_detail_hint, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_detail_hint, "点日期看当天待办");
+
+    /* Back into the original slots: the grid, then the panel under it. */
+    lv_obj_move_to_index(s_grid, s_content_index);
+    lv_obj_move_to_index(s_detail, s_content_index + 1);
+    return true;
+}
+
 static esp_err_t calendar_create(lv_obj_t *parent)
 {
+    s_parent = parent;
+
     /*
      * Header: ONE row with three segments.
      *
@@ -872,142 +1130,15 @@ static esp_err_t calendar_create(lv_obj_t *parent)
     }
 
     /* Weekday header + day cells share one grid, so the columns always line up. */
-    s_grid = lv_obj_create(parent);
-    if (s_grid == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    lv_obj_remove_style_all(s_grid);
-    lv_obj_set_width(s_grid, LV_PCT(100));
-    lv_obj_set_flex_grow(s_grid, 1);
-    lv_obj_set_style_bg_color(s_grid, UI_COLOR_SURFACE, 0);
-    lv_obj_set_style_bg_opa(s_grid, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_grid, UI_CARD_RADIUS, 0);
-    lv_obj_set_style_pad_all(s_grid, 6, 0);
-    lv_obj_set_style_pad_row(s_grid, 2, 0);
-    lv_obj_set_style_pad_column(s_grid, 4, 0);
-    lv_obj_remove_flag(s_grid, LV_OBJ_FLAG_SCROLLABLE);
-
-    static const int32_t cols[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
-                                    LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
-                                    LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
-    lv_obj_set_grid_dsc_array(s_grid, cols, cal_grid_rows(0));
-
-    for (int i = 0; i < CAL_COLS; i++) {
-        lv_obj_t *head = lv_label_create(s_grid);
-        lv_label_set_text(head, s_week_names[i]);
-        lv_obj_set_style_text_font(head, ui_font(UI_FONT_SMALL), 0);
-        /* Weekend columns read as weekend before any date is picked. */
-        const bool weekend = (i == 0 || i == 6);
-        lv_obj_set_style_text_color(head, weekend ? UI_COLOR_WARNING : UI_COLOR_TEXT_MUTED, 0);
-        lv_obj_set_grid_cell(head, LV_GRID_ALIGN_CENTER, i, 1, LV_GRID_ALIGN_CENTER, 0, 1);
-    }
-
-    for (int i = 0; i < CAL_MAX_DAYS; i++) {
-        cal_cell_t *cell = &s_cells[i];
-
-        /*
-         * A real button stretched across its whole grid cell.
-         *
-         * The cell used to be a bare label sized to its text, so a 16 px digit was
-         * the entire touch target - the device reported it as hard to hit. The
-         * grid uses ALIGN_STRETCH and the button fills the cell, giving roughly
-         * 60x40 px per day; LV_GRID_ALIGN_CENTER would shrink it back to content.
-         */
-        lv_obj_t *btn = lv_button_create(s_grid);
-        cell->btn = btn;
-        lv_obj_remove_style_all(btn);
-        lv_obj_set_style_radius(btn, 6, 0);
-        lv_obj_set_style_pad_all(btn, 2, 0);
-        lv_obj_set_style_bg_color(btn, UI_COLOR_PRIMARY, 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_outline_color(btn, UI_COLOR_PRIMARY, 0);
-        lv_obj_set_style_outline_width(btn, 0, 0);
-        lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_event_cb(btn, day_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(i + 1));
-
-        lv_obj_t *label = lv_label_create(btn);
-        cell->label = label;
-        /* UI_FONT_SMALL, not UI_FONT_BODY: the six week rows share the grid
-         * height, and in the tightest layout (a day with three todos selected)
-         * a row is only ~20 px high - the ~25 px line box of the 20 px font would
-         * make the digits touch the due dot. 16 px fits. */
-        lv_obj_set_style_text_font(label, ui_font(UI_FONT_SMALL), 0);
-        lv_obj_set_style_text_color(label, UI_COLOR_TEXT, 0);
-        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 0);
-
-        /* Due marker: a small dot in the lower part of the cell. */
-        lv_obj_t *dot = lv_obj_create(btn);
-        cell->dot = dot;
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 6, 6);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, 0);
-        lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(dot, LV_ALIGN_BOTTOM_MID, 0, 0);
-    }
-
     /*
-     * Bottom of the page: the panel with the selected day's todos.
-     *
-     * It is always on screen (no more swapping with an action bar) and it is
-     * sized by its content, with an upper bound, so it can never squeeze the
-     * grid below the height the date numbers need - see the budget note at the
-     * top of this file.
+     * The content block starts here (grid + selected-day panel). The slot is
+     * remembered so a rebuild can put the objects back in the same place -
+     * see content_create().
      */
-    s_detail = lv_obj_create(parent);
-    if (s_detail == NULL) {
+    s_content_index = (int32_t)lv_obj_get_child_count(parent);
+    if (!content_create(parent)) {
         return ESP_ERR_NO_MEM;
     }
-    lv_obj_remove_style_all(s_detail);
-    lv_obj_set_width(s_detail, LV_PCT(100));
-    lv_obj_set_height(s_detail, LV_SIZE_CONTENT);
-    /* Upper bound: a day with a lot of todos must not eat the grid. */
-    lv_obj_set_style_max_height(s_detail, CAL_DETAIL_MAX_HEIGHT, 0);
-    lv_obj_set_flex_flow(s_detail, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_bg_color(s_detail, UI_COLOR_SURFACE, 0);
-    lv_obj_set_style_bg_opa(s_detail, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_detail, UI_CARD_RADIUS, 0);
-    lv_obj_set_style_pad_hor(s_detail, 10, 0);
-    lv_obj_set_style_pad_ver(s_detail, 3, 0);
-    lv_obj_set_style_pad_row(s_detail, 2, 0);
-    lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
-
-    s_detail_title = lv_label_create(s_detail);
-    if (s_detail_title == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    lv_obj_set_width(s_detail_title, LV_PCT(100));
-    lv_label_set_long_mode(s_detail_title, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_style_text_font(s_detail_title, ui_font(UI_FONT_SMALL), 0);
-    lv_obj_set_style_text_color(s_detail_title, UI_COLOR_PRIMARY, 0);
-    lv_label_set_text(s_detail_title, "");
-    lv_obj_add_flag(s_detail_title, LV_OBJ_FLAG_HIDDEN);
-
-    /* The todo lines, one per row. */
-    s_detail_list = lv_obj_create(s_detail);
-    if (s_detail_list == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    lv_obj_remove_style_all(s_detail_list);
-    lv_obj_set_width(s_detail_list, LV_PCT(100));
-    lv_obj_set_height(s_detail_list, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(s_detail_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(s_detail_list, 1, 0);
-    lv_obj_remove_flag(s_detail_list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_detail_list, LV_OBJ_FLAG_HIDDEN);
-
-    /* Shown while no day is selected. */
-    s_detail_hint = lv_label_create(s_detail);
-    if (s_detail_hint == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    lv_obj_set_width(s_detail_hint, LV_PCT(100));
-    lv_label_set_long_mode(s_detail_hint, LV_LABEL_LONG_MODE_DOTS);
-    lv_obj_set_style_text_font(s_detail_hint, ui_font(UI_FONT_SMALL), 0);
-    lv_obj_set_style_text_color(s_detail_hint, UI_COLOR_TEXT_MUTED, 0);
-    lv_label_set_text(s_detail_hint, "点日期看当天待办");
 
     (void)ui_event_bind(CALENDAR_EVENT, CALENDAR_EVENT_TIME_SYNCED, UI_PAGE_CALENDAR, 0);
     (void)ui_event_bind(CALENDAR_EVENT, CALENDAR_EVENT_TIMEZONE_CHANGED, UI_PAGE_CALENDAR, 0);
@@ -1035,6 +1166,17 @@ static esp_err_t calendar_create(lv_obj_t *parent)
 
 static esp_err_t calendar_on_show(void)
 {
+    /*
+     * The grid and the detail panel were destroyed when the page was hidden
+     * (ROADMAP v1.8.3 §1), so build them again from the state that was kept:
+     * the month on screen, the selected day and the week row count. Nothing
+     * is read from the SD card and no request is made here.
+     */
+    if (!content_create(s_parent)) {
+        SYS_LOGE(TAG, "cannot rebuild the calendar grid");
+        return ESP_ERR_NO_MEM;
+    }
+
     refresh_clock();
     /* Todo marks may have changed while another page was on screen; the bindings
      * only cover changes that happen *while* this page is visible, and they are
@@ -1042,6 +1184,20 @@ static esp_err_t calendar_on_show(void)
      * keeps the grid honest either way. */
     render_grid();
     render_detail();
+    return ESP_OK;
+}
+
+/**
+ * Leaving the page: the grid and the detail panel go away with it.
+ *
+ * They are the biggest batch of objects in the app (31 day cells, each with a
+ * button, a label and a due dot) and ui_core only *hides* the page container,
+ * so keeping them would take the internal heap down for good. on_show() builds
+ * them again from the state kept in RAM.
+ */
+static esp_err_t calendar_on_hide(void)
+{
+    content_destroy();
     return ESP_OK;
 }
 
@@ -1075,6 +1231,7 @@ const ui_page_t page_calendar = {
     .name = "calendar",
     .create = calendar_create,
     .on_show = calendar_on_show,
+    .on_hide = calendar_on_hide,
     .on_tick = calendar_on_tick,
     .on_event = calendar_on_event,
     .tick_period_ms = 1000,

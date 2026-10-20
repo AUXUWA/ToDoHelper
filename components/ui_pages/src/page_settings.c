@@ -38,6 +38,23 @@
  *   - **Write only what changed.**  Every label update compares against the
  *     value that is on screen before touching the widget
  *     (AGENT.md 9.0.1.1, rule 2).
+ *
+ * ## Shell and content (ROADMAP v1.8.3 §1)
+ *
+ * This is the heaviest page in the project: six cards, 182 widgets, about
+ * 42 KB of internal RAM.  So it is split in two:
+ *
+ *   - the **shell** (the header with the back button) is built once and stays;
+ *   - the **content** (the six cards) is destroyed when the page is hidden and
+ *     rebuilt when it comes back.
+ *
+ * ui_core only hides the other pages (lv_obj_add_flag(HIDDEN)) - it never
+ * destroys them - so without this split "visiting this page once" would cost
+ * 42 KB of internal heap for good.  The rebuild reads nothing but RAM: the
+ * slider values come from s_pending, everything else from the owning
+ * components' in-RAM caches.  The event subscription stays in create() (it
+ * runs exactly once) - subscribing again on every rebuild would handle every
+ * calendar event twice.
  */
 
 #include <stdio.h>
@@ -1213,54 +1230,166 @@ static void refresh_info(void)
 /* Page                                                                      */
 /* ------------------------------------------------------------------------ */
 
-static esp_err_t settings_create(lv_obj_t *parent)
+/**
+ * 这一页是全工程最重的一页：六张卡片、182 个控件、约 42 KB 内部 RAM。
+ *
+ * 所以它分成两半（ROADMAP v1.8.3 §1）：
+ *
+ *   - **外壳**：页面容器 + 抬头（返回按钮）。只建一次，留在原地；
+ *   - **内容**：六张卡片。页面被切走时销毁，回来时重建。
+ *
+ * 重建只用内存里的东西：滑块的有效值在 s_pending 里，AI / 单词 / 时区 /
+ * 设备信息都由各自的模块在 RAM 里缓存 —— 重建既不写 NVS 也不读 SD 卡。
+ *
+ * 可见内容一个字节都没变：卡片的顺序、标题、每一行的键值、字体、颜色、
+ * 间距都跟改动前一模一样，这一轮只改「什么时候建、什么时候拆」。
+ */
+#define SETTINGS_CARD_COUNT 6
+
+/** 六张卡片，顺序跟界面上从上到下一样。 */
+static lv_obj_t *s_cards[SETTINGS_CARD_COUNT];
+
+/** 页面容器（ui_core 建的）：重建内容、恢复滚动位置都要用它。 */
+static lv_obj_t *s_page_parent;
+
+/** 内容是否已经建好：on_show 只在「被销毁过」之后才重建。 */
+static bool s_content_built;
+
+/** 离开本页时记住的滚动位置。 */
+static int32_t s_scroll_y;
+
+/**
+ * 清掉内容控件的指针，以及「屏上是什么」的缓存。
+ *
+ * 控件被销毁之后，缓存里的字符串已经不对应屏幕上的任何一个标签了 ——
+ * 如果留着，下一次重建时 label_set_cached() 会认为「文字没变」而跳过写入，
+ * 新建的标签就一直是空的。所以销毁时必须一起清掉。
+ */
+static void settings_state_reset(void)
 {
-    (void)page_header_create(parent, "设置");
+    s_ai_key_label = NULL;
+    s_ai_hint_label = NULL;
+    s_ai_model_btn[0] = NULL;
+    s_ai_model_btn[1] = NULL;
+    s_ai_model_label = NULL;
+    s_ai_rounds_label = NULL;
+    s_ai_prompt_label = NULL;
+
+    s_word_book_label = NULL;
+    s_word_cloud_btn = NULL;
+    s_word_stats_label = NULL;
+
+    s_tz_state_label = NULL;
+
+    for (int i = 0; i < INFO_ROW_COUNT; i++) {
+        s_info_value[i] = NULL;
+    }
+
+    s_auth_label = NULL;
+    s_url_label = NULL;
+
+    /* 滑块：控件没了，句柄也必须清掉，否则 settings_tick() 会去读野指针。 */
+    s_slider_count = 0;
+    for (size_t i = 0; i < SETTINGS_MAX_SLIDERS; i++) {
+        s_slider_objs[i] = NULL;
+        s_slider_values[i] = NULL;
+    }
+
+    /* 「屏上是什么」的缓存，见上面的说明。 */
+    memset(s_ai_key_text, 0, sizeof(s_ai_key_text));
+    memset(s_ai_model_text, 0, sizeof(s_ai_model_text));
+    memset(s_ai_model_name_text, 0, sizeof(s_ai_model_name_text));
+    memset(s_ai_rounds_text, 0, sizeof(s_ai_rounds_text));
+    memset(s_ai_prompt_text, 0, sizeof(s_ai_prompt_text));
+    memset(s_word_book_text, 0, sizeof(s_word_book_text));
+    memset(s_word_cloud_text, 0, sizeof(s_word_cloud_text));
+    memset(s_word_stats_text, 0, sizeof(s_word_stats_text));
+    memset(s_tz_state_text, 0, sizeof(s_tz_state_text));
+    memset(s_info_cache, 0, sizeof(s_info_cache));
+    memset(s_url_text, 0, sizeof(s_url_text));
+    memset(s_auth_text, 0, sizeof(s_auth_text));
+}
+
+/**
+ * 销毁六张卡片（内容）。
+ *
+ * 只删自己建的对象，外壳（抬头、返回按钮）留着 —— 它们很少，
+ * 销毁重建只会让页面闪一下。
+ *
+ * 这一步是这一页省内存的关键：ui_core 切页时只是把别的页面藏起来
+ * （lv_obj_add_flag(HIDDEN)），对象并不销毁，所以「逛过这一页」
+ * 会让内部堆永久少 42 KB（ROADMAP v1.8.3 §0/§1）。
+ */
+static void settings_content_destroy(void)
+{
+    for (int i = 0; i < SETTINGS_CARD_COUNT; i++) {
+        if (s_cards[i] != NULL) {
+            lv_obj_delete(s_cards[i]);
+            s_cards[i] = NULL;
+        }
+    }
+    settings_state_reset();
+    s_content_built = false;
+}
+
+/** 三个滑块的定义（初值在重建时从 s_pending 里取）。 */
+static setting_slider_t s_brightness = {
+    .title = "屏幕亮度",
+    .min = 5,
+    .max = 100,
+    .on_change = brightness_changed,
+};
+static setting_slider_t s_idle_bright = {
+    /* 100 = the idle face keeps its pure white eyes; lower to dim the panel
+     * while idle (also the default in ui_core.c). */
+    .title = "待机亮度",
+    .min = 0,
+    .max = 100,
+    .on_change = idle_brightness_changed,
+};
+static setting_slider_t s_idle_timeout = {
+    .title = "待机超时(秒)",
+    .min = 5,
+    .max = 300,
+    .on_change = idle_timeout_changed,
+};
+
+/**
+ * 建六张卡片（内容）。
+ *
+ * 顺序、标题、每一行的键值、字体、颜色、间距都跟改动前一字不差 ——
+ * 这一轮只改「什么时候建、什么时候拆」。
+ */
+static esp_err_t settings_content_build(lv_obj_t *parent)
+{
+    /* 上一次建到一半失败时留下的卡片先清掉，免得叠出两套。 */
+    settings_content_destroy();
 
     /* ---- Display ---- */
     lv_obj_t *display = NULL;
-    if (add_card(parent, "显示与待机", &display) == NULL) {
+    s_cards[0] = add_card(parent, "显示与待机", &display);
+    if (s_cards[0] == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
-    static setting_slider_t s_brightness = {
-        .title = "屏幕亮度",
-        .min = 5,
-        .max = 100,
-        .on_change = brightness_changed,
-    };
-    static setting_slider_t s_idle_bright = {
-        /* 100 = the idle face keeps its pure white eyes; lower to dim the panel
-         * while idle (also the default in ui_core.c). */
-        .title = "待机亮度",
-        .min = 0,
-        .max = 100,
-        .on_change = idle_brightness_changed,
-    };
-    static setting_slider_t s_idle_timeout = {
-        .title = "待机超时(秒)",
-        .min = 5,
-        .max = 300,
-        .on_change = idle_timeout_changed,
-    };
-
-    s_brightness.value = sys_config_get_i32_or(SYS_KEY_BRIGHTNESS, 100);
-    s_idle_bright.value = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 100);
-    s_idle_timeout.value = sys_config_get_i32_or(SYS_KEY_IDLE_TIMEOUT, 30);
-
-    /* 滑块的新值先记在这儿，等去抖定时器交给一次性任务落盘。 */
-    s_pending.brightness = s_brightness.value;
-    s_pending.idle_brightness = s_idle_bright.value;
-    s_pending.idle_timeout = s_idle_timeout.value;
-    s_pending.brightness_dirty = false;
-    s_pending.idle_brightness_dirty = false;
-    s_pending.idle_timeout_dirty = false;
+    /*
+     * 滑块的初值来自内存里的有效值：第一次进来时从 NVS 读一次
+     * （NVS 分区在 RAM 里，读它不碰 flash），之后用户拖动就改这个值
+     * （s_pending）。所以重建既不读盘也不写盘，而且屏上的数字跟
+     * 离开本页时一模一样。
+     */
+    s_brightness.value = s_pending.brightness;
+    s_idle_bright.value = s_pending.idle_brightness;
+    s_idle_timeout.value = s_pending.idle_timeout;
 
     setting_slider_t *defs[] = { &s_brightness, &s_idle_bright, &s_idle_timeout };
     s_slider_count = 0;
     for (size_t i = 0; i < sizeof(defs) / sizeof(defs[0]) && s_slider_count < SETTINGS_MAX_SLIDERS;
          i++) {
         lv_obj_t *row = add_slider(display, defs[i]);
+        if (row == NULL) {
+            break;   /* 内存不够：这一行没有，剩下两行照建 */
+        }
         /* add_slider stored the value label in the slider's user data. */
         lv_obj_t *slider = lv_obj_get_child(row, 1);
         s_slider_objs[s_slider_count] = slider;
@@ -1270,7 +1399,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- AI ---- */
     lv_obj_t *ai_body = NULL;
-    if (add_card(parent, "AI 对话", &ai_body) == NULL) {
+    s_cards[1] = add_card(parent, "AI 对话", &ai_body);
+    if (s_cards[1] == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1346,7 +1476,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- Time ---- */
     lv_obj_t *time_card = NULL;
-    if (add_card(parent, "时间与时区", &time_card) == NULL) {
+    s_cards[2] = add_card(parent, "时间与时区", &time_card);
+    if (s_cards[2] == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1370,7 +1501,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- Words ---- */
     lv_obj_t *word_card = NULL;
-    if (add_card(parent, "单词", &word_card) == NULL) {
+    s_cards[3] = add_card(parent, "单词", &word_card);
+    if (s_cards[3] == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1403,7 +1535,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- Security ---- */
     lv_obj_t *sec_card = NULL;
-    if (add_card(parent, "局域网与安全", &sec_card) == NULL) {
+    s_cards[4] = add_card(parent, "局域网与安全", &sec_card);
+    if (s_cards[4] == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1431,7 +1564,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- Info ---- */
     lv_obj_t *info_card = NULL;
-    if (add_card(parent, "设备信息", &info_card) == NULL) {
+    s_cards[5] = add_card(parent, "设备信息", &info_card);
+    if (s_cards[5] == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -1449,6 +1583,40 @@ static esp_err_t settings_create(lv_obj_t *parent)
     lv_obj_t *info_row = add_row(info_card);
     add_button(info_row, "重启设备", reboot_cb, NULL, UI_COLOR_DANGER);
 
+    s_content_built = true;
+    return ESP_OK;
+}
+
+/**
+ * 页面外壳：抬头 + 定时器 + 事件订阅。
+ *
+ * 只跑一次（ui_core 建页面容器时调一次），所以事件订阅放在这里是安全的 ——
+ * 重建内容时**绝不能**再订阅一次，否则同一个事件会被处理两遍
+ * （ROADMAP v1.8.3 §1 硬约束一）。
+ */
+static esp_err_t settings_create(lv_obj_t *parent)
+{
+    s_page_parent = parent;
+
+    (void)page_header_create(parent, "设置");
+
+    /*
+     * 滑块的初值只在这里读一次 NVS（NVS 分区在 RAM 里，读它不碰 flash）。
+     * 之后用户拖动就改 s_pending —— 重建时用的是它，所以重建路径上
+     * 一次 flash 访问都没有（ROADMAP v1.8.3 §1 硬约束二）。
+     */
+    s_pending.brightness = sys_config_get_i32_or(SYS_KEY_BRIGHTNESS, 100);
+    s_pending.idle_brightness = sys_config_get_i32_or(SYS_KEY_IDLE_BRIGHT, 100);
+    s_pending.idle_timeout = sys_config_get_i32_or(SYS_KEY_IDLE_TIMEOUT, 30);
+    s_pending.brightness_dirty = false;
+    s_pending.idle_brightness_dirty = false;
+    s_pending.idle_timeout_dirty = false;
+
+    const esp_err_t err = settings_content_build(parent);
+    if (err != ESP_OK) {
+        return err;
+    }
+
     refresh_info();
     /* Owned by the page so on_hide() can stop it (see settings_tick). */
     s_slider_timer = lv_timer_create(settings_tick, 250, NULL);
@@ -1463,7 +1631,8 @@ static esp_err_t settings_create(lv_obj_t *parent)
     }
 
     /* The NTP outcome is delivered on the LVGL task by ui_core, so the toast can
-     * be shown without the page ever blocking on the network. */
+     * be shown without the page ever blocking on the network.
+     * 订阅只在这里做一次（create() 只跑一次），重建内容时不再订阅。 */
     (void)ui_event_subscribe(CALENDAR_EVENT, CALENDAR_EVENT_SYNC_RESULT,
                              sizeof(esp_err_t), settings_on_sync_result);
 
@@ -1471,9 +1640,45 @@ static esp_err_t settings_create(lv_obj_t *parent)
     return ESP_OK;
 }
 
+/**
+ * 页面回来之后把滚动位置复原。
+ *
+ * 内容被销毁又重建之后，容器的内容高度变了：内容不够高时 LVGL 会把滚动
+ * 位置夹回 0（readjust_scroll），所以这里按记住的值复原。
+ *
+ * 判据是「跟记住的值一样吗」，**不是**「是不是 0」：夹断后的值不是 0，
+ * 只看「是不是 0」会直接返回 → 位置根本没复原（AGENT.md 9.0.1.6 第 12 条）。
+ */
+static void settings_scroll_restore(void)
+{
+    if (s_page_parent == NULL || s_scroll_y <= 0) {
+        return;
+    }
+    if (lv_obj_get_scroll_y(s_page_parent) == s_scroll_y) {
+        /* 位置正是我们要的：什么都不不要做。 */
+        return;
+    }
+    /* LV_ANIM_OFF：不带动画，直接落位。 */
+    lv_obj_scroll_to_y(s_page_parent, s_scroll_y, LV_ANIM_OFF);
+}
+
 static esp_err_t settings_on_show(void)
 {
+    /*
+     * 内容在 on_hide 里被销毁了，这里按内存里的缓存重建。
+     * 重建只碰 RAM：不写 NVS、不读盘（ROADMAP v1.8.3 §1）。
+     */
+    if (!s_content_built && s_page_parent != NULL) {
+        if (settings_content_build(s_page_parent) != ESP_OK) {
+            SYS_LOGE(TAG, "the settings content could not be rebuilt");
+        }
+    }
+
     refresh_info();
+
+    /* 回到离开本页时的滚动位置（跟改动前的观感一致）。 */
+    settings_scroll_restore();
+
     if (s_slider_timer != NULL) {
         lv_timer_resume(s_slider_timer);
     }
@@ -1493,6 +1698,31 @@ static esp_err_t settings_on_hide(void)
         slider_save_flush();
         lv_timer_pause(s_save_timer);
     }
+
+    /* 记住滚动位置：卡片马上要被销毁，容器的内容高度会塌回去。 */
+    if (s_page_parent != NULL) {
+        /*
+         * 惯性滚动（手指甩出去之后的那段动画）要停掉。
+         * 否则记住的是**动画中途**的值，而动画还在跑 —— 回来时复原到的位置
+         * 会跟动画打架（两边都以为自己说了算），位置就飘了。
+         */
+        lv_anim_delete(s_page_parent, NULL);
+        s_scroll_y = lv_obj_get_scroll_y(s_page_parent);
+    }
+
+    /*
+     * 卡片是这一页最大的一批对象（182 个控件，约 42 KB 内部 RAM）。
+     * ui_core 切页时只是把别的页面藏起来，对象并不销毁，所以「逛过这一页」
+     * 会让内部堆永久少 42 KB（ROADMAP v1.8.3 §0/§1）。这里把它们销毁掉，
+     * 页面外壳（抬头、返回按钮）留着。
+     *
+     * on_hide 由 ui_core 的 page_switch_locked() 调用，跑在 LVGL 任务里，
+     * 所以这里动 LVGL 对象是安全的（不在 httpd 回调里）。
+     */
+    const int released = s_content_built ? SETTINGS_CARD_COUNT : 0;
+    settings_content_destroy();
+
+    SYS_LOGD(TAG, "settings page hidden: %d cards released", released);
     return ESP_OK;
 }
 

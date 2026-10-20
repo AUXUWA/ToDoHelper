@@ -33,6 +33,13 @@ static lv_obj_t *s_grade_bar;
 /** 助记/例句 fetched from MaiMemo (plan B); hidden when unavailable. */
 static lv_obj_t *s_enrich_label;
 
+/** The flashcard itself. Part of the content block (see below). */
+static lv_obj_t *s_card;
+/** The page container: the parent of every object of this page. */
+static lv_obj_t *s_parent;
+/** Slot of the content block among the children of the page container. */
+static int32_t s_content_index;
+
 static EXT_RAM_BSS_ATTR word_item_t s_word;
 static bool s_have_word;
 static bool s_revealed;
@@ -572,33 +579,90 @@ static void restart_clicked_cb(lv_event_t *e)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Page                                                                      */
+/* Content block (card + hint + enrichment)                                 */
 /* ------------------------------------------------------------------------ */
 
-static esp_err_t word_create(lv_obj_t *parent)
-{
-    (void)page_header_create(parent, "单词背诵");
+/*
+ * The card, the hint line under it and the enrichment footnote are the
+ * *content* of this page: they are destroyed when the page is hidden and
+ * rebuilt when it comes back (ROADMAP v1.8.3 §1). Everything around them -
+ * the header, the progress line, the three grade buttons and the stats bar -
+ * is chrome and is built exactly once, in create().
+ *
+ * Why the card counts as content: it carries the only big text buffer of the
+ * page (spelling + meaning + example), so it is the object that keeps the
+ * internal heap busy for as long as nobody looks at the page.
+ *
+ * What is deliberately *not* rebuilt: the word itself. s_word / s_have_word /
+ * s_revealed live in RAM, so the user comes back to the very card - and to the
+ * same side of it - that they left. The queue is never re-read from storage
+ * and nothing is fetched from the network on the way back in.
+ */
 
-    s_progress_label = lv_label_create(parent);
-    lv_obj_set_style_text_font(s_progress_label, ui_font(UI_FONT_SMALL), 0);
-    lv_obj_set_style_text_color(s_progress_label, UI_COLOR_PRIMARY, 0);
+/**
+ * Destroy the content block.
+ *
+ * Only the objects this file created are touched; the chrome (header, progress
+ * line, grade bar, stats bar) stays exactly where it is.
+ */
+static void content_destroy(void)
+{
+    if (s_card != NULL) {
+        /* The card label is a child of the card and goes with it. */
+        lv_obj_delete(s_card);
+        s_card = NULL;
+        s_card_label = NULL;
+    }
+    if (s_hint_label != NULL) {
+        lv_obj_delete(s_hint_label);
+        s_hint_label = NULL;
+    }
+    if (s_enrich_label != NULL) {
+        lv_obj_delete(s_enrich_label);
+        s_enrich_label = NULL;
+    }
+}
+
+/**
+ * Build the content block and put it back in its original place.
+ *
+ * The page container is a flex column, so the order of its children *is* the
+ * vertical order of the page. Rebuilt objects are appended at the end of the
+ * container, so they are moved back into the slot they had when the page was
+ * built - otherwise the card would jump below the grade buttons.
+ *
+ * @return false when the objects could not be created (out of memory).
+ */
+static bool content_create(lv_obj_t *parent)
+{
+    if (parent == NULL) {
+        return false;
+    }
+    if (s_card != NULL) {
+        /* Already built (first visit): nothing to do. */
+        return true;
+    }
 
     /* Card body: tapping anywhere on it flips or advances. */
-    lv_obj_t *card = lv_button_create(parent);
-    if (card == NULL) {
-        return ESP_ERR_NO_MEM;
+    s_card = lv_button_create(parent);
+    if (s_card == NULL) {
+        return false;
     }
-    lv_obj_set_width(card, LV_PCT(100));
-    lv_obj_set_flex_grow(card, 1);
-    lv_obj_set_style_bg_color(card, UI_COLOR_SURFACE, 0);
-    lv_obj_set_style_radius(card, UI_CARD_RADIUS, 0);
-    lv_obj_set_style_pad_all(card, 16, 0);
-    lv_obj_set_style_shadow_width(card, 0, 0);
-    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_add_event_cb(card, card_clicked_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_width(s_card, LV_PCT(100));
+    lv_obj_set_flex_grow(s_card, 1);
+    lv_obj_set_style_bg_color(s_card, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_radius(s_card, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_card, 16, 0);
+    lv_obj_set_style_shadow_width(s_card, 0, 0);
+    lv_obj_set_flex_flow(s_card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_event_cb(s_card, card_clicked_cb, LV_EVENT_CLICKED, NULL);
 
-    s_card_label = lv_label_create(card);
+    s_card_label = lv_label_create(s_card);
+    if (s_card_label == NULL) {
+        content_destroy();
+        return false;
+    }
     lv_obj_set_width(s_card_label, LV_PCT(100));
     lv_label_set_long_mode(s_card_label, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_align(s_card_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -606,17 +670,55 @@ static esp_err_t word_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_card_label, UI_COLOR_TEXT, 0);
 
     s_hint_label = lv_label_create(parent);
+    if (s_hint_label == NULL) {
+        content_destroy();
+        return false;
+    }
     lv_obj_set_style_text_font(s_hint_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_hint_label, UI_COLOR_TEXT_MUTED, 0);
 
     /* Plan B: 助记/例句 from MaiMemo, shown under the hint once revealed. Hidden
      * by default so the card keeps its shape when there is nothing to add. */
     s_enrich_label = lv_label_create(parent);
+    if (s_enrich_label == NULL) {
+        content_destroy();
+        return false;
+    }
     lv_obj_set_width(s_enrich_label, LV_PCT(100));
     lv_label_set_long_mode(s_enrich_label, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_enrich_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_enrich_label, UI_COLOR_PRIMARY, 0);
     lv_obj_add_flag(s_enrich_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* Back into the original slots: card, hint, enrichment. */
+    lv_obj_move_to_index(s_card, s_content_index);
+    lv_obj_move_to_index(s_hint_label, s_content_index + 1);
+    lv_obj_move_to_index(s_enrich_label, s_content_index + 2);
+    return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Page                                                                      */
+/* ------------------------------------------------------------------------ */
+
+static esp_err_t word_create(lv_obj_t *parent)
+{
+    (void)page_header_create(parent, "单词背诵");
+    s_parent = parent;
+
+    s_progress_label = lv_label_create(parent);
+    lv_obj_set_style_text_font(s_progress_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_progress_label, UI_COLOR_PRIMARY, 0);
+
+    /*
+     * The content block starts here (card, hint, enrichment). The slot is
+     * remembered so a rebuild can put the objects back in the same place -
+     * see content_create().
+     */
+    s_content_index = (int32_t)lv_obj_get_child_count(parent);
+    if (!content_create(parent)) {
+        return ESP_ERR_NO_MEM;
+    }
 
     s_grade_bar = lv_obj_create(parent);
     lv_obj_remove_style_all(s_grade_bar);
@@ -688,6 +790,18 @@ static esp_err_t word_create(lv_obj_t *parent)
 
 static esp_err_t word_on_show(void)
 {
+    /*
+     * The card was destroyed when the page was hidden (ROADMAP v1.8.3 §1), so
+     * build it again from the RAM state: the word (s_word / s_have_word) and
+     * the side of the card the user had flipped to (s_revealed) are still
+     * there, so the page comes back exactly as it was left. Nothing is read
+     * from the SD card and nothing is fetched from the network here.
+     */
+    if (!content_create(s_parent)) {
+        SYS_LOGE(TAG, "cannot rebuild the card");
+        return ESP_ERR_NO_MEM;
+    }
+
     if (!s_have_word) {
         next_word();
     }
@@ -714,6 +828,15 @@ static esp_err_t word_on_event(int32_t event_id, void *data)
 static esp_err_t word_on_hide(void)
 {
     uplink_flush();
+
+    /*
+     * The card is the heaviest object of this page (it holds the spelling,
+     * the meaning and the example), and ui_core only *hides* the page
+     * container - the objects themselves would stay in the heap forever and
+     * shred the internal heap into unusable fragments (ROADMAP v1.8.3 §1).
+     * They are rebuilt in on_show() from the state that was kept in RAM.
+     */
+    content_destroy();
     return ESP_OK;
 }
 

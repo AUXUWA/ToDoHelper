@@ -36,6 +36,11 @@
  * two height placeholders) stays alive - it is tiny, and rebuilding it would
  * make the page flicker.
  *
+ * The detail page (page_todo_detail) uses the same split (ROADMAP v1.8.3 §1):
+ * the card is the shell and is built once, the three labels inside it are the
+ * content - destroyed when the page is hidden and rebuilt from todo_manager's
+ * RAM snapshot (todo_get() never touches the card) when it comes back.
+ *
  * Every LVGL call below runs in the LVGL task: create()/on_show()/on_event()
  * are invoked by ui_core, and ui_event_bind() marshals into that task — see
  * AGENT.md 9.0.1.
@@ -1283,7 +1288,19 @@ const ui_page_t page_todo = {
 /* Detail page (FR2 / UI_PAGE_TODO_DETAIL) — display only                    */
 /* ------------------------------------------------------------------------ */
 
+/*
+ * 详情页的「外壳」与「内容」。
+ *
+ * 外壳（抬头、卡片容器、只读提示）只建一次，一直留在原地；
+ * 内容（卡片里的三个标签）**页面隐藏时销毁、回来时重建**
+ * （ROADMAP v1.8.3 §1）—— ui_core 只把页面容器藏起来，对象并不销毁，
+ * 不清掉的话逛一遍页面就能把内部堆吃光。
+ *
+ * 重建的数据来自 todo_manager 的内存缓存（todo_get() 只在 RAM 里找），
+ * 不读盘、不发网络请求；勾选/删除状态也保存在 todo_manager 里，重建后照旧。
+ */
 static uint32_t s_detail_id;
+static lv_obj_t *s_detail_body;   /**< 卡片里的内容容器（外壳，不销毁） */
 static lv_obj_t *s_detail_title;
 static lv_obj_t *s_detail_meta;
 static lv_obj_t *s_detail_desc;
@@ -1413,45 +1430,105 @@ static void detail_refresh(void)
     detail_set_text(s_detail_meta, meta);
 }
 
-static esp_err_t todo_detail_create(lv_obj_t *parent)
+/**
+ * 建详情页的「内容」：卡片里的三个标签。
+ *
+ * 顺序跟改动前完全一样（标题 → 元信息 → 备注），所以重建出来的观感一个字节
+ * 都不差。样式也照抄，值都没改。
+ */
+static void detail_content_build(void)
 {
-    (void)page_header_create(parent, "待办详情");
-
-    lv_obj_t *body = NULL;
-    if (ui_card_create(parent, NULL, &body) == NULL) {
-        return ESP_ERR_NO_MEM;
+    if (s_detail_body == NULL || s_detail_title != NULL) {
+        return;
     }
 
-    s_detail_title = lv_label_create(body);
+    s_detail_title = lv_label_create(s_detail_body);
+    if (s_detail_title == NULL) {
+        return;
+    }
     lv_obj_set_width(s_detail_title, LV_PCT(100));
     lv_label_set_long_mode(s_detail_title, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_detail_title, ui_font(UI_FONT_TITLE), 0);
     lv_obj_set_style_text_color(s_detail_title, UI_COLOR_TEXT, 0);
 
-    s_detail_meta = lv_label_create(body);
+    s_detail_meta = lv_label_create(s_detail_body);
+    if (s_detail_meta == NULL) {
+        return;
+    }
     lv_obj_set_width(s_detail_meta, LV_PCT(100));
     lv_label_set_long_mode(s_detail_meta, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_detail_meta, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_detail_meta, UI_COLOR_TEXT_MUTED, 0);
 
-    s_detail_desc = lv_label_create(body);
+    s_detail_desc = lv_label_create(s_detail_body);
+    if (s_detail_desc == NULL) {
+        return;
+    }
     lv_obj_set_width(s_detail_desc, LV_PCT(100));
     lv_label_set_long_mode(s_detail_desc, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_detail_desc, ui_font(UI_FONT_BODY), 0);
     lv_obj_set_style_text_color(s_detail_desc, UI_COLOR_TEXT, 0);
+}
+
+/**
+ * 销毁详情页的「内容」（页面隐藏时）。
+ *
+ * 只删自己建的三个标签：卡片容器（外壳）留着 —— 外壳重建只会让页面闪一下，
+ * 而且会把只读提示挤到别的位置上去。
+ */
+static void detail_content_clear(void)
+{
+    if (s_detail_title != NULL) {
+        lv_obj_delete(s_detail_title);
+        s_detail_title = NULL;
+    }
+    if (s_detail_meta != NULL) {
+        lv_obj_delete(s_detail_meta);
+        s_detail_meta = NULL;
+    }
+    if (s_detail_desc != NULL) {
+        lv_obj_delete(s_detail_desc);
+        s_detail_desc = NULL;
+    }
+}
+
+static esp_err_t todo_detail_create(lv_obj_t *parent)
+{
+    (void)page_header_create(parent, "待办详情");
+
+    /* 外壳：卡片（内容容器）只建一次。 */
+    if (ui_card_create(parent, NULL, &s_detail_body) == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
 
     /* The "完成/取消 / 优先级 / 删除" bar used to live here; the detail page is
      * a viewer now, so its slot carries the read-only hint instead. */
     readonly_hint_create(parent);
 
-    detail_refresh();
+    /* 内容：三个标签。隐藏时销毁，回来时按内存里的快照重建。 */
+    detail_content_build();
+
     (void)ui_event_bind(TODO_EVENT, TODO_EVENT_LIST_CHANGED, UI_PAGE_TODO_DETAIL, 0);
     return ESP_OK;
 }
 
 static esp_err_t todo_detail_on_show(void)
 {
+    /* 内容在 on_hide 里被销毁了：按 todo_manager 的内存缓存重建
+     * （todo_get() 只在 RAM 里找，不读盘、不发网络请求）。 */
+    detail_content_build();
     detail_refresh();
+    return ESP_OK;
+}
+
+/**
+ * 页面被切走：把「内容」销毁掉，把内部堆还回去（ROADMAP v1.8.3 §1）。
+ *
+ * 外壳（抬头、卡片、只读提示）留着 —— 它们很少，重建只会让页面闪一下。
+ */
+static esp_err_t todo_detail_on_hide(void)
+{
+    detail_content_clear();
     return ESP_OK;
 }
 
@@ -1468,5 +1545,6 @@ const ui_page_t page_todo_detail = {
     .name = "todo_detail",
     .create = todo_detail_create,
     .on_show = todo_detail_on_show,
+    .on_hide = todo_detail_on_hide,
     .on_event = todo_detail_on_event,
 };

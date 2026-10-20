@@ -110,22 +110,30 @@ CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL=y
 CONFIG_ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD=y
 CONFIG_TODOHELPER_FONT_FREETYPE=y
 
-# FreeType 字形缓存：256 → 32。
+# FreeType 字形缓存：256 → 64。
 #
-# 这个缓存装的是**每一个用过的汉字的位图**（28 px 的汉字约 784 B，48 px 约 2.3 KB），
-# 而 LVGL 用的是 C 库的 malloc（CONFIG_LV_USE_CLIB_MALLOC=y），
+# 这个缓存装的是**每一个用过的汉字的位图**（16 px 约 256 B，28 px 约 784 B，
+# 48 px 约 2.3 KB），而 LVGL 用的是 C 库的 malloc（CONFIG_LV_USE_CLIB_MALLOC=y），
 # 所以这些位图全部落在内部堆里（≤4096 B 的分配优先内部，见上面
 # CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL）。
 #
-# 真机实测（同一个固件，只改这一个数，绕开所有页面各走三遍）：
-#   256 → 内部堆 290 KB 掉到 **0 KB**（最大连续块 0 KB），设备直接崩；
-#   64  → 绕完三遍只剩 54~64 KB，最大连续块 5~17 KB；
-#   32  → 绕完三遍还剩 76~88 KB，最大连续块 22~35 KB（过了 PHY 需要的 ~30 KB）。
+# 缓存越大，界面越流畅（被挤掉的字形每一帧都要重新渲染，
+# FreeType 每个汉字约 100~200 µs）；但内部堆只有 290 KB，撑不住 256。
 #
-# 代价：缓存小了，被挤掉的字形要重新渲染（FreeType 每个汉字约 100~200 µs）。
-# 一屏 30~40 个汉字 → 每帧多几毫秒，滚动略慢但不掉帧；
-# 而「逛一遍页面就把内存吃光、然后崩掉」是不能接受的。
-CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=32
+# 真机实测（同一个固件，只改这一个数，绕开所有页面各走三遍）：
+#   256 → 内部堆掉到 **0 KB**（最大连续块 0 KB），设备崩；
+#   128 → 最低水位掉到 0 KB，分配失败，随时可能 panic；
+#   64  → 最低水位 31 KB，最大连续块 23 KB，绕完三遍还剩 114 KB；← 选它
+#   32  → 最低水位 54 KB，最大连续块 22~35 KB（更安全，但界面明显卡）
+#
+# 代价：被挤掉的字形要重新渲染。一屏 30~40 个汉字 → 每帧多几毫秒，
+# 滚动略慢但不掉帧；而「逛一遍页面就把内存吃光、然后崩掉」是不能接受的。
+#
+# 想回到 256（完全不卡），前提是**字形位图搬到 PSRAM**——
+# 试过把 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 压到 128（让位图落 PSRAM），
+# 结果 **TLS 握手直接失败**（mbedtls_ssl_handshake 返回 -0x008D），
+# 所以这条路留给下一轮：只给 FreeType 一条通往 PSRAM 的路，别动全局的分配阈值。
+CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=64
 
 # Display / UI
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_FS=y
