@@ -67,6 +67,10 @@ static const struct {
     { "/api/v1/todos", HTTP_GET },
     { "/api/v1/todos/*", HTTP_GET },
     { "/api/v1/ai/history", HTTP_GET },
+    /* The AI configuration says whether a key is set, which model is in use
+     * and how much history is kept - the same "the user's own data" as the
+     * conversation log above. */
+    { "/api/v1/ai/config", HTTP_GET },
 };
 
 /**

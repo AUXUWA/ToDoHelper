@@ -1380,13 +1380,15 @@ I (xxx) TH:app: ready (storage=/sdcard)
 
 下表是**实际注册**的全部路由（来源：`components/*/src/*.c` 中的
 `http_router_register()` / `http_router_register_not_implemented()` 路由表）。
-**v1.9.0 真机复核**：`GET /api/v1/device/status` 返回 `"routes":62`
-（含调试 shell 的 2 条时是 64 —— 调试 shell 默认不开）。
-按注册项（`path + method`）拆：`sync_server` 8 + `todo_manager` 10 + `weather_service` 5 +
-`calendar_service` 5 + `word_service` 8 + `wifi_manager` 7 + `ai_service` 7 + `voice_service` 2 +
-`maimemo_client` 8 = 60，另加 `sync_server` 的 `/ws/events` 501 占位等。
-（1.3.0 那句「51 条」是按**唯一路径**数的，而且当时 `todo_manager` / `word_service` /
-`maimemo_client` 还没长到现在这么多；v1.9.0 起以真机返回的 62 为准。）
+**v1.9.0 真机复核**：`GET /api/v1/device/status` 返回 `"routes":62`。
+按注册项（`path + method`）拆开正好是 62：
+`sync_server` 8（含 `/ws/events` 的 501 占位）+ `todo_manager` 10 + `weather_service` 5 +
+`calendar_service` 5 + `word_service` 8 + `wifi_manager` 7 + `ai_service` 7 +
+`voice_service` 2 + `maimemo_client` 8 + `debug_shell` 2 = 62。
+（**注意**：`debug_shell` 的 2 条**在**这 62 条里 —— 本工程
+`CONFIG_TODOHELPER_DEBUG_SHELL=y`，调试 shell 是开着的。1.3.0 那句「51 条」
+是按**唯一路径**数的，而且当时 `todo_manager` / `word_service` /
+`maimemo_client` 还没长到现在这么多。）
 
 > **1.0.0 更正**：旧版这张表把 `/api/v1/wifi/*` 记为"组件里没有任何 `http_router_register()`
 > 调用 → 404"、把 `ai_service` 记为"不在 `app_main` 模块表里 → 运行时 404"。**两条都是错的**，
@@ -1445,7 +1447,7 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/api/v1/ai/history` | ai_service | 对话历史。**强制鉴权** | ✅ 200（需 token） |
 | DELETE | `/api/v1/ai/history` | ai_service | 清空历史。**强制鉴权** | ✅ 200（需 token） |
 | POST | `/api/v1/ai/config` | ai_service | 设置 API Key / 模型 / 轮数。**强制鉴权**，响应不回显 Key | ✅ 200（需 token） |
-| GET | `/api/v1/ai/config` | ai_service | **v1.9.0 新增**：读当前配置状态（`model` / `has_api_key` / `history_rounds` / `state`），**不回显 Key** | ✅ 200 |
+| GET | `/api/v1/ai/config` | ai_service | **v1.9.0 新增**：读当前配置状态（`model` / `has_api_key` / `history_rounds` / `save_history` / `state`），**不回显 Key**。**强制鉴权**（v1.9.7 起，与 `/ai/history` 同列） | ✅ 200（需 token） |
 | POST | `/api/v1/ai/abort` | ai_service | 中断正在进行的流式回答 | ✅ 200 |
 | GET | `/api/v1/voice/status` | voice_service | 板子有没有麦克风/扬声器（`microphone`/`speaker` 是**能力**，不占用内存）、音频外设是否已启动（`audio_ready`）、ASR/TTS 端点是否已配 | ✅ 200 |
 | POST | `/api/v1/voice/config` | voice_service | 配置 ASR/TTS HTTP 端点（协议见 §ai_service / §voice_service） | ✅ 200 |
