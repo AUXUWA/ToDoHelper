@@ -6,17 +6,45 @@
 
 /**
  * @file page_settings.c
- * @brief Settings: brightness, idle behaviour, timezone, city, daily words,
- *        HTTP auth token and a storage/device summary.
+ * @brief Settings: display and idle, AI chat, timezone and city, daily words,
+ *        HTTP auth token and a device summary.
  *
  * Everything writes straight to NVS through the owning component's API, so the
  * values survive a reboot without this page knowing any key names.
+ *
+ * ## Layout
+ *
+ * Six cards in one scrollable column.  The page container is created by
+ * ui_core.c's page_container_create(), which puts LV_OBJ_FLAG_SCROLLABLE on
+ * every page container, so the page simply grows downwards instead of being
+ * squeezed into one screen.
+ *
+ * The vertical budget of one screen is 412 px (480 - 40 status bar - 2x14 page
+ * padding).  What the six cards add up to is roughly:
+ *
+ *   显示与待机 ~150   AI 对话 ~300   时间与时区 ~185
+ *   单词 ~220          局域网与安全 ~200          设备信息 ~320
+ *   + 抬头 ~35 + 6 个卡间距 6x12 + 页内边距 28  ≈ 1500 px
+ *
+ * So this page is meant to be scrolled - roughly four screens.  Nothing is
+ * given a fixed height, so no text is ever clipped; the alternative (squeezing
+ * the same content into 412 px) would mean unreadable rows.
+ *
+ * ## Two rules this file follows everywhere
+ *
+ *   - **No blocking work in an LVGL callback.**  NVS writes are handed to a
+ *     one-shot task and the cloud word list is fetched in a worker task
+ *     (AGENT.md 9.0.1).
+ *   - **Write only what changed.**  Every label update compares against the
+ *     value that is on screen before touching the widget
+ *     (AGENT.md 9.0.1.1, rule 2).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "ai_service.h"
 #include "calendar_service.h"
 #include "esp_app_desc.h"
 #include "esp_random.h"
@@ -32,10 +60,66 @@
 
 static const char *TAG = "page_settings";
 
-static lv_obj_t *s_info_label;
+/* ------------------------------------------------------------------------ */
+/* Widget state                                                              */
+/* ------------------------------------------------------------------------ */
+
+/* ---- AI card ----------------------------------------------------------- */
+
+static const char *const s_ai_models[2] = { "deepseek-chat", "deepseek-reasoner" };
+
+static lv_obj_t *s_ai_key_label;
+static lv_obj_t *s_ai_hint_label;
+static lv_obj_t *s_ai_model_btn[2];
+static lv_obj_t *s_ai_model_label;
+static lv_obj_t *s_ai_rounds_label;
+static lv_obj_t *s_ai_prompt_label;
+
+/* Dirty-check buffers for the AI card (see refresh_ai_card). */
+static char s_ai_key_text[16];
+static char s_ai_model_text[32];
+static char s_ai_model_name_text[48];
+static char s_ai_rounds_text[16];
+static char s_ai_prompt_text[256];
+
+/* ---- Word card --------------------------------------------------------- */
+
+static lv_obj_t *s_word_book_label;
+static lv_obj_t *s_word_cloud_btn;
+static lv_obj_t *s_word_stats_label;
+
+static char s_word_book_text[48];
+static char s_word_cloud_text[32];
+static char s_word_stats_text[96];
+
+/* ---- Time card --------------------------------------------------------- */
+
+/** Read only line: active timezone and whether the clock is synchronised. */
+static lv_obj_t *s_tz_state_label;
+static char s_tz_state_text[64];
+
+/* ---- Device info grid -------------------------------------------------- */
+/**
+ * Number of key/value rows in the device card.
+ *
+ * The address is the one value that is too long for a two column cell, so it
+ * gets a row of its own (add_kv_wide_row) - that is why the count is 8 and not
+ * 9.
+ */
+#define INFO_ROW_COUNT 8
+
+static lv_obj_t *s_info_value[INFO_ROW_COUNT];
+static char s_info_cache[INFO_ROW_COUNT][80];
+
+/* ---- Security card ----------------------------------------------------- */
+
 static lv_obj_t *s_auth_label;
 /** Web console address, shown large so it can be read off the screen. */
 static lv_obj_t *s_url_label;
+
+/* Dirty-check buffers for the security card's two lines (see refresh_info). */
+static char s_url_text[128];
+static char s_auth_text[96];
 
 /* ------------------------------------------------------------------------ */
 /* Sliders                                                                   */
@@ -253,8 +337,313 @@ static void word_reset_cb(lv_event_t *e)
     ui_toast("单词进度已清空");
 }
 
+/* ------------------------------------------------------------------------ */
+/* AI card                                                                   */
+/* ------------------------------------------------------------------------ */
+
+/** Page level limits for the retained round count (ai_service allows 1..12). */
+#define AI_ROUNDS_MIN 1
+#define AI_ROUNDS_MAX 10
+
+/**
+ * A pending AI setting write.
+ *
+ * Model and round count are persisted in NVS, and an LVGL callback must not do
+ * a flash write (AGENT.md 9.0.1), so a click only queues this struct for a
+ * one-shot task.
+ */
+typedef enum {
+    AI_WRITE_MODEL = 0,
+    AI_WRITE_ROUNDS,
+} ai_write_kind_t;
+
+typedef struct {
+    ai_write_kind_t kind;
+    char model[32];
+    uint32_t rounds;
+} ai_write_req_t;
+
+static void refresh_ai_card(void);
+static void refresh_word_card(void);
+
+/** Re-read the cards after a background write landed (runs in the LVGL task). */
+static void settings_refresh_async(void *arg)
+{
+    (void)arg;
+    refresh_ai_card();
+    refresh_word_card();
+}
+
+static void ai_write_task(void *arg)
+{
+    ai_write_req_t *req = (ai_write_req_t *)arg;
+    if (req != NULL) {
+        if (req->kind == AI_WRITE_MODEL) {
+            (void)ai_service_set_model(req->model);
+        } else {
+            (void)ai_service_set_history_rounds(req->rounds);
+        }
+        free(req);
+    }
+    /* The write is done: pull the new state back into the widgets. */
+    (void)ui_run_async(settings_refresh_async, NULL);
+    vTaskDelete(NULL);
+}
+
+static void ai_model_clicked_cb(lv_event_t *e)
+{
+    const char *model = (const char *)lv_event_get_user_data(e);
+    if (model == NULL || strcmp(model, ai_service_get_model()) == 0) {
+        return;   /* already the active model */
+    }
+
+    ai_write_req_t *req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+        ui_toast("设置失败：内存不足");
+        return;
+    }
+    req->kind = AI_WRITE_MODEL;
+    strlcpy(req->model, model, sizeof(req->model));
+
+    /* 4096 B of internal RAM: a task that touches flash must not have a PSRAM
+     * stack (AGENT.md 9.0.1). */
+    if (xTaskCreate(ai_write_task, "th_ai_set", 4096, req, 3, NULL) != pdPASS) {
+        free(req);
+        ui_toast("设置失败：无法创建任务");
+    }
+}
+
+static void ai_rounds_clicked_cb(lv_event_t *e)
+{
+    const int delta = (int)(intptr_t)lv_event_get_user_data(e);
+
+    int32_t rounds = (int32_t)ai_service_get_history_rounds() + delta;
+    if (rounds < AI_ROUNDS_MIN) {
+        rounds = AI_ROUNDS_MIN;
+    }
+    if (rounds > AI_ROUNDS_MAX) {
+        rounds = AI_ROUNDS_MAX;
+    }
+    if ((uint32_t)rounds == ai_service_get_history_rounds()) {
+        ui_toast(delta > 0 ? "最多保留 %d 轮" : "至少保留 %d 轮",
+                 delta > 0 ? AI_ROUNDS_MAX : AI_ROUNDS_MIN);
+        return;
+    }
+
+    ai_write_req_t *req = calloc(1, sizeof(*req));
+    if (req == NULL) {
+        ui_toast("设置失败：内存不足");
+        return;
+    }
+    req->kind = AI_WRITE_ROUNDS;
+    req->rounds = (uint32_t)rounds;
+
+    if (xTaskCreate(ai_write_task, "th_ai_set", 4096, req, 3, NULL) != pdPASS) {
+        free(req);
+        ui_toast("设置失败：无法创建任务");
+    }
+}
+
+static void ai_clear_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    /* Clearing the context only touches RAM (no NVS write), so it is safe to
+     * do right here in the callback. */
+    if (ai_service_clear_history() == ESP_OK) {
+        ui_toast("对话已清空");
+    } else {
+        ui_toast("清空失败");
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Refresh                                                                   */
+/* ------------------------------------------------------------------------ */
+
 /* Defined below; the auth callbacks use it to re-render the security card. */
 static void refresh_info(void);
+
+/* ------------------------------------------------------------------------ */
+/* Widget helpers                                                            */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * Text colour for a button background.
+ *
+ * UI_COLOR_ON_PRIMARY is a near-black meant for the bright accent colour.  On
+ * the dark UI_COLOR_SURFACE_ALT it was unreadable (the old timezone and daily
+ * word buttons used it), so the colour now follows the background: light text
+ * on every dark button, dark text on the bright one.
+ */
+static lv_color_t button_fg(lv_color_t bg)
+{
+    return lv_color_eq(bg, UI_COLOR_PRIMARY) ? UI_COLOR_ON_PRIMARY : UI_COLOR_TEXT;
+}
+
+/**
+ * Build a card and restyle its title.
+ *
+ * ui_card_create() hard-codes the title style (UI_FONT_TITLE + body colour) in
+ * ui_core, and ui_core is not touched this round.  Doing it here keeps the six
+ * cards of this page looking like one set: body sized title in the accent
+ * colour.
+ */
+static lv_obj_t *add_card(lv_obj_t *parent, const char *title, lv_obj_t **out_body)
+{
+    lv_obj_t *card = ui_card_create(parent, title, out_body);
+    if (card == NULL) {
+        return NULL;
+    }
+    /* The title label is the first child, the content body the second. */
+    lv_obj_t *title_label = lv_obj_get_child(card, 0);
+    if (title_label != NULL) {
+        lv_obj_set_style_text_font(title_label, ui_font(UI_FONT_BODY), 0);
+        lv_obj_set_style_text_color(title_label, UI_COLOR_PRIMARY, 0);
+    }
+    return card;
+}
+
+static lv_obj_t *add_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb,
+                            const void *user_data, lv_color_t color)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_height(btn, UI_TOUCH_MIN);
+    lv_obj_set_flex_grow(btn, 1);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(label, button_fg(color), 0);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)user_data);
+    return btn;
+}
+
+static lv_obj_t *add_row(lv_obj_t *parent)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
+}
+
+/**
+ * Write a label only when its text really changed.
+ *
+ * lv_label_set_text() invalidates the label even when the string is identical,
+ * and this page is refreshed every 5 s (AGENT.md 9.0.1.1, rule 2).
+ */
+static void label_set_cached(lv_obj_t *label, char *cache, size_t cache_size,
+                             const char *text)
+{
+    if (label == NULL || text == NULL) {
+        return;
+    }
+    if (cache != NULL && strcmp(cache, text) == 0) {
+        return;
+    }
+    if (cache != NULL) {
+        strlcpy(cache, text, cache_size);
+    }
+    lv_label_set_text(label, text);
+}
+
+/** Change a button's background (and its text colour to match). */
+static void set_button_color(lv_obj_t *btn, lv_color_t color)
+{
+    if (btn == NULL) {
+        return;
+    }
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (label != NULL) {
+        lv_obj_set_style_text_color(label, button_fg(color), 0);
+    }
+}
+
+/** Change a button's caption, but only when it differs from the one on screen. */
+static void set_button_text(lv_obj_t *btn, char *cache, size_t cache_size, const char *text)
+{
+    if (btn == NULL || text == NULL) {
+        return;
+    }
+    if (cache != NULL && strcmp(cache, text) == 0) {
+        return;
+    }
+    if (cache != NULL) {
+        strlcpy(cache, text, cache_size);
+    }
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (label != NULL) {
+        lv_label_set_text(label, text);
+    }
+}
+
+/**
+ * One key/value row of the device card: key on the left (muted, small),
+ * value on the right (body colour, small).
+ */
+static lv_obj_t *add_kv_row(lv_obj_t *parent, const char *key, int index)
+{
+    lv_obj_t *row = add_row(parent);
+
+    lv_obj_t *k = lv_label_create(row);
+    lv_label_set_text(k, key);
+    lv_obj_set_style_text_font(k, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(k, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_set_width(k, 92);
+
+    lv_obj_t *v = lv_label_create(row);
+    lv_obj_set_flex_grow(v, 1);
+    lv_obj_set_style_text_font(v, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(v, UI_COLOR_TEXT, 0);
+
+    if (index >= 0 && index < INFO_ROW_COUNT) {
+        s_info_value[index] = v;
+    }
+    return row;
+}
+
+/**
+ * A key/value row whose value is too long for a two column cell: the key gets
+ * its own line and the value takes the full width below it.
+ *
+ * The web console address is such a value - squeezed into the right hand
+ * column it would be cut off.
+ */
+static void add_kv_wide_row(lv_obj_t *parent, const char *key, int index)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_width(box, LV_PCT(100));
+    lv_obj_set_height(box, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 2, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *k = lv_label_create(box);
+    lv_label_set_text(k, key);
+    lv_obj_set_style_text_font(k, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(k, UI_COLOR_TEXT_MUTED, 0);
+
+    lv_obj_t *v = lv_label_create(box);
+    lv_obj_set_width(v, LV_PCT(100));
+    lv_label_set_long_mode(v, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(v, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(v, UI_COLOR_TEXT, 0);
+
+    if (index >= 0 && index < INFO_ROW_COUNT) {
+        s_info_value[index] = v;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Auth / reboot actions                                                     */
+/* ------------------------------------------------------------------------ */
 
 static void auth_enable_cb(lv_event_t *e)
 {
@@ -279,8 +668,8 @@ static void auth_enable_cb(lv_event_t *e)
          *
          * Strings are kept short on purpose: ui_dialog_secret() lays the lead-in
          * and the token out side by side (the panel is 800x480 landscape), so
-         * long prose in the left column would squeeze the token column instead of
-         * merely making the box taller.
+         * long prose in the left column would squeeze the token column instead
+         * of merely making the box taller.
          */
         ui_dialog_secret("HTTP 鉴权已开启",
                          "把下面的 token 填进网页控制台的「访问令牌」。",
@@ -317,55 +706,238 @@ static void reboot_cb(lv_event_t *e)
     esp_restart();
 }
 
-static lv_obj_t *add_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb,
-                            const void *user_data, lv_color_t color)
+/* ------------------------------------------------------------------------ */
+/* Cloud word book (continued)                                              */
+/* ------------------------------------------------------------------------ */
+
+/** The worker finished: refresh the card in the LVGL task. */
+static void word_cloud_done_async(void *arg)
 {
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_height(btn, UI_TOUCH_MIN);
-    lv_obj_set_flex_grow(btn, 1);
-    lv_obj_set_style_bg_color(btn, color, 0);
-    lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
-    lv_obj_set_style_text_color(label, UI_COLOR_ON_PRIMARY, 0);
-    lv_obj_center(label);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)user_data);
-    return btn;
+    const bool enable = (arg != NULL);
+    refresh_word_card();
+    if (enable) {
+        ui_toast("已开启云端词库");
+    } else {
+        ui_toast("已关闭云端词库");
+    }
 }
 
-static lv_obj_t *add_row(lv_obj_t *parent)
+static void word_cloud_worker(void *arg)
 {
-    lv_obj_t *row = lv_obj_create(parent);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_width(row, LV_PCT(100));
-    lv_obj_set_height(row, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(row, 8, 0);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    return row;
+    const bool enable = (arg != NULL);
+
+    (void)word_set_cloud_mode(enable);
+    if (enable) {
+        /* Blocking TLS plus SD card writes - never in an LVGL callback. */
+        (void)word_cloud_refresh();
+    }
+
+    (void)ui_run_async(word_cloud_done_async, (void *)(uintptr_t)(enable ? 1 : 0));
+    vTaskDelete(NULL);
+}
+
+/** The user confirmed the switch: hand the work to the worker thread. */
+static void word_cloud_confirm_cb(lv_event_t *e)
+{
+    /* The confirm button hands the message box over as its event user data
+     * (see ui_dialog_confirm); the payload rides on the box. */
+    lv_obj_t *mbox = (lv_obj_t *)lv_event_get_user_data(e);
+    if (mbox == NULL) {
+        return;
+    }
+    const bool enable = (lv_obj_get_user_data(mbox) != NULL);
+
+    /* Do the work first, close the box afterwards: lv_msgbox_close() deletes
+     * the box synchronously and LVGL then drops the rest of this click. */
+    if (xTaskCreate(word_cloud_worker, "th_word_mode", 6144,
+                    (void *)(uintptr_t)(enable ? 1 : 0), 3, NULL) != pdPASS) {
+        ui_toast("操作失败：无法创建任务");
+    }
+
+    lv_msgbox_close(mbox);
+}
+
+static void word_cloud_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    const bool enable = !word_cloud_mode();
+
+    lv_obj_t *mbox = ui_dialog_confirm(
+        enable ? "开启云端词库" : "关闭云端词库",
+        enable ? "将从墨墨账号拉取今天的单词（需要联网）。确定开启？"
+               : "将改用本地词书。确定关闭？",
+        enable ? "开启" : "关闭", "取消",
+        word_cloud_confirm_cb, (void *)(uintptr_t)(enable ? 1 : 0));
+    if (mbox == NULL) {
+        ui_toast("无法打开确认框");
+    }
 }
 
 /* ------------------------------------------------------------------------ */
-/* Refresh                                                                   */
+/* Card refresh                                                              */
 /* ------------------------------------------------------------------------ */
 
 /**
- * Last rendered info block.
+ * One sentence summary of the system prompt.
  *
- * The label is a six-line LV_LABEL_LONG_MODE_WRAP at 100% width, so re-setting
- * it forces a full re-wrap and height re-measure of the card. Almost nothing in
- * it changes at the 5 s tick cadence (the firmware version never does), and
- * building it calls storage_free_bytes() - a statvfs on the SD card - so the
- * text is compared before the label is touched (smoothness audit P1-10).
+ * The prompt can be a whole paragraph (it is editable from the web console),
+ * so the device only shows its opening sentence.  The cut never happens in
+ * the middle of a UTF-8 character, otherwise the last glyph would be garbage.
  */
-static char s_info_text[320];
-/** Dirty-check buffers for the security card's two lines (see refresh_info). */
-static char s_url_text[64];
-static char s_auth_text[96];
+static void ai_prompt_summary(const char *prompt, char *out, size_t out_size)
+{
+    const char *p = (prompt != NULL) ? prompt : "";
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
+    }
+    if (p[0] == '\0') {
+        snprintf(out, out_size, "%s", "");
+        return;
+    }
 
+    /* At most 120 bytes (about 40 Chinese characters); stop before a UTF-8
+     * continuation byte so that the summary always ends on a whole character. */
+    size_t n = 0;
+    while (p[n] != '\0' && n < 120) {
+        if (((unsigned char)p[n] & 0xC0u) == 0x80u) {
+            break;
+        }
+        n++;
+    }
+
+    /* Prefer the first sentence.  The Chinese full stop is a three byte
+     * sequence, so it cannot be written as a character constant (that would be
+     * a multi-character constant, which the build rejects). */
+    size_t end = n;
+    bool truncated = true;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == '!' || p[i] == '?') {
+            end = i + 1;
+            truncated = false;
+            break;
+        }
+        if (i + 2 < n && (unsigned char)p[i] == 0xE3u &&
+            (unsigned char)p[i + 1] == 0x80u && (unsigned char)p[i + 2] == 0x82u) {
+            end = i + 3;
+            truncated = false;
+            break;
+        }
+    }
+
+    snprintf(out, out_size, "%.*s%s", (int)end, p, truncated ? "…" : "");
+}
+
+/** Re-render the AI card. Every write is dirty-checked. */
+static void refresh_ai_card(void)
+{
+    if (s_ai_key_label == NULL) {
+        return;
+    }
+
+    /* API key: only the state is shown, the key itself never reaches the
+     * screen (same rule as every other secret on this device). */
+    const bool has_key = ai_service_has_api_key();
+    const char *key_text = has_key ? "已配置" : "未配置";
+    if (strcmp(key_text, s_ai_key_text) != 0) {
+        strlcpy(s_ai_key_text, key_text, sizeof(s_ai_key_text));
+        lv_label_set_text(s_ai_key_label, s_ai_key_text);
+        lv_obj_set_style_text_color(s_ai_key_label,
+                                    has_key ? UI_COLOR_SUCCESS : UI_COLOR_WARNING, 0);
+    }
+
+    /* Without a key the user has to go to the web console - this board has no
+     * keyboard, so typing one here is impossible. */
+    if (s_ai_hint_label != NULL) {
+        const bool hidden = has_key;
+        if (lv_obj_has_flag(s_ai_hint_label, LV_OBJ_FLAG_HIDDEN) != hidden) {
+            if (hidden) {
+                lv_obj_add_flag(s_ai_hint_label, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_remove_flag(s_ai_hint_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+
+    /* Model: the active one is highlighted.  An unknown model name highlights
+     * neither and is spelled out below instead. */
+    const char *model = ai_service_get_model();
+    if (strcmp(model, s_ai_model_text) != 0) {
+        strlcpy(s_ai_model_text, model, sizeof(s_ai_model_text));
+        for (int i = 0; i < 2; i++) {
+            const bool active = (strcmp(model, s_ai_models[i]) == 0);
+            set_button_color(s_ai_model_btn[i],
+                             active ? UI_COLOR_PRIMARY : UI_COLOR_SURFACE_ALT);
+        }
+    }
+    const bool known_model = (strcmp(model, s_ai_models[0]) == 0) ||
+                             (strcmp(model, s_ai_models[1]) == 0);
+    if (s_ai_model_label != NULL) {
+        if (known_model) {
+            if (!lv_obj_has_flag(s_ai_model_label, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_add_flag(s_ai_model_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            char text[48];
+            snprintf(text, sizeof(text), "当前模型：%s", model);
+            label_set_cached(s_ai_model_label, s_ai_model_name_text,
+                             sizeof(s_ai_model_name_text), text);
+            if (lv_obj_has_flag(s_ai_model_label, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_remove_flag(s_ai_model_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+
+    /* Retained rounds. */
+    char rounds[16];
+    snprintf(rounds, sizeof(rounds), "%u", (unsigned)ai_service_get_history_rounds());
+    label_set_cached(s_ai_rounds_label, s_ai_rounds_text, sizeof(s_ai_rounds_text), rounds);
+
+    /* System prompt: read only, one sentence, plus where to change it. */
+    if (s_ai_prompt_label != NULL) {
+        char summary[160];
+        char text[224];
+        ai_prompt_summary(ai_service_get_system_prompt(), summary, sizeof(summary));
+        snprintf(text, sizeof(text), "%s（可在网页端修改）", summary);
+        label_set_cached(s_ai_prompt_label, s_ai_prompt_text, sizeof(s_ai_prompt_text), text);
+    }
+}
+
+/** Re-render the word card. Every write is dirty-checked. */
+static void refresh_word_card(void)
+{
+    if (s_word_book_label == NULL) {
+        return;
+    }
+
+    label_set_cached(s_word_book_label, s_word_book_text, sizeof(s_word_book_text),
+                     word_get_book());
+
+    /* word_cloud_mode() is false while no cloud account is configured, so this
+     * shows the state that is actually in effect. */
+    set_button_text(s_word_cloud_btn, s_word_cloud_text, sizeof(s_word_cloud_text),
+                    word_cloud_mode() ? "云端词库：开" : "云端词库：关");
+
+    word_stats_t stats;
+    char text[96];
+    if (word_stats(&stats) == ESP_OK) {
+        snprintf(text, sizeof(text), "已学 %u · 模糊 %u · 掌握 %u · 未记住 %u",
+                 (unsigned)stats.learned, (unsigned)stats.fuzzy_total,
+                 (unsigned)stats.known_total, (unsigned)stats.unknown_total);
+    } else {
+        snprintf(text, sizeof(text), "学习统计暂不可用");
+    }
+    label_set_cached(s_word_stats_label, s_word_stats_text, sizeof(s_word_stats_text), text);
+}
+
+/**
+ * The whole page refresh (5 s tick and after every action).
+ *
+ * Everything is dirty-checked: this runs forever while the page is open, and
+ * an unconditional lv_label_set_text() would repaint the page every time.
+ */
 static void refresh_info(void)
 {
-    if (s_info_label == NULL) {
+    if (s_info_value[0] == NULL) {
         return;
     }
 
@@ -378,21 +950,39 @@ static void refresh_info(void)
      * quickest way to tell which firmware is actually flashed on the board. */
     const esp_app_desc_t *app = esp_app_get_description();
 
-    char text[sizeof(s_info_text)];
-    snprintf(text, sizeof(text),
-             "固件 %s · IDF %s\nIP %s · %s\n存储 %s（%s）\n剩余 %llu KB · 时区 %s\n"
-             "天气源 %s · 城市 %s\n单词 %u/日 · 词库 %s",
-             (app != NULL) ? app->version : "?",
-             (app != NULL) ? app->idf_ver : "?",
-             ip, mac,
-             storage_root() ? storage_root() : "不可用",
+    char text[80];
+
+    snprintf(text, sizeof(text), "%s", (app != NULL) ? app->version : "?");
+    label_set_cached(s_info_value[0], s_info_cache[0], sizeof(s_info_cache[0]), text);
+
+    snprintf(text, sizeof(text), "%s", (app != NULL) ? app->idf_ver : "?");
+    label_set_cached(s_info_value[1], s_info_cache[1], sizeof(s_info_cache[1]), text);
+
+    snprintf(text, sizeof(text), "%s", ip[0] ? ip : "未连接");
+    label_set_cached(s_info_value[2], s_info_cache[2], sizeof(s_info_cache[2]), text);
+
+    snprintf(text, sizeof(text), "%s", mac[0] ? mac : "-");
+    label_set_cached(s_info_value[3], s_info_cache[3], sizeof(s_info_cache[3]), text);
+
+    snprintf(text, sizeof(text), "%s · 剩余 %llu KB",
              storage_sd_available() ? "SD 卡" : "内置",
-             (unsigned long long)(storage_free_bytes() / 1024),
-             calendar_get_timezone(),
-             weather_get_provider(),
-             weather_get_city()[0] ? weather_get_city() : "未设置",
-             (unsigned)word_get_daily_count(),
-             word_get_book());
+             (unsigned long long)(storage_free_bytes() / 1024));
+    label_set_cached(s_info_value[4], s_info_cache[4], sizeof(s_info_cache[4]), text);
+
+    snprintf(text, sizeof(text), "%s", calendar_get_timezone());
+    label_set_cached(s_info_value[5], s_info_cache[5], sizeof(s_info_cache[5]), text);
+
+    /* Timezone and clock state as one read only line. */
+    if (s_tz_state_label != NULL) {
+        char tz_state[64];
+        snprintf(tz_state, sizeof(tz_state), "%s · %s", calendar_get_timezone(),
+                 calendar_time_synced() ? "已同步" : "未同步");
+        label_set_cached(s_tz_state_label, s_tz_state_text, sizeof(s_tz_state_text), tz_state);
+    }
+
+    snprintf(text, sizeof(text), "%s · %s", weather_get_provider(),
+             weather_get_city()[0] ? weather_get_city() : "未设置");
+    label_set_cached(s_info_value[6], s_info_cache[6], sizeof(s_info_cache[6]), text);
 
     /*
      * The security card is refreshed here too, not just at creation. Its URL line
@@ -401,24 +991,17 @@ static void refresh_info(void)
      * picked up. Both writes are dirty-checked: a 1 Hz unconditional
      * lv_label_set_text would repaint the page forever.
      */
-    if (s_url_label != NULL) {
-        /*
-         * Show both forms when mDNS is on. `todohelper.local` is nicer to type but
-         * only resolves with Bonjour on Windows and not at all where multicast is
-         * blocked, so the IP is always shown as well - the user should never have
-         * to go hunting for an address that works.
-         */
+    char url[128];
+    const char *primary = sync_server_url();
+    if (strstr(primary, ".local") != NULL) {
         char ip_url[40];
         sync_server_ip_url(ip_url, sizeof(ip_url));
+        snprintf(url, sizeof(url), "%s\n或 %s", primary, ip_url);
+    } else {
+        snprintf(url, sizeof(url), "%s", primary);
+    }
 
-        char url[128];
-        const char *primary = sync_server_url();
-        if (strstr(primary, ".local") != NULL) {
-            snprintf(url, sizeof(url), "%s\n或 %s", primary, ip_url);
-        } else {
-            snprintf(url, sizeof(url), "%s", primary);
-        }
-
+    if (s_url_label != NULL) {
         if (strcmp(url, s_url_text) != 0) {
             strlcpy(s_url_text, url, sizeof(s_url_text));
             lv_label_set_text(s_url_label, s_url_text);
@@ -434,11 +1017,11 @@ static void refresh_info(void)
         }
     }
 
-    if (strcmp(text, s_info_text) == 0) {
-        return;
-    }
-    strlcpy(s_info_text, text, sizeof(s_info_text));
-    lv_label_set_text(s_info_label, s_info_text);
+    /* The address is the one value that does not fit into a two column cell. */
+    label_set_cached(s_info_value[7], s_info_cache[7], sizeof(s_info_cache[7]), url);
+
+    refresh_ai_card();
+    refresh_word_card();
 }
 
 /* ------------------------------------------------------------------------ */
@@ -451,7 +1034,7 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- Display ---- */
     lv_obj_t *display = NULL;
-    if (ui_card_create(parent, "显示与待机", &display) == NULL) {
+    if (add_card(parent, "显示与待机", &display) == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -492,9 +1075,85 @@ static esp_err_t settings_create(lv_obj_t *parent)
         s_slider_count++;
     }
 
+    /* ---- AI ---- */
+    lv_obj_t *ai_body = NULL;
+    if (add_card(parent, "AI 对话", &ai_body) == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* API key state.  The key itself is never shown - requirement 8.8. */
+    lv_obj_t *key_row = add_row(ai_body);
+    lv_obj_t *key_name = lv_label_create(key_row);
+    lv_label_set_text(key_name, "API Key");
+    lv_obj_set_style_text_font(key_name, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(key_name, UI_COLOR_TEXT, 0);
+
+    s_ai_key_label = lv_label_create(key_row);
+    lv_obj_set_flex_grow(s_ai_key_label, 1);
+    lv_obj_set_style_text_align(s_ai_key_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(s_ai_key_label, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(s_ai_key_label, UI_COLOR_WARNING, 0);
+
+    /* This board has no keyboard, so a missing key can only be filled in from
+     * the web console. */
+    s_ai_hint_label = lv_label_create(ai_body);
+    lv_obj_set_width(s_ai_hint_label, LV_PCT(100));
+    lv_label_set_long_mode(s_ai_hint_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(s_ai_hint_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_ai_hint_label, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_ai_hint_label, "本机没有键盘，请在网页端配置");
+
+    /* Model selection. */
+    lv_obj_t *model_row = add_row(ai_body);
+    for (int i = 0; i < 2; i++) {
+        s_ai_model_btn[i] = add_button(model_row, s_ai_models[i], ai_model_clicked_cb,
+                                       s_ai_models[i], UI_COLOR_SURFACE_ALT);
+    }
+
+    /* Only shown when the configured model is neither of the two known ones. */
+    s_ai_model_label = lv_label_create(ai_body);
+    lv_obj_set_width(s_ai_model_label, LV_PCT(100));
+    lv_obj_set_style_text_font(s_ai_model_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_ai_model_label, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_add_flag(s_ai_model_label, LV_OBJ_FLAG_HIDDEN);
+
+    /* Retained rounds. */
+    lv_obj_t *rounds_row = add_row(ai_body);
+    lv_obj_t *rounds_name = lv_label_create(rounds_row);
+    lv_label_set_text(rounds_name, "保留轮数");
+    lv_obj_set_style_text_font(rounds_name, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(rounds_name, UI_COLOR_TEXT, 0);
+
+    /* The two steppers are narrow: the value in between grows instead. */
+    lv_obj_t *minus = add_button(rounds_row, "-", ai_rounds_clicked_cb,
+                                 (void *)(intptr_t)-1, UI_COLOR_SURFACE_ALT);
+    lv_obj_set_flex_grow(minus, 0);
+    lv_obj_set_width(minus, 56);
+
+    s_ai_rounds_label = lv_label_create(rounds_row);
+    lv_obj_set_flex_grow(s_ai_rounds_label, 1);
+    lv_obj_set_style_text_align(s_ai_rounds_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_ai_rounds_label, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(s_ai_rounds_label, UI_COLOR_PRIMARY, 0);
+
+    lv_obj_t *plus = add_button(rounds_row, "+", ai_rounds_clicked_cb,
+                                (void *)(intptr_t)1, UI_COLOR_SURFACE_ALT);
+    lv_obj_set_flex_grow(plus, 0);
+    lv_obj_set_width(plus, 56);
+
+    /* System prompt: read only, one sentence. */
+    s_ai_prompt_label = lv_label_create(ai_body);
+    lv_obj_set_width(s_ai_prompt_label, LV_PCT(100));
+    lv_label_set_long_mode(s_ai_prompt_label, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(s_ai_prompt_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_ai_prompt_label, UI_COLOR_TEXT_MUTED, 0);
+
+    lv_obj_t *ai_row = add_row(ai_body);
+    add_button(ai_row, "清空对话", ai_clear_clicked_cb, NULL, UI_COLOR_DANGER);
+
     /* ---- Time ---- */
     lv_obj_t *time_card = NULL;
-    if (ui_card_create(parent, "时间与时区", &time_card) == NULL) {
+    if (add_card(parent, "时间与时区", &time_card) == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -508,19 +1167,50 @@ static esp_err_t settings_create(lv_obj_t *parent)
     add_button(time_row, "NTP 校时", sync_ntp_cb, NULL, UI_COLOR_PRIMARY);
     add_button(time_row, "当前城市", city_clicked_cb, NULL, UI_COLOR_SURFACE_ALT);
 
+    /* Read only status line: which timezone is active and whether the clock
+     * has ever been synchronised. */
+    s_tz_state_label = lv_label_create(time_card);
+    lv_obj_set_width(s_tz_state_label, LV_PCT(100));
+    lv_obj_set_style_text_font(s_tz_state_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_tz_state_label, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_tz_state_label, "CST-8 · 未同步");
+
     /* ---- Words ---- */
     lv_obj_t *word_card = NULL;
-    if (ui_card_create(parent, "单词", &word_card) == NULL) {
+    if (add_card(parent, "单词", &word_card) == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    lv_obj_t *word_info = add_row(word_card);
+    lv_obj_t *book_name = lv_label_create(word_info);
+    lv_label_set_text(book_name, "当前词书");
+    lv_obj_set_style_text_font(book_name, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(book_name, UI_COLOR_TEXT, 0);
+
+    s_word_book_label = lv_label_create(word_info);
+    lv_obj_set_flex_grow(s_word_book_label, 1);
+    lv_obj_set_style_text_align(s_word_book_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(s_word_book_label, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(s_word_book_label, UI_COLOR_PRIMARY, 0);
+
+    /* Cloud book switch: switching pulls a new queue, so it asks first. */
+    lv_obj_t *cloud_row = add_row(word_card);
+    s_word_cloud_btn = add_button(cloud_row, "云端词库：关", word_cloud_toggle_cb,
+                                  NULL, UI_COLOR_SURFACE_ALT);
+
     lv_obj_t *word_row = add_row(word_card);
     add_button(word_row, "每日 -5", word_count_down_cb, NULL, UI_COLOR_SURFACE_ALT);
     add_button(word_row, "每日 +5", word_count_up_cb, NULL, UI_COLOR_SURFACE_ALT);
     add_button(word_row, "清空进度", word_reset_cb, NULL, UI_COLOR_DANGER);
 
+    s_word_stats_label = lv_label_create(word_card);
+    lv_obj_set_width(s_word_stats_label, LV_PCT(100));
+    lv_obj_set_style_text_font(s_word_stats_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_word_stats_label, UI_COLOR_TEXT_MUTED, 0);
+
     /* ---- Security ---- */
     lv_obj_t *sec_card = NULL;
-    if (ui_card_create(parent, "局域网与安全", &sec_card) == NULL) {
+    if (add_card(parent, "局域网与安全", &sec_card) == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -548,15 +1238,20 @@ static esp_err_t settings_create(lv_obj_t *parent)
 
     /* ---- Info ---- */
     lv_obj_t *info_card = NULL;
-    if (ui_card_create(parent, "设备信息", &info_card) == NULL) {
+    if (add_card(parent, "设备信息", &info_card) == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
-    s_info_label = lv_label_create(info_card);
-    lv_obj_set_width(s_info_label, LV_PCT(100));
-    lv_label_set_long_mode(s_info_label, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_style_text_font(s_info_label, ui_font(UI_FONT_SMALL), 0);
-    lv_obj_set_style_text_color(s_info_label, UI_COLOR_TEXT_MUTED, 0);
+    /* Two column key/value grid: the key is muted, the value is readable.
+     * Eight rows at most, the address gets a row of its own. */
+    add_kv_row(info_card, "固件", 0);
+    add_kv_row(info_card, "IDF", 1);
+    add_kv_row(info_card, "IP", 2);
+    add_kv_row(info_card, "MAC", 3);
+    add_kv_row(info_card, "存储", 4);
+    add_kv_row(info_card, "时区", 5);
+    add_kv_row(info_card, "天气", 6);
+    add_kv_wide_row(info_card, "网页地址", 7);
 
     lv_obj_t *info_row = add_row(info_card);
     add_button(info_row, "重启设备", reboot_cb, NULL, UI_COLOR_DANGER);

@@ -6,14 +6,17 @@
 
 /**
  * @file page_calendar.c
- * @brief FR4: clock plus a month grid with previous/next month and the day's todos.
+ * @brief FR4: a clock header, a month grid with previous/next month and the day's todos.
  *
- * Layout (top to bottom): one compact clock line, the month row, the month grid,
- * an action bar, and a details panel for the selected day.
+ * Layout (top to bottom):
+ *   - header row: [返回][大时间 HH:MM / 小字日期][日历 · 星期 + 本月到期数][回到今天][校时]
+ *   - month row:  [上月] 2026 年 10 月 [下月]
+ *   - month grid: 7 columns, weekday header, one button per day, due dots
+ *   - detail panel: the selected day's title + up to 3 todo lines (always on screen)
  *
- * The board has no RTC, so before SNTP succeeds the clock area shows
- * UI_STATUS_TIME_UNSYNCED and the grid starts on a neutral month; that is the
- * honest behaviour required by FR4.
+ * The board has no RTC, so before SNTP succeeds the clock shows "--:--" with
+ * "时间未同步" underneath, no day is highlighted as today, and the grid starts on a
+ * neutral month; that is the honest behaviour required by FR4.
  *
  * Day cells are real buttons, not bare labels: todo_list() already carries a
  * `due_ts` per item, so a day that has work due is marked in the grid and tapping
@@ -34,15 +37,23 @@ static const char *TAG = "page_calendar";
 #define CAL_COLS 7
 /** Days of the grid that carry todo marks; only one month is ever on screen. */
 #define CAL_MAX_MARKS 32
+/** The detail panel lists at most this many lines (todo lines + the tail line). */
+#define CAL_DETAIL_MAX_LINES 3
+/** Hard upper bound for the detail panel; see the budget note below. */
+#define CAL_DETAIL_MAX_HEIGHT 96
+/** The big time while the wall clock has never been synchronised. */
+#define CAL_TIME_UNSYNCED "--:--"
 
-static lv_obj_t *s_clock;
+/* ---- header ------------------------------------------------------------- */
+static lv_obj_t *s_clock;          /**< big time, HH:MM */
+static lv_obj_t *s_mid_title;      /**< middle segment, line 1: 日历 · 星期X */
+static lv_obj_t *s_mid_sub;        /**< middle segment, line 2: 本月 N 项到期 */
 static lv_obj_t *s_month_title;
 static lv_obj_t *s_grid;
 static lv_obj_t *s_detail;          /**< selected-day panel (title + item list) */
 static lv_obj_t *s_detail_title;
 static lv_obj_t *s_detail_list;
-/** The action bar; hidden while the selected-day panel takes its place. */
-static lv_obj_t *s_action_bar;
+static lv_obj_t *s_detail_hint;     /**< shown when no day is selected */
 
 /**
  * Day cells.
@@ -65,20 +76,24 @@ static int s_selected_day;          /**< 0 = nothing selected */
 static bool s_have_date;
 
 /**
- * Last values painted into the clock label.
+ * Last values painted into the header.
  *
- * refresh_clock() runs every second (tick_period_ms = 1000) but only the seconds
- * field changes that often, so the label is rewritten only when a field it
- * actually shows differs. Without this the 1 Hz write invalidated the label and
+ * refresh_clock() runs every second (tick_period_ms = 1000) but the big time
+ * only shows minutes, so the labels are rewritten only when a field they
+ * actually show differs. Without this the 1 Hz write invalidated the labels and
  * re-laid-out the enclosing flex column every second (smoothness audit P1-8).
  */
-static bool s_clock_text_synced;
-static int s_last_sec = -1;
+static bool s_clock_valid;          /**< the header currently shows a real time */
 static int s_last_min = -1;
 static int s_last_hour = -1;
 static int s_last_mday = -1;
 static int s_last_mon = -1;
 static int s_last_year = -1;
+
+/** Number of unfinished todos due in the *current* month (header middle line). */
+static uint16_t s_month_due;
+static bool s_month_due_painted;
+static uint16_t s_painted_month_due;
 
 /** UTF-8 weekday names: one entry per column, indexed like tm_wday. */
 static const char *const s_week_names[] = { "日", "一", "二", "三", "四", "五", "六" };
@@ -91,19 +106,35 @@ static const char *const s_week_names[] = { "日", "一", "二", "三", "四", "
  *   - page padding top+bottom (14 x2)      28
  *   = usable                              412
  *
- * The page is a flex column, so anything that grows here steals from the grid:
+ * The page is a flex column; the four bands are separated by UI_PAGE_GAP (12):
  *
- *   header ~30 + clock 24 + month row 40 + bar 44 + 5 gaps (12) = 198
- *   => the grid gets ~214 px, i.e. ~30 px for each of its 7 rows, which clears
- *      the 16 px font's ~22 px line height with room for the due dot.
+ *   header row    ~80   big time (48 px font -> ~58 line box) + date line (~20)
+ *   month row      44   the two arrow buttons (UI_TOUCH_MIN)
+ *   grid          flex   weekday header (~20) + up to 6 week rows
+ *   detail panel  26..90 title (~20) + up to 3 todo lines (~20 each)
+ *   gaps       3 x 12 = 36
  *
- * The selected-day panel deliberately **replaces the action bar** (see
- * calendar_show_detail()) instead of stacking above it: with both visible the
- * grid would drop to ~17 px per row and the date rows collided - which is exactly
- * what happened on the first attempt at this feature.
+ * => grid = 412 - 80 - 44 - 36 - detail = 252 - detail
+ *
+ *   detail 26 (no day selected) -> grid 226 -> ~31 px per week row
+ *   detail 90 (3 todo lines)     -> grid 162 -> ~20 px per week row
+ *
+ * Two consequences, both deliberate:
+ *
+ *  1. The day numbers stay on UI_FONT_SMALL (16 px, ~20 px line box).  The 20 px
+ *     font needs a ~25 px line box, which the tightest state (a day with three
+ *     todos selected) cannot offer - the digits would touch the due dot.
+ *  2. The detail panel is LV_SIZE_CONTENT with an upper bound
+ *     (CAL_DETAIL_MAX_HEIGHT), never a fixed height that could push the grid
+ *     below the font height.  It also never shows more than
+ *     CAL_DETAIL_MAX_LINES lines; a longer day ends with "还有 N 条".
+ *
+ * What changed against v1.5.0: the clock used to be a 24 px high label holding
+ * **two** lines of 20 px text - the second line was always cropped - and the
+ * two action buttons lived in a 44 px bar at the bottom.  The clock is now the
+ * header row and the buttons moved into the header, so the bottom of the page
+ * belongs to the grid and to the (now always visible) detail panel.
  */
-#define CAL_DETAIL_HEIGHT 44
-#define CAL_CLOCK_HEIGHT  24
 
 /* Defined in the sections below; the day-selection callback needs them. */
 static void refresh_clock(void);
@@ -124,17 +155,41 @@ typedef struct {
 static cal_mark_t s_marks[CAL_MAX_MARKS];
 
 /**
- * Fill s_marks[] with the todo workload for the month on screen.
+ * Is this todo due on the given local date?
+ *
+ * `due_ts` is an epoch stamp, so it has to be converted to local time before it
+ * can be compared with a calendar cell - the grid shows local dates.
+ */
+static bool due_on_day(const todo_item_t *it, int year, int month, int day)
+{
+    if (it->due_ts <= 0) {
+        return false;
+    }
+    const time_t due = (time_t)it->due_ts;
+    struct tm tm_due;
+    if (localtime_r(&due, &tm_due) == NULL) {
+        return false;
+    }
+    return (tm_due.tm_year + 1900) == year && (tm_due.tm_mon + 1) == month &&
+           tm_due.tm_mday == day;
+}
+
+/**
+ * Fill s_marks[] with the todo workload for the month on screen and count the
+ * unfinished todos of the *current* month for the header.
  *
  * Only items with a real `due_ts` can be placed, and the clock must be synced -
  * before NTP the epoch is unknown, so every due date would land in 1970 and the
  * grid would be nonsense. The caller checks `s_have_date` first.
  *
  * The month is matched in **local** time, because that is what the grid shows.
+ * The header counter always refers to the real current month, so it stays
+ * meaningful while the user browses through other months.
  */
 static void collect_marks(void)
 {
     memset(s_marks, 0, sizeof(s_marks));
+    s_month_due = 0;
 
     todo_item_t *items = NULL;
     size_t count = 0;
@@ -142,18 +197,36 @@ static void collect_marks(void)
         return;
     }
 
+    /* The real current month, for the header counter. */
+    struct tm now = { 0 };
+    const bool have_now = s_have_date && calendar_get_now(&now) == ESP_OK;
+    const int now_year = have_now ? (now.tm_year + 1900) : 0;
+    const int now_month = have_now ? (now.tm_mon + 1) : 0;
+
     for (size_t i = 0; i < count; i++) {
         const todo_item_t *it = &items[i];
         if (it->due_ts <= 0) {
             continue;
         }
 
+        /* The day a recurring item lands on is not modelled here; one entry per
+         * item, counted once. */
         const time_t due = (time_t)it->due_ts;
         struct tm tm_due;
         if (localtime_r(&due, &tm_due) == NULL) {
             continue;
         }
-        if ((tm_due.tm_year + 1900) != s_year || (tm_due.tm_mon + 1) != s_month) {
+        const int year = tm_due.tm_year + 1900;
+        const int month = tm_due.tm_mon + 1;
+
+        /* The header counter always refers to the real current month, so it
+         * stays meaningful while the user browses through other months. */
+        if (have_now && !it->done && year == now_year && month == now_month) {
+            s_month_due++;
+        }
+
+        /* The dots belong to the month on screen. */
+        if (year != s_year || month != s_month) {
             continue;
         }
         const int day = tm_due.tm_mday;
@@ -161,8 +234,6 @@ static void collect_marks(void)
             continue;
         }
 
-        /* The day a recurring item lands on is not modelled here; one entry per
-         * item, counted once. */
         if (it->done) {
             s_marks[day - 1].done++;
         } else {
@@ -171,6 +242,30 @@ static void collect_marks(void)
     }
 
     todo_free_list(items);
+}
+
+/**
+ * Paint the header's "本月 N 项到期" line.
+ *
+ * Written only when the number changed: this runs on every grid repaint and the
+ * label is not fixed width, so re-setting identical text still invalidates it.
+ */
+static void paint_month_count(void)
+{
+    if (s_mid_sub == NULL) {
+        return;
+    }
+    if (s_month_due_painted && s_month_due == s_painted_month_due) {
+        return;
+    }
+    s_month_due_painted = true;
+    s_painted_month_due = s_month_due;
+
+    if (s_month_due == 0) {
+        lv_label_set_text(s_mid_sub, "本月没有到期");
+    } else {
+        lv_label_set_text_fmt(s_mid_sub, "本月 %u 项到期", (unsigned)s_month_due);
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -187,6 +282,35 @@ static void day_clicked_cb(lv_event_t *e)
     s_selected_day = (s_selected_day == day) ? 0 : day;
     render_grid();
     render_detail();
+}
+
+/**
+ * @brief 按「这个月要占几周」生成网格的行轨道。
+ *
+ * LVGL 的 FR 轨道会把容器的剩余高度**平均分给所有 FR 行**——哪怕那一行里
+ * 一个格子都没有。原来的轨道表固定有 6 个 FR 行，于是只占 5 行的月份
+ * （大部分月份）白白浪费 1/6 的高度：真机实测（debug shell 的 widgets 树）
+ * 日期格子只有 30 px 高，正好是 225 px 网格除以 6 再减去表头与内边距。
+ *
+ * 改成按实际周行数生成：多出来的行用 LV_GRID_CONTENT（不占高度），
+ * 5 行的月份格子就有 37~45 px，6 行的月份也有 33~39 px。
+ *
+ * @param week_rows 这个月占的周行数（5 或 6；0 = 还没算出来时按 6 行留位）。
+ * @return 轨道数组（调用方传给 lv_obj_set_grid_dsc_array，LVGL 会复制）。
+ */
+static const int32_t *cal_grid_rows(int week_rows)
+{
+    if (week_rows < 1 || week_rows > 6) {
+        week_rows = 6;
+    }
+    /* 0 = 星期表头，1..week_rows = 各周，剩下的行不占高度。 */
+    static int32_t rows[8];
+    rows[0] = LV_GRID_CONTENT;
+    for (int i = 0; i < 6; i++) {
+        rows[1 + i] = (i < week_rows) ? LV_GRID_FR(1) : LV_GRID_CONTENT;
+    }
+    rows[7] = LV_GRID_TEMPLATE_LAST;
+    return rows;
 }
 
 static void render_grid(void)
@@ -211,7 +335,7 @@ static void render_grid(void)
 
     /* Highlight today only when the year/month match what is on screen. */
     int today = -1;
-    struct tm now;
+    struct tm now = { 0 };
     if (s_have_date && calendar_get_now(&now) == ESP_OK &&
         (now.tm_year + 1900) == s_year && (now.tm_mon + 1) == s_month) {
         today = now.tm_mday;
@@ -224,11 +348,23 @@ static void render_grid(void)
 
     if (s_have_date) {
         collect_marks();
+        paint_month_count();
     } else {
         memset(s_marks, 0, sizeof(s_marks));
     }
 
     const int first_wday = (count > 0) ? days[0].tm_wday : 0;
+    /*
+     * 这个月要占几周 = 首日星期 + 天数，向上取整到整周。
+     * 轨道按它重算，空出来的那一行就不再白吃高度（见 cal_grid_rows 的注释）。
+     */
+    const int week_rows = (int)((first_wday + (int)count + CAL_COLS - 1) / CAL_COLS);
+    {
+        static const int32_t cols[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
+                                        LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
+                                        LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
+        lv_obj_set_grid_dsc_array(s_grid, cols, cal_grid_rows(week_rows));
+    }
     for (size_t i = 0; i < count; i++) {
         cal_cell_t *cell = &s_cells[i];
         if (cell->btn == NULL) {
@@ -292,31 +428,47 @@ static void render_grid(void)
 /* Selected-day detail                                                       */
 /* ------------------------------------------------------------------------ */
 
+/** One todo line in the detail panel: "· 标题" or "✓ 标题". */
+static void detail_row_create(lv_obj_t *parent, const todo_item_t *it)
+{
+    lv_obj_t *row = lv_label_create(parent);
+    if (row == NULL) {
+        return;
+    }
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_label_set_long_mode(row, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(row, ui_font(UI_FONT_SMALL), 0);
+    /* Mark completion with a leading check and a muted colour: LVGL has no
+     * text-decoration, same convention as the todo page. */
+    if (it->done) {
+        lv_label_set_text_fmt(row, "✓ %s", it->title);
+        lv_obj_set_style_text_color(row, UI_COLOR_TEXT_MUTED, 0);
+    } else {
+        lv_label_set_text_fmt(row, "· %s", it->title);
+        lv_obj_set_style_text_color(row, UI_COLOR_TEXT, 0);
+    }
+}
+
 /** Rebuild the panel under the grid for s_selected_day. */
 static void render_detail(void)
 {
-    if (s_detail == NULL || s_detail_title == NULL || s_detail_list == NULL) {
+    if (s_detail == NULL || s_detail_title == NULL || s_detail_list == NULL ||
+        s_detail_hint == NULL) {
         return;
     }
 
-    /*
-     * Exactly one of the panel / action bar is visible.
-     *
-     * They are the same height and live in the same flex position, so swapping
-     * them keeps the page height - and therefore the grid rows - constant whether
-     * or not a day is selected.
-     */
     if (s_selected_day < 1) {
-        lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
-        if (s_action_bar != NULL) {
-            lv_obj_remove_flag(s_action_bar, LV_OBJ_FLAG_HIDDEN);
-        }
+        /* Nothing selected: the panel keeps its place under the grid and only
+         * shows one hint line. */
+        lv_obj_add_flag(s_detail_title, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_detail_list, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
-    if (s_action_bar != NULL) {
-        lv_obj_add_flag(s_action_bar, LV_OBJ_FLAG_HIDDEN);
-    }
+
+    lv_obj_remove_flag(s_detail_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_detail_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_detail_list, LV_OBJ_FLAG_HIDDEN);
 
     /* Weekday of the selected date: mktime() resolves it without needing the
      * clock, because the date itself is known. */
@@ -331,10 +483,8 @@ static void render_detail(void)
         wd = s_week_names[sel.tm_wday];
     }
 
-    lv_label_set_text_fmt(s_detail_title, "%02d 月 %02d 日 · 星期%s", s_month, s_selected_day, wd);
-
     /* Rebuild the lines: a day holds a handful of items at most, so the churn is
-     * not worth an incremental scheme (and the panel is usually hidden). */
+     * not worth an incremental scheme. */
     lv_obj_clean(s_detail_list);
 
     todo_item_t *items = NULL;
@@ -343,44 +493,49 @@ static void render_detail(void)
         return;
     }
 
-    size_t shown = 0;
+    /* First pass: how many todos are due that day (the "共 N 项" in the title). */
+    size_t total = 0;
     for (size_t i = 0; i < count; i++) {
+        if (due_on_day(&items[i], s_year, s_month, s_selected_day)) {
+            total++;
+        }
+    }
+
+    /* Second pass: at most CAL_DETAIL_MAX_LINES lines. When the day holds more
+     * todos than that, the last line becomes the "还有 N 条" summary - a fourth
+     * line would push the panel past its budget and squeeze the grid. */
+    const size_t body = (total > CAL_DETAIL_MAX_LINES) ? (CAL_DETAIL_MAX_LINES - 1) : total;
+    size_t drawn = 0;
+    for (size_t i = 0; i < count && drawn < body; i++) {
         const todo_item_t *it = &items[i];
-        if (it->due_ts <= 0) {
+        if (!due_on_day(it, s_year, s_month, s_selected_day)) {
             continue;
         }
-        const time_t due = (time_t)it->due_ts;
-        struct tm tm_due;
-        if (localtime_r(&due, &tm_due) == NULL) {
-            continue;
-        }
-        if ((tm_due.tm_year + 1900) != s_year || (tm_due.tm_mon + 1) != s_month ||
-            tm_due.tm_mday != s_selected_day) {
-            continue;
-        }
-
-        lv_obj_t *row = lv_label_create(s_detail_list);
-        lv_obj_set_width(row, LV_PCT(100));
-        lv_label_set_long_mode(row, LV_LABEL_LONG_MODE_DOTS);
-        lv_obj_set_style_text_font(row, ui_font(UI_FONT_SMALL), 0);
-        /* Mark completion with a leading check and a muted colour: LVGL has no
-         * text-decoration, same convention as the todo page. */
-        if (it->done) {
-            lv_label_set_text_fmt(row, "✓ %s", it->title);
-            lv_obj_set_style_text_color(row, UI_COLOR_TEXT_MUTED, 0);
-        } else {
-            lv_label_set_text_fmt(row, "· %s", it->title);
-            lv_obj_set_style_text_color(row, UI_COLOR_TEXT, 0);
-        }
-        shown++;
+        detail_row_create(s_detail_list, it);
+        drawn++;
     }
 
-    if (shown == 0) {
+    if (total > body) {
+        lv_obj_t *more = lv_label_create(s_detail_list);
+        if (more != NULL) {
+            lv_obj_set_width(more, LV_PCT(100));
+            lv_label_set_long_mode(more, LV_LABEL_LONG_MODE_DOTS);
+            lv_obj_set_style_text_font(more, ui_font(UI_FONT_SMALL), 0);
+            lv_obj_set_style_text_color(more, UI_COLOR_TEXT_MUTED, 0);
+            lv_label_set_text_fmt(more, "还有 %u 条", (unsigned)(total - body));
+        }
+    } else if (total == 0) {
         lv_obj_t *empty = lv_label_create(s_detail_list);
-        lv_label_set_text(empty, "这一天没有到期待办");
-        lv_obj_set_style_text_font(empty, ui_font(UI_FONT_SMALL), 0);
-        lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
+        if (empty != NULL) {
+            lv_obj_set_width(empty, LV_PCT(100));
+            lv_label_set_text(empty, "这一天没有到期待办");
+            lv_obj_set_style_text_font(empty, ui_font(UI_FONT_SMALL), 0);
+            lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
+        }
     }
+
+    lv_label_set_text_fmt(s_detail_title, "%d 月 %d 日 · 星期%s · 共 %u 项",
+                           s_month, s_selected_day, wd, (unsigned)total);
 
     todo_free_list(items);
 }
@@ -468,17 +623,21 @@ static esp_err_t calendar_on_sync_result(int32_t event_id, void *data)
 
 static void refresh_clock(void)
 {
-    if (s_clock == NULL) {
+    if (s_clock == NULL || s_mid_title == NULL || s_mid_sub == NULL) {
         return;
     }
 
     const bool synced = calendar_time_synced();
     if (!synced) {
-        /* Requirement FR4: "时间未同步", never 1970. */
-        if (s_clock_text_synced) {
-            s_clock_text_synced = false;
-            lv_label_set_text(s_clock, UI_STATUS_TIME_UNSYNCED);
+        /* Requirement FR4: "--:--" and "时间未同步", never 1970. */
+        if (s_clock_valid) {
+            s_clock_valid = false;
+            lv_label_set_text(s_clock, CAL_TIME_UNSYNCED);
             lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT_MUTED, 0);
+            lv_label_set_text(s_mid_title, "日历");
+            lv_label_set_text(s_mid_sub, "未校时");
+            /* Force the counter to be written again when the clock comes back. */
+            s_month_due_painted = false;
         }
         if (s_have_date) {
             s_have_date = false;
@@ -487,33 +646,45 @@ static void refresh_clock(void)
         return;
     }
 
-    struct tm now;
+    struct tm now = { 0 };
     if (calendar_get_now(&now) != ESP_OK) {
         return;
     }
 
-    static const char *const weekdays[] = { "日", "一", "二", "三", "四", "五", "六" };
-    const char *wd = (now.tm_wday >= 0 && now.tm_wday < 7) ? weekdays[now.tm_wday] : "?";
+    const bool was_valid = s_clock_valid;
+    const bool time_changed = (now.tm_hour != s_last_hour) || (now.tm_min != s_last_min);
+    const bool date_changed = (now.tm_mday != s_last_mday) || (now.tm_mon != s_last_mon) ||
+                              (now.tm_year != s_last_year);
 
-    /* Only repaint when a *displayed* field changed. The label is not fixed
-     * width, so re-setting identical text still invalidates it and makes the
+    /* Only repaint when a *displayed* field changed. The labels are not fixed
+     * width, so re-setting identical text still invalidates them and makes the
      * enclosing flex column re-layout - and this runs at 1 Hz (audit P1-8). */
-    if (!s_clock_text_synced || now.tm_sec != s_last_sec || now.tm_min != s_last_min ||
-        now.tm_hour != s_last_hour || now.tm_mday != s_last_mday ||
-        now.tm_mon != s_last_mon || now.tm_year != s_last_year) {
-        lv_label_set_text_fmt(s_clock, "%02d:%02d:%02d\n%04d-%02d-%02d 星期%s",
-                              now.tm_hour, now.tm_min, now.tm_sec,
-                              now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, wd);
-        s_last_sec = now.tm_sec;
-        s_last_min = now.tm_min;
+    if (!was_valid || time_changed) {
+        lv_label_set_text_fmt(s_clock, "%02d:%02d", now.tm_hour, now.tm_min);
         s_last_hour = now.tm_hour;
+        s_last_min = now.tm_min;
+        if (!was_valid) {
+            lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT, 0);
+        }
+    }
+
+    if (!was_valid || date_changed) {
+        const char *wd = (now.tm_wday >= 0 && now.tm_wday < 7) ? s_week_names[now.tm_wday] : "?";
+        /*
+         * 日期与星期都放在中列，而不是压在大时钟下面：
+         * 真机实测（debug shell 的 widgets 树）时钟下面那一行日期占 19 px，
+         * 而网格的日期格子只有 30 px 高——那 19 px 直接从日期格子上扣。
+         * 中列有 391 px 宽，放得下。
+         */
+        lv_label_set_text_fmt(s_mid_title, "日历 · %d 月 %d 日 星期%s",
+                              now.tm_mon + 1, now.tm_mday, wd);
         s_last_mday = now.tm_mday;
         s_last_mon = now.tm_mon;
         s_last_year = now.tm_year;
-        if (!s_clock_text_synced) {
-            s_clock_text_synced = true;
-            lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT, 0);
-        }
+    }
+
+    if (!s_clock_valid) {
+        s_clock_valid = true;
     }
 
     /* Adopt the real month the first time the clock becomes valid. */
@@ -522,34 +693,143 @@ static void refresh_clock(void)
         s_year = now.tm_year + 1900;
         s_month = now.tm_mon + 1;
         render_grid();
+    } else if (date_changed) {
+        /* Midnight: today's highlight and the month counter have to follow. This
+         * happens once a day, not on the 1 Hz path. */
+        render_grid();
     }
 }
 
 /* ------------------------------------------------------------------------ */
 /* Page                                                                      */
 /* ------------------------------------------------------------------------ */
+
+/** A header button: UI_TOUCH_MIN high, width following the text. */
+static lv_obj_t *header_button_create(lv_obj_t *parent, const char *text,
+                                      lv_color_t bg, lv_color_t fg, lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    if (btn == NULL) {
+        return NULL;
+    }
+    lv_obj_set_height(btn, UI_TOUCH_MIN);
+    lv_obj_set_width(btn, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(btn, bg, 0);
+    lv_obj_set_style_radius(btn, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_pad_hor(btn, 12, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(label, fg, 0);
+    lv_obj_center(label);
+
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    return btn;
+}
+
 static esp_err_t calendar_create(lv_obj_t *parent)
 {
-    (void)page_header_create(parent, "日历");
-
     /*
-     * Clock: ONE line.
+     * Header: ONE row with three segments.
      *
-     * It used to be a card of its own holding two lines of 28 px text, sitting
-     * directly above a month row that repeated the year and month - three bands of
-     * the 480 px panel spent on the same information, which squeezed the grid and
-     * left no room for anything else.
+     * left  = big time HH:MM (UI_FONT_HUGE) with the date underneath
+     * middle = page name + weekday, and the number of todos due this month
+     * right = the two action buttons (they used to live in a bar at the bottom)
+     *
+     * The clock used to be a 24 px high label holding two lines of 20 px text -
+     * the second line was cropped away. It is a flex row now, so nothing is
+     * cropped: each label takes the height it needs.
      */
-    s_clock = lv_label_create(parent);
-    lv_obj_set_width(s_clock, LV_PCT(100));
-    /* Fixed one-line height: the label must not be able to grow and squeeze the
-     * grid below it (see the budget note at the top of this file). */
-    lv_obj_set_height(s_clock, CAL_CLOCK_HEIGHT);
-    lv_obj_set_style_text_align(s_clock, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_clock, ui_font(UI_FONT_BODY), 0);
-    lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT, 0);
-    lv_label_set_text(s_clock, UI_STATUS_TIME_UNSYNCED);
+    lv_obj_t *header = lv_obj_create(parent);
+    if (header == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_remove_style_all(header);
+    lv_obj_set_width(header, LV_PCT(100));
+    lv_obj_set_height(header, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* The calendar is pushed onto the stack from the home page, so it needs a
+     * way back. It fits into the header row without costing extra height. */
+    (void)page_back_button_create(header);
+
+    /* --- left segment: big time over a small date --- */
+    lv_obj_t *clock_col = lv_obj_create(header);
+    if (clock_col == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_remove_style_all(clock_col);
+    lv_obj_set_width(clock_col, LV_SIZE_CONTENT);
+    lv_obj_set_height(clock_col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(clock_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(clock_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_remove_flag(clock_col, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_clock = lv_label_create(clock_col);
+    if (s_clock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_set_style_text_font(s_clock, ui_font(UI_FONT_HUGE), 0);
+    lv_obj_set_style_text_color(s_clock, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_clock, CAL_TIME_UNSYNCED);
+
+    /* --- middle segment: page name + weekday, and the month counter --- */
+    lv_obj_t *mid_col = lv_obj_create(header);
+    if (mid_col == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_remove_style_all(mid_col);
+    lv_obj_set_width(mid_col, LV_SIZE_CONTENT);
+    lv_obj_set_height(mid_col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(mid_col, 1);
+    lv_obj_set_flex_flow(mid_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(mid_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_remove_flag(mid_col, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_mid_title = lv_label_create(mid_col);
+    if (s_mid_title == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_set_style_text_font(s_mid_title, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_mid_title, UI_COLOR_TEXT, 0);
+    lv_label_set_text(s_mid_title, "日历");
+
+    s_mid_sub = lv_label_create(mid_col);
+    if (s_mid_sub == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_set_style_text_font(s_mid_sub, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_mid_sub, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_mid_sub, "未校时");
+
+    /* --- right segment: the two action buttons --- */
+    lv_obj_t *actions = lv_obj_create(header);
+    if (actions == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    lv_obj_remove_style_all(actions);
+    lv_obj_set_width(actions, LV_SIZE_CONTENT);
+    lv_obj_set_height(actions, UI_TOUCH_MIN);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(actions, 8, 0);
+    lv_obj_remove_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    (void)header_button_create(actions, "回到今天", UI_COLOR_SURFACE_ALT, UI_COLOR_TEXT,
+                               today_clicked_cb);
+    (void)header_button_create(actions, "校时", UI_COLOR_PRIMARY, UI_COLOR_ON_PRIMARY,
+                               refresh_clicked_cb);
+
+    /* --- month row --- */
     lv_obj_t *month_row = lv_obj_create(parent);
     lv_obj_remove_style_all(month_row);
     lv_obj_set_width(month_row, LV_PCT(100));
@@ -567,13 +847,16 @@ static esp_err_t calendar_create(lv_obj_t *parent)
 
     for (size_t i = 0; i < sizeof(nav) / sizeof(nav[0]); i++) {
         lv_obj_t *btn = lv_button_create(month_row);
-        lv_obj_set_size(btn, 64, 40);
+        /* 44 px high: the arrows are touch targets too and have to reach
+         * UI_TOUCH_MIN (requirement 10.3). */
+        lv_obj_set_size(btn, 64, UI_TOUCH_MIN);
         lv_obj_set_style_bg_color(btn, UI_COLOR_SURFACE_ALT, 0);
         lv_obj_t *label = lv_label_create(btn);
         lv_label_set_text(label, nav[i].text);
-        /* BODY font, matching the action bar below: these used to be the only
-         * buttons on the page still on the default font. */
+        /* BODY font, matching the other buttons on the page: these used to be the
+         * only buttons still on the default font. */
         lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
+        lv_obj_set_style_text_color(label, UI_COLOR_TEXT, 0);
         lv_obj_center(label);
         lv_obj_add_event_cb(btn, nav[i].cb, LV_EVENT_CLICKED, NULL);
 
@@ -607,10 +890,7 @@ static esp_err_t calendar_create(lv_obj_t *parent)
     static const int32_t cols[] = { LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
                                     LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
                                     LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
-    static const int32_t rows[] = { LV_GRID_CONTENT, LV_GRID_FR(1), LV_GRID_FR(1),
-                                    LV_GRID_FR(1), LV_GRID_FR(1), LV_GRID_FR(1),
-                                    LV_GRID_FR(1), LV_GRID_TEMPLATE_LAST };
-    lv_obj_set_grid_dsc_array(s_grid, cols, rows);
+    lv_obj_set_grid_dsc_array(s_grid, cols, cal_grid_rows(0));
 
     for (int i = 0; i < CAL_COLS; i++) {
         lv_obj_t *head = lv_label_create(s_grid);
@@ -648,10 +928,10 @@ static esp_err_t calendar_create(lv_obj_t *parent)
 
         lv_obj_t *label = lv_label_create(btn);
         cell->label = label;
-        /* UI_FONT_SMALL, not UI_FONT_BODY: seven rows share the grid height, which
-         * on a 480 px panel is roughly 22 px each. A 20 px font needs ~26 px of
-         * line height, so digits overflowed and adjacent date rows collided
-         * (reported from the device). 16 px fits with room to spare. */
+        /* UI_FONT_SMALL, not UI_FONT_BODY: the six week rows share the grid
+         * height, and in the tightest layout (a day with three todos selected)
+         * a row is only ~20 px high - the ~25 px line box of the 20 px font would
+         * make the digits touch the due dot. 16 px fits. */
         lv_obj_set_style_text_font(label, ui_font(UI_FONT_SMALL), 0);
         lv_obj_set_style_text_color(label, UI_COLOR_TEXT, 0);
         lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 0);
@@ -669,86 +949,65 @@ static esp_err_t calendar_create(lv_obj_t *parent)
     }
 
     /*
-     * Bottom of the page: the selected-day panel and the action bar.
+     * Bottom of the page: the panel with the selected day's todos.
      *
-     * They are **siblings with a fixed height each**, and render_detail() makes
-     * exactly one of them visible. They must not be wrapped in a shared
-     * fixed-height container with flex_grow on both: grow() only distributes
-     * *free* space, so two growing children of a 44 px box simply split those
-     * 44 px and pushed the panel's own content out of it, which is what squeezed
-     * the layout the moment a day was tapped.
-     *
-     * As siblings in the page column, hiding one makes the other take its place
-     * and the grid above keeps its ~30 px rows either way.
+     * It is always on screen (no more swapping with an action bar) and it is
+     * sized by its content, with an upper bound, so it can never squeeze the
+     * grid below the height the date numbers need - see the budget note at the
+     * top of this file.
      */
-    const int32_t slot_h = UI_TOUCH_MIN;
-
-    /* --- selected-day panel (hidden until a date is tapped) --- */
     s_detail = lv_obj_create(parent);
     if (s_detail == NULL) {
         return ESP_ERR_NO_MEM;
     }
     lv_obj_remove_style_all(s_detail);
     lv_obj_set_width(s_detail, LV_PCT(100));
-    lv_obj_set_height(s_detail, slot_h);
+    lv_obj_set_height(s_detail, LV_SIZE_CONTENT);
+    /* Upper bound: a day with a lot of todos must not eat the grid. */
+    lv_obj_set_style_max_height(s_detail, CAL_DETAIL_MAX_HEIGHT, 0);
     lv_obj_set_flex_flow(s_detail, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_bg_color(s_detail, UI_COLOR_SURFACE, 0);
     lv_obj_set_style_bg_opa(s_detail, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_detail, UI_CARD_RADIUS, 0);
     lv_obj_set_style_pad_hor(s_detail, 10, 0);
     lv_obj_set_style_pad_ver(s_detail, 3, 0);
-    lv_obj_set_style_pad_row(s_detail, 1, 0);
+    lv_obj_set_style_pad_row(s_detail, 2, 0);
     lv_obj_remove_flag(s_detail, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_detail, LV_OBJ_FLAG_HIDDEN);
 
     s_detail_title = lv_label_create(s_detail);
+    if (s_detail_title == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     lv_obj_set_width(s_detail_title, LV_PCT(100));
     lv_label_set_long_mode(s_detail_title, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_font(s_detail_title, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_detail_title, UI_COLOR_PRIMARY, 0);
     lv_label_set_text(s_detail_title, "");
+    lv_obj_add_flag(s_detail_title, LV_OBJ_FLAG_HIDDEN);
 
-    /* The items scroll horizontally on one line, so the panel never needs to grow
-     * taller than the action bar it replaces. */
+    /* The todo lines, one per row. */
     s_detail_list = lv_obj_create(s_detail);
+    if (s_detail_list == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     lv_obj_remove_style_all(s_detail_list);
     lv_obj_set_width(s_detail_list, LV_PCT(100));
-    lv_obj_set_flex_grow(s_detail_list, 1);
-    lv_obj_set_flex_flow(s_detail_list, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(s_detail_list, 10, 0);
-    lv_obj_set_scroll_dir(s_detail_list, LV_DIR_HOR);
-    lv_obj_add_flag(s_detail_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_height(s_detail_list, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_detail_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_detail_list, 1, 0);
+    lv_obj_remove_flag(s_detail_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_detail_list, LV_OBJ_FLAG_HIDDEN);
 
-    /* --- action bar --- */
-    lv_obj_t *bar = lv_obj_create(parent);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_width(bar, LV_PCT(100));
-    lv_obj_set_height(bar, slot_h);
-    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(bar, 10, 0);
-    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    s_action_bar = bar;
-
-    const struct {
-        const char *text;
-        lv_event_cb_t cb;
-        lv_color_t color;
-    } buttons[] = {
-        { "回到今天", today_clicked_cb, UI_COLOR_SURFACE_ALT },
-        { "NTP 校时", refresh_clicked_cb, UI_COLOR_PRIMARY },
-    };
-
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        lv_obj_t *btn = lv_button_create(bar);
-        lv_obj_set_height(btn, UI_TOUCH_MIN);
-        lv_obj_set_flex_grow(btn, 1);
-        lv_obj_set_style_bg_color(btn, buttons[i].color, 0);
-        lv_obj_t *label = lv_label_create(btn);
-        lv_label_set_text(label, buttons[i].text);
-        lv_obj_set_style_text_font(label, ui_font(UI_FONT_BODY), 0);
-        lv_obj_center(label);
-        lv_obj_add_event_cb(btn, buttons[i].cb, LV_EVENT_CLICKED, NULL);
+    /* Shown while no day is selected. */
+    s_detail_hint = lv_label_create(s_detail);
+    if (s_detail_hint == NULL) {
+        return ESP_ERR_NO_MEM;
     }
+    lv_obj_set_width(s_detail_hint, LV_PCT(100));
+    lv_label_set_long_mode(s_detail_hint, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(s_detail_hint, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_detail_hint, UI_COLOR_TEXT_MUTED, 0);
+    lv_label_set_text(s_detail_hint, "点日期看当天待办");
 
     (void)ui_event_bind(CALENDAR_EVENT, CALENDAR_EVENT_TIME_SYNCED, UI_PAGE_CALENDAR, 0);
     (void)ui_event_bind(CALENDAR_EVENT, CALENDAR_EVENT_TIMEZONE_CHANGED, UI_PAGE_CALENDAR, 0);

@@ -940,6 +940,14 @@ esp_err_t ai_service_set_system_prompt(const char *prompt)
     return err;
 }
 
+const char *ai_service_get_system_prompt(void)
+{
+    /* 返回的是内部缓冲，不是副本：网页端随时可能改写提示词，调用方需要留
+     * 住内容就自己复制一份。这里不取锁 —— 读的是一个固定地址的字符串，
+     * 最多看到改写中的一瞬间，而复制同样躲不掉这个窗口。 */
+    return s_system_prompt;
+}
+
 const char *ai_service_get_model(void)
 {
     return s_model;

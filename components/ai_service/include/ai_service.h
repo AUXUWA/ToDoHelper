@@ -79,6 +79,18 @@ bool ai_service_has_api_key(void);
 /** @brief Set and persist the system prompt (role definition). */
 esp_err_t ai_service_set_system_prompt(const char *prompt);
 
+/**
+ * @brief Current system prompt (the role definition).
+ *
+ * The settings page shows a one sentence summary of it, so it needs a way to
+ * read the prompt back.
+ *
+ * @return The internal buffer. It is **not** a copy: the prompt can be
+ *         changed from the web console at any time, so copy it if you need to
+ *         keep it around. Never NULL (an empty prompt yields an empty string).
+ */
+const char *ai_service_get_system_prompt(void);
+
 /** @brief Selected model, "deepseek-chat" or "deepseek-reasoner". */
 const char *ai_service_get_model(void);
 

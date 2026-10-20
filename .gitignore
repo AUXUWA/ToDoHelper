@@ -53,3 +53,8 @@ build_last.log
 
 # Git-Bash 构建时 Windows 重定向产生的空壳文件
 nul
+
+# Windows 临时文件（某些命令的输出重定向残留）
+%TEMP%cmd.txt
+cal_review.diff
+%TEMP%*.diff
