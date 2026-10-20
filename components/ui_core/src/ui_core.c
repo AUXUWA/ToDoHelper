@@ -22,7 +22,18 @@ static const char *TAG = "ui_core";
 #define UI_NAV_STACK_MAX      8
 #define UI_MAX_BINDINGS       40
 #define UI_MAX_EVENT_BASES    8
-#define UI_EVENT_PAYLOAD_MAX  256
+/**
+ * The biggest event payload.
+ *
+ * It has to be at least as big as the biggest binding declares, otherwise the
+ * payload gets cut in the middle (and the UI shows a truncated answer): the
+ * AI's streamed chunks declare AI_MESSAGE_MAX (1024) and the recognised speech
+ * declares VOICE_TEXT_MAX (512).
+ *
+ * The memory is not a fixed pool: every event is malloc'd with its payload
+ * (see ui_post_event), so a big cap only costs what is actually published.
+ */
+#define UI_EVENT_PAYLOAD_MAX  1024
 /** Repaint triggers remembered per page while the page is not on display. */
 #define UI_DEFERRED_MAX       4
 
@@ -280,7 +291,7 @@ static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t han
     /*
      * 载荷后面补一个结尾的 '\0'。
      *
-     * 载荷会被截到 UI_EVENT_PAYLOAD_MAX（256），而**绑定声明的大小**是事件类型
+     * 载荷会被截到 UI_EVENT_PAYLOAD_MAX，而**绑定声明的大小**是事件类型
      * 自己定的（AI 对话的流式文本声明的是 AI_MESSAGE_MAX = 1024）。
      * 处理器拿到的只是指针，它若按 C 字符串处理（strlen），
      * 遇到「正好被截断、没有结尾 0」的载荷就会**越过载荷读堆** ——

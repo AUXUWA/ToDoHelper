@@ -5,13 +5,16 @@
 
 ## 1. 资源评估（真机数据，不是估算）
 
-| 资源 | 现状 | 结论 |
+| 资源 | 现状（可复核的来源） | 结论 |
 |---|---|---|
-| Flash | app 3.1 MB / 分区 8 MB（还剩 4.8 MB） | **够**。语音全部走云端，本地没有模型，不占 flash |
-| PSRAM | 空闲 9.8 MB | **够**。录音 10 s = 320 KB，TTS 一句话 ≈ 30 KB |
-| 内部堆 | 空闲 188 KB，最大连续块 100 KB | **够**。音频外设起来只花 ~13 KB，最大连续块不变 |
+| Flash | `build/todohelper.bin` 3.1 MB / app 分区 8 MB（`build/partition_table/partition-table.bin`） | **够**。语音全走云端，本地没有模型，不占 flash |
+| PSRAM | `heap` 命令报 psram free ≈ 9.8 MB | **够**。录音 10 s = 320 KB（PSRAM），TTS 一句话 ≈ 30 KB |
+| 内部堆 | `heap` 命令报 free ≈ 183 KB、largest ≈ 100 KB | **够**。音频外设起来约 13 KB（free 183 → 170 KB），最大连续块不变 |
 | CPU | 240 MHz | **够**。识别/合成都走云端，本机只做录音与播放 |
 | 网络 | HTTPS 正常（天气/墨墨都在用） | **够** |
+
+（数字都可以用 `debug/exec` 的 `heap` 命令当场复核；仓库里不留串口日志，
+所以文档里只写能自己复算的数。）
 
 **结论：资源够，开工。**
 
