@@ -228,24 +228,33 @@ static void bubbles_clear(void)
  *     再贴一次就重了（ui_core 会把隐藏期间收到的事件在页面回来时重放一遍）；
  *   - 流式输出结束后，历史里也已经有这条回答了，重建时不能再补一个气泡。
  */
-static bool tail_shows_text(const char *text)
+static bool shows_text(const char *text)
 {
     if (s_scroll == NULL || text == NULL) {
         return false;
     }
+    /*
+     * **每个**气泡都查一遍，不是只看最后一个。
+     *
+     * 回答贴上去之后历史还可能变长（比如这一页隐藏着的时候，
+     * 用户从网页端又问了一轮），这时最后一个气泡已经不是那条回答了 ——
+     * 只看尾巴就会把同一条回答**再贴一个气泡**。
+     */
     const uint32_t count = lv_obj_get_child_count(s_scroll);
-    if (count == 0u) {
-        return false;
+    for (uint32_t i = 0; i < count; i++) {
+        lv_obj_t *bubble = lv_obj_get_child(s_scroll, i);
+        if (bubble == NULL) {
+            continue;
+        }
+        lv_obj_t *label = lv_obj_get_child(bubble, 0);
+        if (label == NULL) {
+            continue;
+        }
+        if (strcmp(lv_label_get_text(label), text) == 0) {
+            return true;
+        }
     }
-    lv_obj_t *last = lv_obj_get_child(s_scroll, count - 1u);
-    if (last == NULL) {
-        return false;
-    }
-    lv_obj_t *label = lv_obj_get_child(last, 0);
-    if (label == NULL) {
-        return false;
-    }
-    return strcmp(lv_label_get_text(label), text) == 0;
+    return false;
 }
 
 /**
@@ -281,6 +290,8 @@ static void bubbles_build(void)
 
     /* 对话历史：system 那条不显示。 */
     bool pending_found = false;
+    char last_user[AI_MESSAGE_MAX];
+    last_user[0] = '\0';
     const size_t count = ai_service_history_count();
     for (size_t i = 0; i < count; i++) {
         ai_message_t msg;
@@ -291,15 +302,26 @@ static void bubbles_build(void)
             continue;
         }
         const bool from_user = (strcmp(msg.role, "user") == 0);
-        if (from_user && s_pending_user[0] != '\0' &&
-            strcmp(msg.content, s_pending_user) == 0) {
-            pending_found = true;
+        if (from_user) {
+            /*
+             * 只记住**最新的一条**用户提问。
+             *
+             * 以前是拿内容去比历史里的每一条：用户问过两次同一句话时，
+             * 会先匹配到**旧**的那条 → 认为「这条提问已经在历史里了」→
+             * 把待补的提问清掉 → 而**新**输入的这条还没进历史 →
+             * 重建之后这条提问根本没有气泡（用户离开再回来，
+             * 自己刚发的问题就消失了）。
+             */
+            strlcpy(last_user, msg.content, sizeof(last_user));
         }
         add_bubble(msg.content, from_user);
     }
 
     /* 设备上刚输入的那条提问还没进历史（离线，或者请求刚发出去）：
      * 补在最后，跟它当时出现在屏幕上的位置一样。 */
+    if (s_pending_user[0] != '\0' && strcmp(last_user, s_pending_user) == 0) {
+        pending_found = true;
+    }
     if (pending_found) {
         s_pending_user[0] = '\0';
     } else if (s_pending_user[0] != '\0') {
@@ -308,7 +330,7 @@ static void bubbles_build(void)
 
     /* 正在流式输出的那段：控件被销毁了，文本还在，补一个气泡 ——
      * 除非屏幕上最后一条已经是它了（回答已经结束、进了对话历史）。 */
-    if (s_stream_active && s_stream_len > 0u && !tail_shows_text(s_stream_text)) {
+    if (s_stream_active && s_stream_len > 0u && !shows_text(s_stream_text)) {
         s_stream_bubble = bubble_create(false, &s_stream_label);
         if (s_stream_bubble != NULL) {
             lv_label_set_text_static(s_stream_label, s_stream_text);
@@ -690,7 +712,7 @@ static esp_err_t ai_chat_on_event(int32_t event_id, void *data)
          * for the streaming path chunks were emitted incrementally, so only
          * announce completion. */
         if (s_stream_bubble == NULL && reply != NULL && s_visible &&
-            !tail_shows_text(reply)) {
+            !shows_text(reply)) {
             /* Non-streaming answer: it arrives whole on REPLY_DONE.
              * 页面不在屏幕上时不建气泡（铁律四）：这条回答已经在对话历史里，
              * 回来时重建会把它贴回去；已经贴过了就不再贴一次。 */

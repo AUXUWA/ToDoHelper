@@ -3,7 +3,7 @@
 **ESP32-S31-Korvo 上的局域网待办助手**：待办清单 / 天气 / 日历 / 单词书 / 待机小眼睛 / AI 对话，
 一块 800×480 触摸屏 + 一个内嵌浏览器上位机，数据落在 SD 卡（或片内 LittleFS）。
 
-> **当前版本：`1.8.3`**（工程根目录 `version.txt`，同时出现在设备「设置」页、开机页、
+> **当前版本：`1.8.4`**（工程根目录 `version.txt`，同时出现在设备「设置」页、开机页、
 > `GET /api/v1/device/info` 的 `version` 与 `build/todohelper.bin` 的 app descriptor 里）。
 > 版本规则与发布步骤见 `AGENT.md §8.1`，变更历史见 `CHANGELOG.md`。
 

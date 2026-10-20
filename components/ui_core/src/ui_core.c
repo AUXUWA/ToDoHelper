@@ -266,7 +266,7 @@ static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t han
         data_size = UI_EVENT_PAYLOAD_MAX;
     }
 
-    ui_async_event_t *ev = malloc(sizeof(*ev) + data_size);
+    ui_async_event_t *ev = malloc(sizeof(*ev) + data_size + 1);
     if (ev == NULL) {
         return;
     }
@@ -277,6 +277,17 @@ static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t han
     if (data_size > 0 && data != NULL) {
         memcpy(ev->payload, data, data_size);
     }
+    /*
+     * 载荷后面补一个结尾的 '\0'。
+     *
+     * 载荷会被截到 UI_EVENT_PAYLOAD_MAX（256），而**绑定声明的大小**是事件类型
+     * 自己定的（AI 对话的流式文本声明的是 AI_MESSAGE_MAX = 1024）。
+     * 处理器拿到的只是指针，它若按 C 字符串处理（strlen），
+     * 遇到「正好被截断、没有结尾 0」的载荷就会**越过载荷读堆** ——
+     * 界面上是乱码，最坏是越界读。
+     * → 每个载荷都以 0 结尾，strlen 就一定停在载荷内。
+     */
+    ev->payload[data_size] = '\0';
 
     taskENTER_CRITICAL(&s_event_lock);
     const bool full = (s_event_depth >= UI_EVENT_QUEUE_MAX);

@@ -57,6 +57,17 @@ static lv_obj_t *s_detail_hint;     /**< shown when no day is selected */
 
 /** The page container: the parent of every object of this page. */
 static lv_obj_t *s_parent;
+/**
+ * The page's scroll offset, remembered across the content's destroy/rebuild.
+ *
+ * The page container is scrollable (ui_core gives every page container
+ * LV_OBJ_FLAG_SCROLLABLE), and destroying the content makes LVGL clamp the
+ * offset to the new (much smaller) content height
+ * (lv_obj.c -> readjust_scroll_after_layout -> lv_obj_scroll.c).
+ * Without remembering and restoring it, every visit would come back at the
+ * top - a visible change from before this round.
+ */
+static int32_t s_scroll_y;
 /** Slot of the content block (grid + detail panel) among the page's children. */
 static int32_t s_content_index;
 /**
@@ -1167,6 +1178,16 @@ static esp_err_t calendar_create(lv_obj_t *parent)
 static esp_err_t calendar_on_show(void)
 {
     /*
+     * Restore the scroll offset the page had when it was left.
+     * lv_obj_scroll_to_y() does lv_obj_update_layout() first, so the content
+     * height is already known and the offset is not clamped away.
+     */
+    if (s_parent != NULL && s_scroll_y > 0 &&
+        lv_obj_get_scroll_y(s_parent) != s_scroll_y) {
+        lv_obj_scroll_to_y(s_parent, s_scroll_y, LV_ANIM_OFF);
+    }
+
+    /*
      * The grid and the detail panel were destroyed when the page was hidden
      * (ROADMAP v1.8.3 §1), so build them again from the state that was kept:
      * the month on screen, the selected day and the week row count. Nothing
@@ -1197,6 +1218,16 @@ static esp_err_t calendar_on_show(void)
  */
 static esp_err_t calendar_on_hide(void)
 {
+    /*
+     * Remember the scroll offset before the content goes away, and stop the
+     * inertia animation first: otherwise we would remember a mid-animation
+     * value and the restore would fight with the animation.
+     */
+    if (s_parent != NULL) {
+        lv_anim_delete(s_parent, NULL);
+        s_scroll_y = lv_obj_get_scroll_y(s_parent);
+    }
+
     content_destroy();
     return ESP_OK;
 }
