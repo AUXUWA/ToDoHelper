@@ -27,6 +27,16 @@ static const char *TAG = "weather";
 
 ESP_EVENT_DEFINE_BASE(WEATHER_EVENT);
 
+/*
+ * wifi_manager 的事件基。
+ *
+ * weather_service 刻意**不**依赖 wifi_manager 组件：组件之间的 L3 -> L3 依赖
+ * 是分层规则不允许的（见 docs/TODOHELPER_FRAMEWORK.md）。所以这里像
+ * word_service 那样只声明这个基，用 ESP_EVENT_ANY_ID 订阅，自己判断
+ * 「地址是不是刚出现」。
+ */
+extern esp_event_base_t const WIFI_MGR_EVENT;
+
 #ifndef CONFIG_TODOHELPER_WEATHER_INTERVAL_S
 #define CONFIG_TODOHELPER_WEATHER_INTERVAL_S WEATHER_DEFAULT_INTERVAL_S
 #endif
@@ -45,6 +55,35 @@ ESP_EVENT_DEFINE_BASE(WEATHER_EVENT);
 #define WEATHER_TASK_STACK 8192
 #define WEATHER_TASK_PRIO  4
 #define WEATHER_REFRESH_WAIT_MS 20000
+/**
+ * 拿到 IP 之前不发请求，最多等这么久。
+ *
+ * 真机实测 IP 在开机后约 1 秒就位（v1.6.0 日志：6018 ms 天气 ready，7032 ms 拿到 IP），
+ * 6 秒足够覆盖慢一点的握手；到点还没网就**跳过这一轮**（weather_do_refresh()
+ * 见到没有地址就直接返回，不会发起注定失败的 DNS + 连接）。
+ *
+ * **为什么是 6 秒**：同步的 weather_refresh() 只等 WEATHER_REFRESH_WAIT_MS
+ * （20 s）。「等网 + 一次 HTTP 尝试」（12 s）必须留在这个预算之内，否则
+ * 「POST /api/v1/weather/refresh」会从「200 + 缓存读数」变成
+ * 「503 weather API did not answer in time」—— 那是用户可见的行为变化。
+ */
+#define WEATHER_NET_WAIT_MS 6000
+/**
+ * 传输失败后隔多久再试一次。
+ *
+ * 拿到 IP 的那一刻 DNS/路由还没完全就绪（DHCP 把它们和地址一起送到，
+ * 但事件比它们早一点点到），马上重试常常还是失败；歇 3 秒足够让它们就位。
+ */
+#define WEATHER_RETRY_DELAY_MS 3000
+/**
+ * 只有「很快失败」才值得再试一次。
+ *
+ * 同步路径 weather_refresh() 只等 WEATHER_REFRESH_WAIT_MS（20 s），
+ * 一次 HTTP 尝试最长 12 s —— 所以第一次尝试已经用掉超过 5 秒时，
+ * 再加 3 秒间隔 + 12 秒重试就会撑破那个预算，接口会从「回 200 + 缓存读数」
+ * 变成「回 503」。那才是真的用户可见变化，不能为了天气多试一次就搭进去。
+ */
+#define WEATHER_RETRY_BUDGET_MS 5000
 
 /**
  * Default IP geolocation endpoint (FR3 priority 2).
@@ -84,6 +123,27 @@ static SemaphoreHandle_t s_done;
  * 点的「重新定位」莫名其妙没反应。标志位不会丢 —— worker 每一轮都会来取。
  */
 static bool s_detect_requested;
+
+/**
+ * @brief 上一次刷新是不是因为「还没有 IP」而放弃的。
+ *
+ * 这是「开机就能拿到天气」这件事的最后一环：
+ *
+ * - worker 在开机时拿到刷新请求，先等 IP（WEATHER_NET_WAIT_MS，最多 6 s）；
+ * - 等到了 → 正常刷新，这个标志清掉；
+ * - 没等到 → 这一轮放弃（不再白跑一次注定失败的 DNS），标志置位；
+ * - 之后 IP 真的到了（DHCP 有时要十几秒）→ 「拿到 IP」的事件把标志读走，
+ *   再排一次刷新。
+ *
+ * 没有这个标志的话，开机时 IP 来得慢一点，天气就会一直显示缓存值，
+ * 直到 900 秒的周期定时器下一次唤醒它 —— 用户看到的现象是「联网了但天气不动」。
+ */
+static bool s_awaiting_ip;
+
+/**
+ * @brief 上一次看到 WiFi 事件时有没有地址（用来只对「从无到有」这个跳变反应）。
+ */
+static bool s_had_ip;
 
 static esp_timer_handle_t s_timer;
 
@@ -681,11 +741,32 @@ esp_err_t weather_detect_location(void)
 /* Refresh                                                                   */
 /* ------------------------------------------------------------------------ */
 
+/* 定义在下面（和 worker 放在一起）：「设备有没有拿到地址」的判据。 */
+static bool weather_network_up(void);
+
 static esp_err_t weather_do_refresh(void)
 {
     sys_status_t st;
     if (sys_status_get(&st) == ESP_OK && !st.online && !st.wifi_connected) {
         SYS_LOGD(TAG, "offline, keeping cached reading");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * 「关联上了但还没有地址」同样按离线处理。
+     *
+     * 没有地址时 DNS 根本解析不出来（真机日志里的
+     * "getaddrinfo() returns 202"），这时发请求只是白跑一次 DNS 查询 +
+     * 一次连接尝试（电台也醒了），换回来的只有一个错误。
+     * 提前返回还顺带把同步路径的预算守住：weather_refresh() 等的是
+     * WEATHER_REFRESH_WAIT_MS（20 s），而 worker 的等网最多
+     * WEATHER_NET_WAIT_MS（6 s）—— 6 + 12（一次 HTTP 尝试）< 20。
+     */
+    if (!weather_network_up()) {
+        SYS_LOGD(TAG, "no IP address yet, keeping cached reading");
+        /* 记下「这一轮是因为没地址才放弃的」：地址到了之后要补一次刷新
+         * （见 on_wifi_event）。 */
+        __atomic_store_n(&s_awaiting_ip, true, __ATOMIC_RELEASE);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -775,6 +856,96 @@ static bool weather_take_detect_request(void)
     return requested;
 }
 
+/**
+ * @brief 设备是否已经拿到 IP（可以发外网请求了）。
+ *
+ * 真机启动日志（2026-10-20，v1.6.0）：
+ *     I (6018) module 'weather_service' ready
+ *     E (6018) esp-tls: couldn't get hostname for :api.open-meteo.com: getaddrinfo() returns 202
+ *     W (6042) TH:weather: refresh failed: ESP_ERR_HTTP_CONNECT
+ *     I (7032) TH:wifi: got ip 192.168.137.95      ← IP 在这之后才有
+ *
+ * 开机时的那次刷新是**必然失败**的：连 DNS 都解析不出来。
+ * 白跑一次 DNS 查询 + 一次连接尝试（电台也醒了），换回来的只是一个错误。
+ *
+ * 判据用 sys_status 的 wifi_ip：wifi_manager 在 IP_EVENT_STA_GOT_IP 时会刷新它
+ * （components/wifi_manager/src/wifi_manager.c 里 "Keep sys_status fresh" 那段）。
+ */
+static bool weather_network_up(void)
+{
+    sys_status_t st;
+    if (sys_status_get(&st) != ESP_OK) {
+        return false;
+    }
+    /*
+     * 光判「非空」是不够的：wifi_manager 在还没拿到地址时把 "0.0.0.0"
+     * 放进 sys_status（wifi_manager.c 里 s_ip 的初值就是 "0.0.0.0"，
+     * 关联上了但 DHCP 还没回包时也是它），所以开机之后 sys_status.wifi_ip
+     * 一开始就是 "0.0.0.0" —— 非空 → 判据恒为真 → 等网分支一次都进不去。
+     * 判据与 word_service 的 have_ip() 用同一套。
+     */
+    return st.wifi_ip[0] != '\0' && strcmp(st.wifi_ip, "0.0.0.0") != 0;
+}
+
+/**
+ * @brief 等网络就绪（有 IP）再发请求。
+ *
+ * 只在这个 worker 任务里等，不阻塞任何调用方（页面上的「刷新」按钮是异步的，
+ * 会拿到「刷新中」的提示，等多久都不影响界面）。
+ *
+ * @param timeout_ms 最长等多久；到点还没网就放弃这一轮
+ *                    （weather_do_refresh() 见到没有地址会直接返回，
+ *                     不会发起注定失败的 DNS + 连接）。
+ * @return true = 有网了。
+ */
+static bool weather_wait_for_network(uint32_t timeout_ms)
+{
+    for (uint32_t waited = 0; waited < timeout_ms; waited += 500) {
+        if (weather_network_up()) {
+            return true;
+        }
+        if (waited == 0) {
+            SYS_LOGI(TAG, "no IP yet - waiting before the first request");
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    return weather_network_up();
+}
+
+/**
+ * @brief WiFi 事件：地址刚出现时，把之前放弃的那次刷新补上。
+ *
+ * 事件回调跑在共享事件任务上，所以这里**只做最轻的事**：置标志 + 往队列里
+ * 塞一个令牌（不阻塞）。真正的 HTTPS 请求在天气 worker 上跑。
+ *
+ * 只对「从没有地址到有地址」这个跳变反应：
+ * - 已经有地址 → 不重复刷（否则一次扫描事件就能白跑一次网络往返）；
+ * - 还没有地址 → 什么都不做（等下一个事件）；
+ * - 之前那一轮刷新并不是因为没地址才放弃的 → 也不重复刷。
+ */
+static void on_wifi_event(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+
+    const bool now = weather_network_up();
+    const bool had = s_had_ip;
+    s_had_ip = now;
+
+    if (!now || had) {
+        return;   /* 还是没有地址，或者地址没变化 */
+    }
+    if (!__atomic_load_n(&s_awaiting_ip, __ATOMIC_ACQUIRE)) {
+        return;   /* 没有被放弃的刷新要补 */
+    }
+
+    SYS_LOGI(TAG, "the address arrived - retrying the weather refresh");
+    __atomic_store_n(&s_awaiting_ip, false, __ATOMIC_RELEASE);
+    (void)weather_refresh_async();
+}
+
 static void weather_task(void *arg)
 {
     (void)arg;
@@ -783,6 +954,19 @@ static void weather_task(void *arg)
     while (xQueueReceive(s_requests, &token, portMAX_DELAY) == pdTRUE) {
         /* 令牌只负责把 worker 叫醒；这一轮要不要做 IP 定位看标志位。 */
         (void)token;
+
+        /*
+         * 没有 IP 就不发请求。
+         *
+         * 开机时天气模块比拿到 IP 早一秒多，那一次请求必然失败（DNS 都解析不出来），
+         * 白跑一次 DNS + 一次连接。等 IP 的代价是几秒，换来的是「开机就能拿到天气」。
+         */
+    if (!weather_network_up()) {
+        (void)weather_wait_for_network(WEATHER_NET_WAIT_MS);
+        /* 等到了就正常刷新；没等到，这一轮会在 weather_do_refresh() 里
+         * 记下「等地址」，地址真的到了再补一次。 */
+        __atomic_store_n(&s_awaiting_ip, !weather_network_up(), __ATOMIC_RELEASE);
+    }
 
         if (weather_take_detect_request()) {
             /*
@@ -823,8 +1007,43 @@ static void weather_task(void *arg)
             }
         }
 
+        const int64_t attempt_started = sys_time_ms();
         const esp_err_t err = weather_do_refresh();
         if (err != ESP_OK) {
+            /*
+             * 传输层失败时再试一次。
+             *
+             * 拿到地址的那一刻，网络其实**还没完全可用**：DHCP 带来的 DNS
+             * 服务器地址、路由、lwIP 的解析器都是随地址一起到的，比事件晚几十
+             * 毫秒到几百毫秒。这时候立刻发请求，DNS 会解析不出来
+             * （真机日志："couldn't get hostname ... getaddrinfo() returns 202"），
+             * 表现为 ESP_ERR_HTTP_CONNECT —— 但网络其实一直是好的。
+             *
+             * 所以传输失败先歇一下再试一次（最多一次，别把电台耗在重试上）：
+             * 这一下就把「联网了但天气不动」变成了「联网后几秒内天气就到位」。
+             *
+             * 只有「很快就失败」才重试：连接错误是立刻返回的（DNS 解析不出来、
+             * 对端拒绝），而超时意味着这一轮已经耗掉了 12 秒；再试一次会把
+             * 同步路径的 20 秒预算（WEATHER_REFRESH_WAIT_MS）撑破，接口会从
+             * 「回 200 + 缓存读数」变成「回 503」。那才是真的用户可见变化。
+             */
+            const int64_t spent = sys_time_ms() - attempt_started;
+            if (err == ESP_ERR_HTTP_CONNECT && spent < WEATHER_RETRY_BUDGET_MS &&
+                weather_network_up()) {
+                SYS_LOGI(TAG, "the first attempt hit a connection error - retrying in %d s",
+                         (int)(WEATHER_RETRY_DELAY_MS / 1000));
+                vTaskDelay(pdMS_TO_TICKS(WEATHER_RETRY_DELAY_MS));
+                const esp_err_t retry = weather_do_refresh();
+                if (retry == ESP_OK) {
+                    xSemaphoreGive(s_done);
+                    continue;
+                }
+                SYS_LOGW(TAG, "refresh failed: %s", esp_err_to_name(retry));
+                (void)sys_event_post_to(WEATHER_EVENT, WEATHER_EVENT_REFRESH_FAILED,
+                                        &retry, sizeof(retry));
+                xSemaphoreGive(s_done);
+                continue;
+            }
             SYS_LOGW(TAG, "refresh failed: %s", esp_err_to_name(err));
             (void)sys_event_post_to(WEATHER_EVENT, WEATHER_EVENT_REFRESH_FAILED,
                                     &err, sizeof(err));
@@ -1074,6 +1293,22 @@ esp_err_t weather_service_init(void)
     esp_err_t http_err = weather_service_register_http();
     if (http_err != ESP_OK) {
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
+    }
+
+    /*
+     * 订阅 WiFi 事件：地址刚出现时把「因为没地址而放弃的那次刷新」补上。
+     * 没有它的话，开机时 DHCP 慢一点，天气就会一直显示缓存值，
+     * 直到 900 秒的周期定时器下一次唤醒它。
+     *
+     * 订阅在 s_initialized 之后、第一个刷新请求之前做：这样「地址已经在了」
+     * 的情况（热启动、或者 WiFi 先连上）走的是 s_had_ip 的初值，不会多刷一次。
+     */
+    s_had_ip = weather_network_up();
+    const esp_err_t wifi_sub = sys_event_subscribe(WIFI_MGR_EVENT, ESP_EVENT_ANY_ID,
+                                                   on_wifi_event, NULL, NULL);
+    if (wifi_sub != ESP_OK) {
+        SYS_LOGW(TAG, "cannot subscribe to the WiFi events: %s",
+                 esp_err_to_name(wifi_sub));
     }
 
     SYS_LOGI(TAG, "ready (provider '%s', city '%s', every %u s, geo endpoint '%s')",

@@ -27,6 +27,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -36,8 +38,17 @@
 
 static const char *TAG = "page_splash";
 
-/** How often the log view is rebuilt while new lines arrive. */
-#define SPLASH_TICK_MS 100
+/** How often the log view is rebuilt while new lines arrive.
+ *
+ * 250 ms (4 Hz) since v1.7.0 (ROADMAP A3). It used to be 100 ms (10 Hz): the
+ * boot takes ~6.4 s, so the old timer ran 64 times, and every pass that found
+ * a new line called lv_label_set_text_static() on a label holding up to 5 KB of
+ * wrapped text - that invalidates the label, so the next layout pass has to
+ * re-measure the whole string. The splash is the *only* visible page while the
+ * modules come up, so the UI task's time went entirely into that.
+ * 4 Hz still looks live: the boot log only grows by a few lines per 250 ms.
+ */
+#define SPLASH_TICK_MS 250
 
 /** Animated ellipsis: one more dot every this many ms while the boot runs. */
 #define SPLASH_DOTS_MS 420
@@ -48,6 +59,12 @@ static const char *TAG = "page_splash";
 /** Render buffer: one row per retained line ("L " + text + newline + NUL). */
 #define SPLASH_TEXT_LEN (SYS_LOG_RECENT_CAPACITY * (SYS_LOG_RECENT_LINE_LEN + 3) + 1)
 
+/** Status line buffer: "启动日志 N 条 · 最新 S.Ts · 启动中..." - 128 bytes is
+ *  enough for the longest possible line (seq is at most 10 digits, the uptime
+ *  at most "4294967.2s"); the text is built in place so a refresh allocates
+ *  nothing and the label does not have to copy it. */
+#define SPLASH_STATUS_LEN 128
+
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_log_box;
 static lv_obj_t *s_log_label;
@@ -57,6 +74,17 @@ static lv_obj_t *s_log_label;
  * through lv_label_set_text_static(), so a refresh allocates nothing.
  */
 static char *s_text;
+
+/**
+ * Status line text, kept in a static buffer so the label can borrow it.
+ *
+ * It holds the *last rendered* status string: the status line is refreshed on
+ * the same 250 ms throttle as the log, and lv_label_set_text_static() always
+ * invalidates the label even when the text did not change (AGENT.md 9.0.1.1
+ * iron rule 2). So the new text is compared against this buffer first and the
+ * label is only touched when it really differs.
+ */
+static char s_status_text[SPLASH_STATUS_LEN];
 
 /** Refresh timer; NULL while the page is hidden or when no timer was available. */
 static lv_timer_t *s_timer;
@@ -127,17 +155,27 @@ static void splash_update_status(const sys_log_recent_info_t *newest)
     }
 
     const char *dots = dots_for(s_dots_phase);
+    char next[SPLASH_STATUS_LEN];
+
     if (newest == NULL) {
-        lv_label_set_text_fmt(s_status_label, "正在等待第一条日志%s", dots);
-        return;
+        (void)snprintf(next, sizeof(next), "正在等待第一条日志%s", dots);
+    } else {
+        /* The page is up while main/app_main.c brings the optional services up, so it
+         * says so instead of just sitting there with a frozen counter. */
+        (void)snprintf(next, sizeof(next), "启动日志 %u 条 · 最新 %u.%us · 启动中%s",
+                       (unsigned)newest->seq,
+                       (unsigned)(newest->uptime_ms / 1000u),
+                       (unsigned)((newest->uptime_ms % 1000u) / 100u), dots);
     }
 
-    /* The page is up while main/app_main.c brings the optional services up, so it
-     * says so instead of just sitting there with a frozen counter. */
-    lv_label_set_text_fmt(s_status_label, "启动日志 %u 条 · 最新 %u.%us · 启动中%s",
-                          (unsigned)newest->seq,
-                          (unsigned)(newest->uptime_ms / 1000u),
-                          (unsigned)((newest->uptime_ms % 1000u) / 100u), dots);
+    /* Compare before writing: lv_label_set_text_static() invalidates the label
+     * unconditionally, and the status line is refreshed on every tick - writing
+     * an identical string would re-measure the label for nothing. */
+    if (strcmp(next, s_status_text) == 0) {
+        return;
+    }
+    memcpy(s_status_text, next, strlen(next) + 1u);
+    lv_label_set_text_static(s_status_label, s_status_text);
 }
 
 /**
@@ -150,10 +188,12 @@ static void splash_update_status(const sys_log_recent_info_t *newest)
  * Almost every pass is a pure *append*: sys_log_recent_seq() is monotonic, lines
  * are retained in order, and the ring only ever drops the oldest once it is full.
  * Rebuilding all 64 lines (a >5 KB buffer, re-wrapped by a
- * LV_LABEL_LONG_MODE_WRAP label) on every 100 ms tick was the single most
+ * LV_LABEL_LONG_MODE_WRAP label) on every tick was the single most
  * expensive thing on the boot screen - it also forced lv_obj_update_layout() to
  * run synchronously inside the timer, stealing time from frame composition
- * (smoothness audit P2).
+ * (smoothness audit P2). The append path is kept: only the *rate* was lowered
+ * (100 ms -> 250 ms, ROADMAP v1.7.0 A3), so a tick that finds new lines still
+ * only writes the new ones.
  *
  * A full rebuild is still needed in two cases, and both are handled below:
  *   - the first ever pass (nothing rendered yet);
@@ -193,6 +233,10 @@ static void splash_refresh_log(void)
     bool have_newest = false;
 
     if (can_append) {
+        /* Rollback point: if this batch cannot be finished, everything appended
+         * below has to go away again (see the comment at the break). */
+        const size_t used_before = used;
+
         /* Only the newest `new_lines` entries, oldest first. */
         for (size_t age = (size_t)new_lines; age > 0u; age--) {
             char line[SYS_LOG_RECENT_LINE_LEN];
@@ -215,6 +259,27 @@ static void splash_refresh_log(void)
                 newest = info;
                 have_newest = true;
             }
+        }
+
+        if (!complete) {
+            /*
+             * 回滚这一批。
+             *
+             * sys_log 的写入方是「先占序号、后发布内容」（sys_log.c 的
+             * recent_capture()），读者完全可能读到一条**已被认领但尚未发布**
+             * 的行 —— 这时 sys_log_recent_get() 返回 false。
+             *
+             * 如果把已经追加进去的那几行留在缓冲里，而 s_rendered_seq 又因为
+             * complete == false 没有推进，下一拍算出的 new_lines 还是同一批，
+             * 于是这几行会被**再追加一遍**：屏幕上出现重复的启动日志，
+             * 而且要等环形缓冲溢出触发一次全量重建才会消失。
+             *
+             * 所以这里把这一批整个撤掉（文本截回追加之前，已用长度还原），
+             * 让下一拍从同一起点重来：那时候那一行早发布了，整批能一次追加完。
+             */
+            s_text[used_before] = '\0';
+            s_text_used = used_before;
+            return;   /* 不写标签、不改 s_rendered_seq */
         }
     } else {
         /* Full rebuild: oldest retained line first, newest last - the order a
@@ -307,7 +372,11 @@ static void splash_tick(lv_timer_t *timer)
     (void)timer;
 
     /* The ellipsis runs on its own clock: between two log lines nothing else on
-     * this page changes, and a frozen status line reads as a hung device. */
+     * this page changes, and a frozen status line reads as a hung device.
+     * The phase is derived from the wall clock, not from the tick count, so the
+     * dot still advances roughly every SPLASH_DOTS_MS (420 ms). Because the tick
+     * (250 ms) is shorter than the dot period, the phase can only advance by one
+     * per tick - no dot is ever skipped. */
     const uint32_t elapsed = (uint32_t)sys_time_ms() - s_started_ms;
     const uint32_t phase = elapsed / SPLASH_DOTS_MS;
     if (phase != s_dots_phase) {

@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_littlefs.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
@@ -61,6 +62,34 @@ static uint64_t s_total_bytes;
 static uint64_t s_free_bytes;
 static bool s_low_space_reported;
 static SemaphoreHandle_t s_io_lock;
+
+/* ------------------------------------------------------------------------- */
+/* Memory helpers                                                            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * @brief 堆分配：优先落 PSRAM，内部堆兜底。
+ *
+ * **为什么不能直接用裸 malloc()**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`
+ * （见 `sdkconfig.defaults`）意味着**所有 ≤ 4096 字节的普通分配优先走内部堆**，
+ * 而内部 RAM 恰恰是本板最紧的资源 —— AGENT.md §9.0.3 里 WiFi PHY 重新使能需要
+ * 约 30 KB 的**连续**内部块。读一个几百字节的文件（`todos.json` 550 B、
+ * `weather.json` 211 B …）本来是毫秒级的小事，却会在内部堆上留下一块
+ * 不规则的洞，把最大连续块切碎（真机实测：联网开机后最大连续块只剩 12 KB）。
+ *
+ * 写法与 sys_utils 的 `json_malloc()` 一致
+ * （`components/sys_utils/src/sys_json.c`）：`prefer = 2` 表示在满足
+ * `MALLOC_CAP_SPIRAM` 的堆里，优先挑同时满足 `MALLOC_CAP_DEFAULT`（真正的 RAM，
+ * 而不是外部 memory）的那几个。
+ *
+ * **释放端不用改**：IDF 的 `esp_heap_caps.h` 写明「In IDF, free(p) is equivalent
+ * to heap_caps_free(p)」，所以调用方现有的 `free(out)` 对 PSRAM 块同样正确，
+ * 不需要跨文件改。
+ */
+static void *storage_malloc(size_t size)
+{
+    return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Path helpers                                                              */
@@ -549,7 +578,9 @@ static void storage_recover_tree(const char *dir, int depth)
             continue;
         }
         const size_t len = strlen(entry->d_name);
-        char *copy = malloc(len + 1);
+        /* 目录项名很短，但仍是内部堆上的一块小碎片；放 PSRAM 里，内部堆就
+         * 干净一点（这两处都在开机路径上跑，碎得正是最要紧的时候）。 */
+        char *copy = storage_malloc(len + 1);
         if (copy == NULL) {
             break;
         }
@@ -684,7 +715,9 @@ static void storage_migrate_cache_to_pinned(void)
             continue;
         }
         const size_t len = strlen(entry->d_name);
-        char *copy = malloc(len + 1);
+        /* 目录项名很短，但仍是内部堆上的一块小碎片；放 PSRAM 里，内部堆就
+         * 干净一点（这两处都在开机路径上跑，碎得正是最要紧的时候）。 */
+        char *copy = storage_malloc(len + 1);
         if (copy == NULL) {
             break;
         }
@@ -1098,7 +1131,9 @@ static esp_err_t file_read_text(const char *abs, char **out, size_t *len)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    char *buf = malloc(size + 1);
+    /* 缓冲走 PSRAM 优先：文件内容只是要被解析的文本，不需要内部 RAM 的
+     * 连续性，而内部堆的连续块是 WiFi PHY 的硬需求（见 storage_malloc()）。 */
+    char *buf = storage_malloc(size + 1);
     if (buf == NULL) {
         return ESP_ERR_NO_MEM;
     }

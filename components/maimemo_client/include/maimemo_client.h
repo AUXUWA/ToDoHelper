@@ -35,6 +35,26 @@
  * Every function here performs blocking TLS I/O. **None of them may be called
  * from the LVGL task** (AGENT.md 9.0.1: LVGL callbacks run with the adapter lock
  * held). The intended use is the worker task started by maimemo_sync_start().
+ *
+ * ## Failure handling and retries (v1.7.0)
+ *
+ * Failures are classified before anything is retried:
+ *
+ *   - **Authentication** (HTTP 401/403, or an `unauthorized`/`token` code in the
+ *     envelope) is **never retried** - the same token would fail again. The
+ *     component latches "the token was refused" and the automatic paths stop
+ *     asking the cloud until the token is replaced (maimemo_set_token() clears
+ *     the latch).
+ *   - **Transport failures** (DNS, connect, timeout) are retried with an
+ *     exponential backoff: 60 s, 120 s, 240 s, 480 s, capped at 15 minutes.
+ *     While the backoff window is open the automatic paths do not touch the
+ *     network at all and return the remembered error code, so the caller sees
+ *     the same error class it would have seen from a real attempt.
+ *   - Everything else (the API answered, even with an error envelope) is final.
+ *
+ * The explicit, user-triggered actions (the console's "verify" and "probe"
+ * buttons) always make a live request - they exist to answer "is the network /
+ * the token working?", so a cached answer would defeat their purpose.
  */
 
 #pragma once
@@ -140,11 +160,17 @@ esp_err_t maimemo_set_token(const char *token);
  *
  * Performs one lightweight `/study/get_study_progress` call, which doubles as
  * the connectivity check for the web console's "测试" button.
+ *
+ * This is an explicit, user-triggered check, so it always makes a live request:
+ * it is never short-circuited by the retry backoff.
  */
 esp_err_t maimemo_verify_token(void);
 
 /**
  * @brief Plan A: fetch today's words. Blocking; call from a worker task.
+ *
+ * Inside a transport-failure backoff window this returns the remembered error
+ * code without touching the network (see "Failure handling and retries").
  *
  * @param out   Array of at least @p max entries.
  * @param max   Capacity of @p out (MAIMEMO_MAX_TODAY is a sensible value).
@@ -152,7 +178,12 @@ esp_err_t maimemo_verify_token(void);
  */
 esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count);
 
-/** @brief Plan A: fetch account progress. Blocking. */
+/**
+ * @brief Plan A: fetch account progress. Blocking.
+ *
+ * Inside a transport-failure backoff window this returns the remembered error
+ * code without touching the network (see "Failure handling and retries").
+ */
 esp_err_t maimemo_fetch_progress(maimemo_progress_t *out);
 
 /**
@@ -241,11 +272,34 @@ esp_err_t maimemo_set_push_enabled(bool enabled);
  *
  * Posts MAIMEMO_EVENT_SYNC_DONE / _FAILED when finished. Returns immediately, so
  * this is the one entry point that *is* safe to call from a UI event.
+ *
+ * The worker waits for an address before it touches the network (without one the
+ * DNS lookup cannot even start), and a transport failure is retried with a
+ * backoff (60 s, then 120 s, at most three attempts in total); an authentication
+ * failure is not retried at all. The backoff does **not** block the caller: the
+ * worker exits during the wait and a timer re-launches it, so ESP_ERR_INVALID_STATE
+ * ("a sync is already running") only means that a request is on the wire right
+ * now.
  */
 esp_err_t maimemo_sync_start(void);
 
 /** @brief Last known progress, without touching the network. */
 esp_err_t maimemo_get_cached_progress(maimemo_progress_t *out);
+
+/**
+ * @brief Let the next request go out immediately, ignoring the retry backoff.
+ *
+ * The backoff window only guards the **automatic** paths (the boot sync, the
+ * cloud queue, the per-card enrichment). An explicit, user-triggered action -
+ * a button in the web console - must make a live request: the network has very
+ * likely recovered inside the window (the boot sync fails before the IP
+ * arrives, and the IP shows up seconds later).
+ *
+ * Only the transport backoff is affected. The "the token was refused" latch is
+ * cleared by replacing the token (maimemo_set_token()), because that is the
+ * configuration change the latch waits for.
+ */
+void maimemo_allow_request_now(void);
 
 /**
  * @brief Plan D: fetch the 释义 for a spelling (`GET /interpretations`).

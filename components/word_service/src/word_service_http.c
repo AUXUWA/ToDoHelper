@@ -60,10 +60,30 @@ static cJSON *stats_to_json(const word_stats_t *stats)
     return obj;
 }
 
+/**
+ * Answer a handler that needs the wordbook.
+ *
+ * The book is loaded in the background (v1.7.0), so a request can arrive
+ * before it is there. That is not an internal error but a temporary state:
+ * 503 says "not yet", 500 would say "broken". A failed load keeps the 500,
+ * because then the request really cannot be served.
+ */
+static esp_err_t word_reply_book_error(httpd_req_t *req, esp_err_t err,
+                                        const char *context)
+{
+    if (err == ESP_ERR_NOT_FINISHED) {
+        return http_reply_unavailable(req, "the wordbook is still loading");
+    }
+    return http_reply_esp_error(req, err, context);
+}
+
 static esp_err_t today_get_handler(httpd_req_t *req)
 {
     const size_t limit = word_get_daily_count();
-    word_item_t *words = calloc(limit, sizeof(word_item_t));
+    /* PSRAM: up to 100 cards x ~650 B is bulk data, and the internal heap is
+     * the scarce resource on this board (roadmap B3). */
+    word_item_t *words = heap_caps_calloc_prefer(limit, sizeof(word_item_t), 2,
+                                                  MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     if (words == NULL) {
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "today's words");
     }
@@ -71,14 +91,14 @@ static esp_err_t today_get_handler(httpd_req_t *req)
     size_t count = 0;
     esp_err_t err = word_get_today(words, limit, &count);
     if (err != ESP_OK) {
-        free(words);
-        return http_reply_esp_error(req, err, "today's words");
+        heap_caps_free(words);
+        return word_reply_book_error(req, err, "today's words");
     }
 
     cJSON *root = cJSON_CreateObject();
     cJSON *array = cJSON_CreateArray();
     if (root == NULL || array == NULL) {
-        free(words);
+        heap_caps_free(words);
         cJSON_Delete(root);
         cJSON_Delete(array);
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "today's words");
@@ -90,7 +110,7 @@ static esp_err_t today_get_handler(httpd_req_t *req)
             cJSON_AddItemToArray(array, obj);
         }
     }
-    free(words);
+    heap_caps_free(words);
 
     cJSON_AddNumberToObject(root, "count", (double)count);
     cJSON_AddStringToObject(root, "book", word_get_book());
@@ -117,7 +137,7 @@ static esp_err_t stats_get_handler(httpd_req_t *req)
     word_stats_t stats;
     esp_err_t err = word_stats(&stats);
     if (err != ESP_OK) {
-        return http_reply_esp_error(req, err, "word stats");
+        return word_reply_book_error(req, err, "word stats");
     }
 
     cJSON *obj = stats_to_json(&stats);
@@ -140,7 +160,7 @@ static esp_err_t next_get_handler(httpd_req_t *req)
         return http_reply_err(req, 404, "no words loaded");
     }
     if (err != ESP_OK) {
-        return http_reply_esp_error(req, err, "next word");
+        return word_reply_book_error(req, err, "next word");
     }
 
     cJSON *obj = word_to_json(&word);
@@ -253,8 +273,12 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         (void)word_reset_progress();
     }
 
-    word_stats_t stats;
-    (void)word_stats(&stats);
+    word_stats_t stats = { 0 };
+    /* The book may still be loading (v1.7.0): then there are no counters yet,
+     * and the answer says so instead of reporting uninitialised memory. */
+    if (word_stats(&stats) != ESP_OK) {
+        SYS_LOGD(TAG, "the wordbook is not ready yet; the stats stay empty");
+    }
     cJSON *obj = stats_to_json(&stats);
     if (obj == NULL) {
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "word config");

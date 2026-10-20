@@ -60,9 +60,19 @@ NVS 键 `weather_key` 是给和风 / OpenWeather 这类付费 provider 预留的
    `now > 0 && update_ts > 0 && (now - update_ts) > WEATHER_STALE_AFTER_S`，而
    `WEATHER_STALE_AFTER_S = 2 × 900 = 1800` 秒；**时钟未同步时 `now == 0`，`stale` 恒为 false**（无法判断，不误报）。
 4. **刷新失败不是致命错误**。离线（`sys_status_get()` 里 `!online && !wifi_connected`）直接返回
-   `ESP_ERR_INVALID_STATE`；未设城市返回 `ESP_ERR_NOT_FOUND`；失败发
+   `ESP_ERR_INVALID_STATE`；**「关联上了但还没拿到地址」同样按离线处理**
+   （`sys_status.wifi_ip` 为空或 `"0.0.0.0"`）：没有地址时 DNS 根本解析不出来
+   （真机日志里的 `getaddrinfo() returns 202`），发请求只是白跑一次 DNS + 一次连接。
+   未设城市返回 `ESP_ERR_NOT_FOUND`；失败发
    `WEATHER_EVENT_REFRESH_FAILED`（payload `esp_err_t`），成功发 `WEATHER_EVENT_UPDATED`（无 payload）
    并 `sys_notify("weather_changed")` 给 SSE。缓存里的旧读数始终保留可见。
+4b. **第一次请求要等 IP**（roadmap v1.7.0 C1）。worker 在发请求前先看
+   `sys_status.wifi_ip`：没有地址就最多等 `WEATHER_NET_WAIT_MS = 6000 ms`
+   （轮询 500 ms）。等到了才发，于是开机那一次刷新不再是「注定失败的一次」。
+   6 秒的上限是为了守住同步路径的预算：`weather_refresh()` 只等 20 s，
+   而「等网 6 s + 一次 HTTP 尝试 12 s」必须小于它，否则
+   `POST /api/v1/weather/refresh` 会从「200 + 缓存读数」变成 503。
+   等不到就跳过这一轮（周期定时器会再试）。
 5. **WMO 天气码 → 中文描述 + 图标名**（`weather_wmo_to_condition()`）。映射覆盖
    `0 晴 / 1 少云 / 2 多云 / 3 阴 / 45,48 雾 / 51,53,55 毛毛雨 / 56,57 冻雨 / 61,63,65 小-大 雨 /
    66,67 冻雨 / 71,73,75 小-大 雪 / 77 米雪 / 80,81,82 阵雨-暴雨 / 85,86 阵雪 / 95 雷阵雨 / 96,99 雷阵雨伴冰雹`，
@@ -130,3 +140,40 @@ I (xxx) TH:weather_om: 4.0 C, feels 2.1 C, 46%, '晴' (code 0)
 `"offline, showing the cached reading"`，串口出现
 `I (xxx) TH:weather: refresh failed: ESP_ERR_INVALID_STATE`，而 `GET /api/v1/weather` 仍返回上次读数。
 重启后应看到 `I (xxx) TH:weather: cache loaded: Beijing 4.0 C '晴'`。
+
+## v1.7.0：开机那一轮刷新怎么拿到地址（roadmap C1）
+
+这块板子开机时**天气模块比拿到 IP 早一秒多**，那一刻 DNS 都解析不出来
+（真机日志：`couldn't get hostname for :api.open-meteo.com: getaddrinfo() returns 202`），
+发出去只是白跑一次 DNS + 一次连接 + 一次电台唤醒。
+
+现在的规矩（**先等地址，再发请求**）：
+
+1. worker 拿到刷新请求，先看 `sys_status.wifi_ip`：
+   - **有地址** → 直接发；
+   - **没有** → 最多等 `WEATHER_NET_WAIT_MS`（**6 s**），
+     日志里打 `no IP yet - waiting before the first request`。
+2. 6 s 到了还没有地址 → 这一轮放弃（**不发那个注定失败的请求**），
+   记下「在等地址」。
+3. **地址后来到了** → `WIFI_MGR_EVENT_GOT_IP` 的事件回调把这一步补上，
+   日志里打 `the address arrived - retrying the weather refresh`。
+4. 请求本身如果撞上「地址刚到、DNS 还没就绪」，会失败一次
+   （`ESP_ERR_HTTP_CONNECT`），歇 3 秒**再试一次**。
+
+### 两个判据的坑
+
+- **「有网」不是「`wifi_ip` 非空」**：`wifi_manager` 在没拿到地址时把
+  `"0.0.0.0"` 放进 `sys_status`（`s_ip` 的初值），所以开机后 `wifi_ip`
+  一开始就是 `"0.0.0.0"` —— 非空 → 判据恒为真 → 等地址的分支一次都进不去。
+  判据必须是「非空 **且** 不等于 `"0.0.0.0"`」。
+- **拿到地址 ≠ 网络能用了**：DHCP 把 DNS 服务器地址、路由、lwIP 的解析器
+  跟地址一起送到，比 IP 事件晚一点到。所以「地址到了立刻发」会撞上
+  DNS 还没就绪（表现为 `ESP_ERR_HTTP_CONNECT`），要歇一下再试。
+
+### 为什么等网上限是 6 s（不是更长）
+
+同步路径 `weather_refresh()` 只等 `WEATHER_REFRESH_WAIT_MS`（20 s），
+一次 HTTP 尝试最长 12 s。等网上限 + HTTP 超时必须小于 20 s，
+否则接口会从「回 200 + 缓存读数」变成「回 503」—— 那是用户可见的行为变化。
+重试也只在「第一次很快就失败」（< 5 s）时才做：连接错误是立刻返回的，
+而超时意味着这一轮已经吃掉 12 秒，再试一次就撑破了 20 秒的预算。

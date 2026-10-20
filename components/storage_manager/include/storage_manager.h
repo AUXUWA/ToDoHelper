@@ -147,6 +147,11 @@ esp_err_t storage_append_file(const char *rel, const void *buf, size_t len);
 /**
  * @brief Read a whole text file into a heap buffer (NUL terminated).
  *        The caller owns the buffer and must free() it.
+ *
+ * The buffer is allocated **PSRAM first** (see ROADMAP v1.7.0 B2): a few hundred
+ * bytes on the internal heap would chip away at the largest contiguous internal
+ * block that the WiFi PHY needs. The returned pointer may therefore live in
+ * PSRAM - that is fine, `free()` is equivalent to `heap_caps_free()` in IDF.
  */
 esp_err_t storage_read_text(const char *rel, char **out, size_t *len);
 
@@ -213,6 +218,7 @@ esp_err_t storage_write_cache_pinned(const char *name, const void *buf, size_t l
  * empty; writes always go to the pinned location.
  *
  * @param out Receives a NUL terminated heap buffer the caller must free().
+ *             The buffer is allocated PSRAM first (see storage_read_text()).
  */
 esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len);
 

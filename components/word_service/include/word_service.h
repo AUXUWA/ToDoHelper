@@ -36,7 +36,24 @@ typedef enum {
     WORD_EVENT_REVIEWED,       /**< payload: uint32_t word id */
     WORD_EVENT_PROGRESS_SAVED, /**< no payload */
     WORD_EVENT_LOAD_FAILED,    /**< payload: esp_err_t */
+    /** The book is being loaded in the background (v1.7.0). No payload.
+     *  Posted once, right after word_service_init() started the loader.
+     *  WORD_EVENT_LOADED / WORD_EVENT_LOAD_FAILED follow when it is done. */
+    WORD_EVENT_BOOK_LOADING,
 } word_event_id_t;
+
+/**
+ * @brief State of the wordbook (v1.7.0: the book is loaded in the background).
+ *
+ * The three states must be distinguishable, because the UI treats them
+ * differently: "loading" is a normal state (「词库加载中…」), "failed" is an
+ * error the user has to know about.
+ */
+typedef enum {
+    WORD_BOOK_LOADING = 0,  /**< the background loader is still running */
+    WORD_BOOK_READY,        /**< the book is loaded and cards can be served */
+    WORD_BOOK_FAILED,       /**< the load failed; see word_book_error() */
+} word_book_state_t;
 
 typedef enum {
     WORD_REVIEW_UNKNOWN = 0,
@@ -98,8 +115,36 @@ typedef struct {
  *
  * Order: `<app_dir>/words/<book>.json` -> written-out template of the compiled
  * in starter book. Progress is always read from `words/progress.json`.
+ *
+ * Since v1.7.0 the book is loaded **in the background**: the function returns
+ * as soon as the loader task is started, so the boot path does not pay the
+ * ~343 ms of the SD-card read plus the JSON parse. Until the load is done,
+ * word_get_today() / word_next() / word_stats() report
+ * **ESP_ERR_NOT_FINISHED** (the book is still coming) instead of handing out
+ * an empty list. When the load fails they report ESP_ERR_INVALID_STATE and
+ * WORD_EVENT_LOAD_FAILED is posted.
+ *
+ * Watch word_book_state() or the WORD_EVENT_BOOK_LOADING / _LOADED /
+ * _LOAD_FAILED events to follow the progress.
  */
 esp_err_t word_service_init(void);
+
+/**
+ * @brief State of the wordbook.
+ *
+ * @return WORD_BOOK_LOADING while the background loader runs, WORD_BOOK_READY
+ *         when the book can be served, WORD_BOOK_FAILED when the load failed.
+ */
+word_book_state_t word_book_state(void);
+
+/**
+ * @brief Why the last book load failed.
+ *
+ * @return ESP_OK when there was no failure, otherwise the underlying error
+ *         (for example ESP_ERR_NOT_FOUND for an unreadable file or
+ *         ESP_ERR_INVALID_ARG for a malformed book).
+ */
+esp_err_t word_book_error(void);
 
 /**
  * @brief Replace the active book from an explicit storage path.
@@ -145,6 +190,9 @@ size_t word_cloud_count(void);
  * @brief Total number of words loaded from the book (v1.4.0).
  *
  * Used by the console to show which book is backing the cards.
+ *
+ * @return 0 while the book is still loading in the background (v1.7.0); use
+ *         word_book_state() to tell "not loaded yet" from "empty book".
  */
 size_t word_count(void);
 
@@ -183,11 +231,17 @@ esp_err_t word_cloud_export(bool force);
  * @brief Today's queue: due words first, then new words, capped by the daily count.
  *
  * @param out Array of at least @p max entries (NULL to only query the count).
+ *
+ * @return ESP_ERR_NOT_FINISHED while the book is still loading in the
+ *         background (v1.7.0), ESP_ERR_INVALID_STATE when the load failed.
  */
 esp_err_t word_get_today(word_item_t *out, size_t max, size_t *count);
 
 /**
  * @brief The next card in today's queue, advancing an internal cursor.
+ *
+ * @return ESP_ERR_NOT_FINISHED while the book is still loading in the
+ *         background (v1.7.0), ESP_ERR_INVALID_STATE when the load failed.
  */
 esp_err_t word_next(word_item_t *out);
 
@@ -215,6 +269,10 @@ esp_err_t word_review(uint32_t id, word_review_result_t result);
  *          word_review(), word_set_daily_count() and word_reset_progress() all
  *          use word_save_progress_async() internally for this reason; call this
  *          only from a worker task or when the result must be known immediately.
+ *
+ * @return ESP_ERR_NOT_FINISHED while the wordbook is still being loaded in the
+ *         background (v1.7.0): writing then would overwrite the progress on
+ *         the card with an empty list.
  */
 esp_err_t word_save_progress(void);
 
@@ -226,7 +284,11 @@ esp_err_t word_save_progress(void);
  */
 esp_err_t word_save_progress_async(void);
 
-/** @brief Aggregate counters for the UI and the HTTP API. */
+/** @brief Aggregate counters for the UI and the HTTP API.
+ *
+ * @return ESP_ERR_NOT_FINISHED while the book is still loading in the
+ *         background (v1.7.0), ESP_ERR_INVALID_STATE when the load failed.
+ */
 esp_err_t word_stats(word_stats_t *out);
 
 /** @brief Words offered per day. */
@@ -235,7 +297,11 @@ uint32_t word_get_daily_count(void);
 /** @brief Change the daily target (persisted), clamped to 1..100. */
 esp_err_t word_set_daily_count(uint32_t count);
 
-/** @brief Drop all progress for the active book. */
+/** @brief Drop all progress for the active book.
+ *
+ * @return ESP_ERR_NOT_FINISHED while the wordbook is still being loaded in the
+ *         background (v1.7.0) - there is no progress to reset yet.
+ */
 esp_err_t word_reset_progress(void);
 
 /** @brief Machine readable name of a grade, used by the HTTP API. */

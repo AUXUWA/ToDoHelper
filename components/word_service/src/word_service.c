@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "storage_manager.h"
 #include "word_default_book.h"
@@ -121,6 +122,58 @@ static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
 
 /* ------------------------------------------------------------------------ */
+/* Book loading state (v1.7.0 A2)                                            */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * ## Why the book is loaded in the background (v1.7.0, roadmap A2)
+ *
+ * `word_service_init()` used to read the 120 KB `words/cet6.json` and parse its
+ * 833 words **synchronously on the main task**: 343 ms measured on the board
+ * (build/after_ui.log, 6333 -> 6412 ms). At that moment the only thing on screen
+ * is the splash log and nobody can ask for a word yet, so those 343 ms were
+ * pure boot latency - and the roadmap's target is a boot under 5.0 s.
+ *
+ * The load now happens in a worker task and the public interfaces say
+ * "not ready yet" until it is done, instead of handing out an empty list.
+ *
+ * The three states must be distinguishable, because the UI treats them
+ * differently:
+ *
+ *   WORD_BOOK_LOADING  still loading - the page shows 「词库加载中…」;
+ *   WORD_BOOK_READY    the book is there;
+ *   WORD_BOOK_FAILED   the load failed - the page has to show the error.
+ *
+ * `word_book_state()` answers without listening to events; the events
+ * (WORD_EVENT_BOOK_LOADING / _LOADED / _LOAD_FAILED) are the push variant.
+ */
+static word_book_state_t s_book_state;
+static esp_err_t s_book_error;
+/** Cached cloud-mode switch: an event handler must not read NVS. */
+static bool s_cloud_mode_selected;
+
+/* Defined with the book-loading section below; the save path uses them too. */
+static esp_err_t book_guard(void);
+static bool book_settled(void);
+
+/* ------------------------------------------------------------------------ */
+/* Cloud queue bookkeeping (v1.7.0 C1)                                       */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * A request counter rather than a flag: the queue can be asked for from three
+ * places (a finished sync, the station got an IP, the IP was already there at
+ * boot). One worker must serve those requests with a single round, but a
+ * request that arrives *while* it runs must not be lost.
+ *
+ * The variables are only touched through the __atomic builtins, which provide
+ * the ordering - no volatile needed.
+ */
+static uint32_t s_cloud_requests;
+/** Whether a worker is already running (never two TLS tasks at once). */
+static bool s_cloud_worker_running;
+
+/* ------------------------------------------------------------------------ */
 /* Deferred saving                                                           */
 /* ------------------------------------------------------------------------ */
 
@@ -162,7 +215,19 @@ static void word_save_worker(void *arg)
          * path never touches the card itself. */
         word_history_flush_pending();
 
-        const esp_err_t err = word_save_progress();
+        esp_err_t err = word_save_progress();
+        if (err == ESP_ERR_NOT_FINISHED) {
+            /*
+             * The wordbook is still being parsed in the background (v1.7.0), and
+             * writing now would overwrite the progress on the card with an
+             * empty list. Wait for the loader - it is a fraction of a second -
+             * and try again.
+             */
+            for (int i = 0; i < 10 && err == ESP_ERR_NOT_FINISHED; i++) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                err = word_save_progress();
+            }
+        }
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             SYS_LOGW(TAG, "deferred progress save failed: %s", esp_err_to_name(err));
         }
@@ -265,7 +330,7 @@ static void free_buffers(void)
 {
     free(s_words);
     free(s_progress);
-    free(s_queue);
+    heap_caps_free(s_queue);   /* PSRAM (see build_queue) */
     s_words = NULL;
     s_progress = NULL;
     s_queue = NULL;
@@ -423,6 +488,16 @@ esp_err_t word_save_progress(void)
     }
     if (!storage_available()) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!book_settled()) {
+        /*
+         * The book is still being parsed in the background (v1.7.0). Writing
+         * now would serialise an **empty** word list and overwrite the
+         * progress that is on the card - and the loader restores the progress
+         * right after the parse, so the old file is the truth. The honest
+         * answer is "not now"; the save worker waits and retries.
+         */
+        return ESP_ERR_NOT_FINISHED;
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -618,6 +693,109 @@ static esp_err_t load_progress(void)
 /* Book loading                                                              */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Record the new book state.
+ *
+ * The events are posted by the loading code itself (WORD_EVENT_LOADED /
+ * _LOAD_FAILED are already part of the published contract), so this only
+ * remembers the state; the "loading started" event is posted by the caller
+ * that starts the load.
+ */
+static void book_set_state(word_book_state_t state, esp_err_t err)
+{
+    __atomic_store_n(&s_book_error, err, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_book_state, state, __ATOMIC_RELEASE);
+}
+
+/**
+ * Is the book usable?
+ *
+ * @return ESP_OK when it is ready, ESP_ERR_NOT_FINISHED while the background
+ *         loader is still running, ESP_ERR_INVALID_STATE when the load failed.
+ *
+ * "still loading" and "failed" are different user-facing situations, so they
+ * must not collapse into one error code: the first one is a normal state the UI
+ * shows as 「词库加载中…」, the second one is a real failure.
+ */
+static esp_err_t book_guard(void)
+{
+    switch (__atomic_load_n(&s_book_state, __ATOMIC_ACQUIRE)) {
+    case WORD_BOOK_READY:
+        return ESP_OK;
+    case WORD_BOOK_LOADING:
+        return ESP_ERR_NOT_FINISHED;
+    case WORD_BOOK_FAILED:
+    default:
+        return ESP_ERR_INVALID_STATE;
+    }
+}
+
+/** Has the background loader finished (either way)? */
+static bool book_settled(void)
+{
+    return __atomic_load_n(&s_book_state, __ATOMIC_ACQUIRE) != WORD_BOOK_LOADING;
+}
+
+/*
+ * The loader's stack.
+ *
+ * 4 KB is the smallest stack that still leaves room for the SD-card read and
+ * the cJSON parse of the book (the parse itself is bounded by the depth guard
+ * in sys_json_parse(), so the recursion is shallow - the 7000 cJSON nodes live
+ * in the heap, not on the stack).
+ *
+ * The task prints its stack high water mark when it is done, so "is 4 KB
+ * enough?" is answered by the log of the next boot instead of by a guess.
+ * See the README for the exact threshold.
+ */
+#define WORD_BOOK_TASK_STACK 4096
+
+/*
+ * The loader runs at the **same priority as the main task** (1), and that is
+ * the whole point of moving the load off the boot path:
+ *
+ *   - a *higher* priority would preempt the main task for the whole parse, so
+ *     the boot would still wait the same 343 ms - only the bill would change;
+ *   - the same priority means the two share the core: the main task finishes
+ *     its remaining init while the loader grinds in the background, and the
+ *     loader even gets the main task's blocking waits (NVS, SD, network) for
+ *     free.
+ *
+ * The UI is not affected: the LVGL task runs at priority 6 (see
+ * esp_lv_adapter.h), far above this one.
+ */
+#define WORD_BOOK_TASK_PRIO  1
+
+/**
+ * Load the book in the background.
+ *
+ * Runs on its own task so the boot path does not pay the ~343 ms of the SD-card
+ * read plus the JSON parse. The result is announced through the events.
+ */
+static void word_book_worker(void *arg)
+{
+    (void)arg;
+
+    const esp_err_t err = word_reload();
+    if (err != ESP_OK) {
+        /* The failure was already logged and posted as WORD_EVENT_LOAD_FAILED. */
+        SYS_LOGE(TAG, "the wordbook could not be loaded: %s", esp_err_to_name(err));
+    } else {
+        SYS_LOGI(TAG, "the wordbook is ready");
+    }
+
+    /*
+     * Stack high water mark: how many bytes of the 4 KB were *never* touched.
+     * The number is what decides whether the stack can be shrunk (or has to
+     * grow) - see the README.
+     */
+    const UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+    SYS_LOGI(TAG, "book loader: %u stack item(s) (~%u B) never used",
+             (unsigned)hwm, (unsigned)(hwm * sizeof(StackType_t)));
+
+    vTaskDelete(NULL);
+}
+
 static void book_path(char *out, size_t len, const char *book)
 {
     snprintf(out, len, WORD_BOOK_DIR "/%s.json", book);
@@ -647,6 +825,7 @@ esp_err_t word_load_from_sd(const char *path)
     esp_err_t err = storage_read_text(relative, &json, &len);
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "cannot read wordbook '%s': %s", relative, esp_err_to_name(err));
+        book_set_state(WORD_BOOK_FAILED, err);
         (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_LOAD_FAILED, &err, sizeof(err));
         return err;
     }
@@ -654,6 +833,7 @@ esp_err_t word_load_from_sd(const char *path)
     err = parse_book(json);
     free(json);
     if (err != ESP_OK) {
+        book_set_state(WORD_BOOK_FAILED, err);
         (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_LOAD_FAILED, &err, sizeof(err));
         return err;
     }
@@ -663,6 +843,7 @@ esp_err_t word_load_from_sd(const char *path)
 
     const size_t count = s_count;
     SYS_LOGI(TAG, "loaded %u words from '%s' (%u B)", (unsigned)count, relative, (unsigned)len);
+    book_set_state(WORD_BOOK_READY, ESP_OK);
     (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_LOADED, &count, sizeof(count));
 
     /* Restore progress last: it indexes into the freshly loaded words. */
@@ -696,6 +877,7 @@ esp_err_t word_reload(void)
     SYS_LOGI(TAG, "using the compiled-in starter wordbook");
     esp_err_t err = parse_book(WORD_DEFAULT_BOOK_JSON);
     if (err != ESP_OK) {
+        book_set_state(WORD_BOOK_FAILED, err);
         (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_LOAD_FAILED, &err, sizeof(err));
         return err;
     }
@@ -703,6 +885,7 @@ esp_err_t word_reload(void)
     s_queue_len = 0;
     (void)load_progress();
     const size_t count = s_count;
+    book_set_state(WORD_BOOK_READY, ESP_OK);
     (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_LOADED, &count, sizeof(count));
     return ESP_OK;
 }
@@ -710,6 +893,16 @@ esp_err_t word_reload(void)
 const char *word_get_book(void)
 {
     return s_book;
+}
+
+word_book_state_t word_book_state(void)
+{
+    return __atomic_load_n(&s_book_state, __ATOMIC_ACQUIRE);
+}
+
+esp_err_t word_book_error(void)
+{
+    return __atomic_load_n(&s_book_error, __ATOMIC_ACQUIRE);
 }
 
 esp_err_t word_set_book(const char *book)
@@ -742,10 +935,37 @@ bool word_cloud_mode(void)
     return strcmp(mode, "cloud") == 0 && maimemo_has_token();
 }
 
+/**
+ * The mode switch alone, without the token check.
+ *
+ * `word_cloud_mode()` reads NVS twice (the mode and the token), which is fine
+ * for a UI call but not for an event handler: the handlers only need to know
+ * whether the user wants the cloud book at all, and the token is checked in the
+ * worker (where a blocking NVS read is fine).
+ */
+static bool cloud_mode_selected(void)
+{
+    char mode[16];
+    if (sys_config_get_str(SYS_KEY_MAIMEMO_MODE, mode, sizeof(mode)) != ESP_OK) {
+        return false;
+    }
+    return strcmp(mode, "cloud") == 0;
+}
+
 esp_err_t word_set_cloud_mode(bool enabled)
 {
     const esp_err_t err = sys_config_set_str(SYS_KEY_MAIMEMO_MODE, enabled ? "cloud" : "local");
     if (err == ESP_OK) {
+        /* Keep the cache in step with the stored setting. */
+        s_cloud_mode_selected = enabled;
+        if (enabled) {
+            /*
+             * The user just asked for the cloud book: that is an explicit
+             * action, and it must not be swallowed by a retry backoff window
+             * that was opened by an earlier transport failure.
+             */
+            maimemo_allow_request_now();
+        }
         /* Force a rebuild so the next card comes from the new source. */
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_queue_len = 0;
@@ -799,25 +1019,270 @@ esp_err_t word_cloud_export(bool force);
 static void on_maimemo_sync_done(void *arg, esp_event_base_t base,
                                  int32_t event_id, void *data);
 
+/*
+ * ## Why the cloud queue waits for the IP (v1.7.0, roadmap C1)
+ *
+ * The boot log of the real board (build/after_ui.log) reads:
+ *
+ *     I (6546) TH:mm: sync started
+ *     E (6018) esp-tls: couldn't get hostname for ...: getaddrinfo() returns 202
+ *     I (7032) TH:wifi: got ip 192.168.137.95
+ *
+ * The cloud queue was built **before** the DHCP lease existed, so the DNS lookup
+ * could not even start: one useless DNS query plus one useless TLS attempt on
+ * every boot.
+ *
+ * Two things changed:
+ *
+ *   1. the builder waits for an address before it touches the network, and
+ *   2. the trigger is "the address arrived" instead of "the boot happened".
+ *
+ * The address itself is read from `sys_status`, the only cross-component state
+ * channel this project allows (see sys_status.h): wifi_manager publishes the
+ * address there *before* it posts its own events, so it is already there when
+ * the event arrives.
+ */
+/*
+ * 6 KB, **not** 4 KB.
+ *
+ * v1.7.0 tried 4 KB to save internal RAM (a FreeRTOS stack can only come from
+ * internal RAM) and the board proved it wrong:
+ *
+ *     ***ERROR*** A stack overflow in task th_word_cq has been detected.
+ *
+ * The worker does a full TLS handshake with open.maimemo.com, and esp-tls
+ * needs more than 4 KB of task stack for that. The old 6 KB value is the one
+ * that has actually run on the board, so it goes back.
+ *
+ * The worker prints its stack high water mark when it is done, so "is 6 KB
+ * enough?" is answered by the log of the next boot instead of by a guess -
+ * see the README for the exact threshold.
+ */
+#define WORD_CLOUD_TASK_STACK 6144
+#define WORD_CLOUD_TASK_PRIO  3
+/** How long the builder waits for an IP (and for the local book) at most. */
+#define WORD_CLOUD_WAIT_MS 30000
+/** Poll period while waiting. */
+#define WORD_CLOUD_POLL_MS 1000
+
+/**
+ * Does the station have an IPv4 address?
+ *
+ * `sys_status` is the sanctioned channel for it: wifi_manager publishes the
+ * address there before it posts its events, so the value is already current
+ * when the event handler runs.
+ */
+static bool have_ip(void)
+{
+    sys_status_t status;
+    if (sys_status_get(&status) != ESP_OK) {
+        return false;
+    }
+    return status.wifi_ip[0] != '\0' && strcmp(status.wifi_ip, "0.0.0.0") != 0;
+}
+
+/**
+ * Wait until the queue can actually be built.
+ *
+ * Two prerequisites: an address (otherwise the DNS lookup cannot even start)
+ * and a settled local book (otherwise the cloud words lose the content the
+ * local book provides - measured 12 of 20 words on a live account).
+ *
+ * @param timeout_ms How long to wait at most.
+ * @return true when both are ready, false on timeout.
+ */
+static bool cloud_prerequisites_ready(uint32_t timeout_ms)
+{
+    const int64_t deadline = sys_time_ms() + (int64_t)timeout_ms;
+    for (;;) {
+        if (have_ip() && book_settled()) {
+            return true;
+        }
+        if (sys_time_ms() >= deadline) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(WORD_CLOUD_POLL_MS));
+    }
+}
+
+/*
+ * wifi_manager's event base.
+ *
+ * word_service deliberately does **not** depend on the wifi_manager component:
+ * this round forbids new component dependencies, and an L3 -> L3 edge is what
+ * the project avoids ("services publish their state to sys_status and everyone
+ * else reads it", sys_status.h). So the single symbol that is needed is
+ * declared here: `ESP_EVENT_DEFINE_BASE(WIFI_MGR_EVENT)` in wifi_manager.c
+ * defines it as a global `const char *` whose value is "WIFI_MGR_EVENT".
+ *
+ * A wifi_manager that is not linked in is a **link error**, never a silent
+ * misbehaviour - which is the failure mode we want.
+ */
+extern esp_event_base_t const WIFI_MGR_EVENT;
+
+/** Whether the station had an address at the last wifi_manager event. */
+static bool s_had_ip;
+
+/* Forward declarations: the event handlers below start the worker. */
+static void cloud_start_worker(const char *why);
+static void cloud_request_build(const char *why);
+
+/**
+ * A wifi_manager event arrived.
+ *
+ * The subscription covers **every** event of that base rather than one
+ * hard-coded id: the id would have to be copied out of wifi_manager.h into
+ * this file (a silent breakage if the enum ever changes), while the thing we
+ * actually care about - "is there an address now?" - is published by
+ * wifi_manager in `sys_status` *before* it posts its events.
+ *
+ * So the trigger is the **transition**: the address appeared. A scan (which
+ * also posts a WIFI_MGR event) therefore never starts a cloud request, and a
+ * disconnect clears the flag again.
+ */
+static void on_wifi_event(void *arg, esp_event_base_t base, int32_t event_id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)event_id;
+    (void)data;
+
+    const bool now = have_ip();
+    const bool had = s_had_ip;
+    s_had_ip = now;
+
+    if (!now || had) {
+        return;   /* no address, or nothing changed since the last event */
+    }
+    if (!s_cloud_mode_selected) {
+        return;   /* the user did not ask for the cloud book */
+    }
+
+    /*
+     * The boot sync failed with "no address yet" (a transport failure), and the
+     * maimemo client therefore has a retry backoff window open - inside it the
+     * automatic paths do not touch the network at all. The address is here now,
+     * so that window is obsolete: open the gate before asking for the queue,
+     * otherwise the build would be refused for the rest of the window and the
+     * device would keep serving the local book.
+     */
+    maimemo_allow_request_now();
+
+    if (word_cloud_count() > 0) {
+        return;   /* the queue is already there: do not spend a round trip */
+    }
+    cloud_request_build("the station got an IP");
+}
+
+/**
+ * Ask for the cloud queue to be (re)built.
+ *
+ * The request is **counted**, not flagged: a request that arrives while a
+ * worker is running must not be lost, it has to produce a second round.
+ */
+static void cloud_request_build(const char *why)
+{
+    __atomic_add_fetch(&s_cloud_requests, 1, __ATOMIC_ACQ_REL);
+    SYS_LOGD(TAG, "cloud queue requested (%s)", why);
+    cloud_start_worker(why);
+}
+
 /**
  * Worker that builds the cloud queue off the event task.
  *
- * The sync event is delivered on the shared sys_evt task, whose stack is small
- * (AGENT.md 9.0.1), and word_cloud_refresh() does blocking TLS plus SD-card
- * writes - so it must not run there. One worker per completed sync, which is
- * naturally rate-limited by the sync itself (maimemo_sync_start() refuses to
- * start a second one while one is in flight).
+ * The trigger events are delivered on the shared event task, whose stack is
+ * small (AGENT.md 9.0.1), and word_cloud_refresh() does blocking TLS plus
+ * SD-card writes - so it must not run there.
+ *
+ * The task deletes itself when it is done: it is a one-shot, and a leftover
+ * 4 KB task stack is a hole in the internal heap (the thing roadmap B1 is
+ * about).
  */
 static void cloud_build_worker(void *arg)
 {
     (void)arg;
-    const esp_err_t err = word_cloud_refresh();
-    if (err != ESP_OK) {
-        SYS_LOGW(TAG, "cloud queue refresh failed: %s", esp_err_to_name(err));
+
+    for (;;) {
+        /* Consume the requests that piled up so far. */
+        __atomic_store_n(&s_cloud_requests, 0, __ATOMIC_RELEASE);
+
+        /*
+         * Wait for the two things the queue needs: an address (otherwise the
+         * DNS lookup cannot even start) and the local book (otherwise the
+         * cloud words lose the content the local book provides).
+         */
+        if (!cloud_prerequisites_ready(WORD_CLOUD_WAIT_MS)) {
+            /*
+             * Nothing arrived within the timeout: build the queue anyway. The
+             * old behaviour was "build it at boot, whatever the network does",
+             * and a cloud queue that cannot be fetched must not leave the user
+             * without cards - word_cloud_refresh() falls back to the local book
+             * on every failure.
+             */
+            SYS_LOGW(TAG, "no IP (or no wordbook) after %d ms; building the cloud queue anyway",
+                     (int)WORD_CLOUD_WAIT_MS);
+        }
+
+        if (!word_cloud_mode()) {
+            /* The mode was switched off, or the token was removed. */
+            break;
+        }
+
+        const esp_err_t err = word_cloud_refresh();
+        if (err != ESP_OK) {
+            SYS_LOGW(TAG, "cloud queue refresh failed: %s", esp_err_to_name(err));
+        }
+
+        /*
+         * Stack high water mark: the number that says whether 4 KB is enough
+         * for the TLS handshake (roadmap B1). See the README for the threshold.
+         */
+        const UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+        SYS_LOGI(TAG, "cloud queue worker: %u stack item(s) (~%u B) never used",
+                 (unsigned)hwm, (unsigned)(hwm * sizeof(StackType_t)));
+
+        if (__atomic_load_n(&s_cloud_requests, __ATOMIC_ACQUIRE) == 0) {
+            break;   /* nothing new came in while we were building */
+        }
+    }
+
+    __atomic_store_n(&s_cloud_worker_running, false, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&s_cloud_requests, __ATOMIC_ACQUIRE) > 0) {
+        /* A request arrived between the last check and the flag reset. */
+        cloud_start_worker("a late request");
     }
     vTaskDelete(NULL);
 }
 
+static void cloud_start_worker(const char *why)
+{
+    if (__atomic_exchange_n(&s_cloud_worker_running, true, __ATOMIC_ACQ_REL)) {
+        return;   /* one is already running; it will pick the request up */
+    }
+
+    /*
+     * 4 KB (was 6 KB, roadmap B1): a FreeRTOS task stack can only come from
+     * internal RAM, so every kilobyte here is a permanent hole in the scarcest
+     * resource on this board. The task does a TLS handshake, so the number has
+     * to be verified on hardware - the worker prints its stack high water
+     * mark, which is the threshold (see the README).
+     */
+    if (xTaskCreate(cloud_build_worker, "th_word_cq", WORD_CLOUD_TASK_STACK, NULL,
+                    WORD_CLOUD_TASK_PRIO, NULL) != pdPASS) {
+        __atomic_store_n(&s_cloud_worker_running, false, __ATOMIC_RELEASE);
+        /* Not fatal: the local book still serves cards, and the next sync (or a
+         * page visit) retries. Logged because it means the queue silently did not
+         * get built, which is exactly the symptom this path exists to fix. */
+        SYS_LOGW(TAG, "cannot start the cloud queue worker (%s); using the local book", why);
+    }
+}
+
+/**
+ * A MaiMemo sync finished: rebuild the queue.
+ *
+ * A successful sync means the network worked, so the address is there and the
+ * worker starts building right away.
+ */
 static void on_maimemo_sync_done(void *arg, esp_event_base_t base,
                                  int32_t event_id, void *data)
 {
@@ -826,18 +1291,14 @@ static void on_maimemo_sync_done(void *arg, esp_event_base_t base,
     (void)event_id;
     (void)data;
 
+    /* Refresh the cached flag: the mode may have been switched since boot. */
+    s_cloud_mode_selected = cloud_mode_selected();
+
     if (!word_cloud_mode()) {
         return;
     }
 
-    /* 6 KB: TLS handshake, the enrichment fetches this may trigger, and the
-     * JSON work for words/maimemo.json. Internal RAM only (AGENT.md 9.0.1). */
-    if (xTaskCreate(cloud_build_worker, "th_word_cq", 6144, NULL, 3, NULL) != pdPASS) {
-        /* Not fatal: the local book still serves cards, and the next sync (or a
-         * page visit) retries. Logged because it means the queue silently did not
-         * get built, which is exactly the symptom this path exists to fix. */
-        SYS_LOGW(TAG, "cannot start the cloud queue worker; using the local book");
-    }
+    cloud_request_build("a MaiMemo sync finished");
 }
 
 /**
@@ -996,7 +1457,7 @@ esp_err_t word_cloud_refresh(void)
     s_cloud_count = count;
     s_cloud_active = (count > 0);
     /* The local index queue is replaced by the cloud queue, so clear it. */
-    free(s_queue);
+    heap_caps_free(s_queue);   /* PSRAM (see build_queue) */
     s_queue = NULL;
     s_queue_len = 0;
     s_queue_pos = 0;
@@ -1109,7 +1570,15 @@ static esp_err_t build_queue(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint16_t *queue = malloc((size_t)s_daily_count * 2 * sizeof(uint16_t) + 1);
+    /*
+     * The queue is a word-index array, i.e. bulk device data: ask for PSRAM
+     * explicitly (roadmap B3). With CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 a
+     * plain malloc() of this size would land in the internal heap, and the
+     * internal heap is the scarce resource on this board.
+     */
+    uint16_t *queue = heap_caps_calloc_prefer((size_t)s_daily_count * 2 + 1,
+                                               sizeof(uint16_t), 2,
+                                               MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     if (queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -1167,7 +1636,7 @@ static esp_err_t build_queue(void)
         }
     }
 
-    free(s_queue);
+    heap_caps_free(s_queue);   /* PSRAM (see build_queue) */
     s_queue = queue;
     s_queue_len = len;
     s_queue_pos = 0;
@@ -1183,6 +1652,21 @@ esp_err_t word_get_today(word_item_t *out, size_t max, size_t *count)
     }
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * The book may still be loading in the background (roadmap A2). Then the
+     * answer is "not ready yet" - **not** an empty list, which the page would
+     * render as "today there are no words" and the console as an empty array.
+     *
+     * The cloud queue is exempt: it does not come from the local book, so it
+     * can serve cards even while the book is still being parsed.
+     */
+    if (!s_cloud_active) {
+        const esp_err_t guard = book_guard();
+        if (guard != ESP_OK) {
+            return guard;
+        }
     }
 
     /*
@@ -1237,6 +1721,14 @@ esp_err_t word_next(word_item_t *out)
     }
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Not loaded yet: say so instead of handing out a stale/empty card. */
+    if (!s_cloud_active) {
+        const esp_err_t guard = book_guard();
+        if (guard != ESP_OK) {
+            return guard;
+        }
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -1294,6 +1786,11 @@ esp_err_t word_get(uint32_t id, word_item_t *out)
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* The id belongs to the book, so the book has to be there. */
+    const esp_err_t guard = book_guard();
+    if (guard != ESP_OK) {
+        return guard;
+    }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (size_t i = 0; i < s_count; i++) {
@@ -1320,6 +1817,15 @@ esp_err_t word_restart_queue(void)
 
 esp_err_t word_queue_position(size_t *position, size_t *total)
 {
+    /* The cloud queue has its own length, so it can answer before the local
+     * book is loaded. */
+    if (!s_cloud_active) {
+        const esp_err_t guard = book_guard();
+        if (guard != ESP_OK) {
+            return guard;
+        }
+    }
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
     /* The cloud queue has its own length; reporting the local one here would show
      * "3/10" while flipping through 20 cloud cards. */
@@ -1429,6 +1935,12 @@ esp_err_t word_stats(word_stats_t *out)
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* The counters are the book's counters: without the book there is nothing
+     * to count (and an all-zero answer would read as "no words at all"). */
+    const esp_err_t guard = book_guard();
+    if (guard != ESP_OK) {
+        return guard;
+    }
 
     word_stats_t stats = { 0 };
     const int64_t now = now_stamp();
@@ -1486,6 +1998,15 @@ esp_err_t word_reset_progress(void)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!book_settled()) {
+        /*
+         * The book is still loading: there is no progress to reset yet, and the
+         * loader would restore the old progress from the card right after the
+         * parse - so the reset would look like it worked and then undo itself.
+         */
+        SYS_LOGW(TAG, "the wordbook is still loading; the reset was refused");
+        return ESP_ERR_NOT_FINISHED;
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -1945,9 +2466,25 @@ esp_err_t word_service_init(void)
 
     s_initialized = true;
 
-    esp_err_t err = word_reload();
-    if (err != ESP_OK) {
-        SYS_LOGW(TAG, "wordbook load failed: %s", esp_err_to_name(err));
+    /*
+     * The book is loaded in the background (roadmap A2).
+     *
+     * Reading the 120 KB `words/cet6.json` and parsing its 833 words used to
+     * happen right here, on the main task: 343 ms measured on the board, at a
+     * moment when the only thing on screen is the splash log and nobody can
+     * ask for a word yet. The load now runs in its own task and the public
+     * interfaces report "not ready yet" until it is done.
+     */
+    book_set_state(WORD_BOOK_LOADING, ESP_OK);
+    (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_BOOK_LOADING, NULL, 0);
+
+    if (xTaskCreate(word_book_worker, "th_word_book", WORD_BOOK_TASK_STACK, NULL,
+                    WORD_BOOK_TASK_PRIO, NULL) != pdPASS) {
+        /* No memory for the loader: load it inline. Slow (the old behaviour),
+         * but the feature is complete - the alternative would be a word page
+         * that never gets a book. */
+        SYS_LOGW(TAG, "no memory for the book loader; loading it inline");
+        (void)word_reload();
     }
 
     esp_err_t http_err = word_service_register_http();
@@ -1975,7 +2512,33 @@ esp_err_t word_service_init(void)
                  esp_err_to_name(sub_err));
     }
 
-    SYS_LOGI(TAG, "ready (book '%s', %u words, %u/day)", s_book, (unsigned)s_count,
+    /*
+     * The other trigger for the cloud queue: the station got an IP (roadmap
+     * C1). Before that the DNS lookup cannot even start, so building the queue
+     * then is a wasted round trip.
+     *
+     * The subscription covers every event of the base; the handler reacts to
+     * the moment the address appears (see on_wifi_event).
+     */
+    const esp_err_t wifi_sub = sys_event_subscribe(WIFI_MGR_EVENT, ESP_EVENT_ANY_ID,
+                                                   on_wifi_event, NULL, NULL);
+    if (wifi_sub != ESP_OK) {
+        SYS_LOGW(TAG, "cannot subscribe to the WiFi events: %s",
+                 esp_err_to_name(wifi_sub));
+    }
+
+    /* The mode cache (the event handlers must not read NVS) and the state of
+     * the network at this very moment. */
+    s_cloud_mode_selected = cloud_mode_selected();
+    s_had_ip = have_ip();
+    if (s_cloud_mode_selected && s_had_ip && word_cloud_count() == 0) {
+        /* The address was already there when this module started (a warm boot,
+         * or a reconnect that finished before us): no event will come, so ask
+         * for the queue now. */
+        cloud_request_build("the station already has an IP");
+    }
+
+    SYS_LOGI(TAG, "ready (book '%s', %u/day, loading in the background)", s_book,
              (unsigned)s_daily_count);
     return ESP_OK;
 }

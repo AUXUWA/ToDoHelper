@@ -14,6 +14,7 @@
 | 分组 | 函数 |
 |---|---|
 | 生命周期 | `word_service_init()`、`word_reload()`、`word_load_from_sd()` |
+| 词库状态 | `word_book_state()`、`word_book_error()`（v1.7.0：后台加载） |
 | 词库选择 | `word_get_book()`、`word_set_book()`、`word_count()` |
 | 今日队列 | `word_get_today()`、`word_next()`、`word_get()`、`word_restart_queue()`、`word_queue_position()` |
 | 云端队列 | `word_cloud_mode()`、`word_set_cloud_mode()`、`word_cloud_refresh()`、`word_cloud_count()`、`word_cloud_export()` |
@@ -66,6 +67,180 @@ cJSON 节点）会把内部 RAM 抽干，并连带把当时正在连网的 WiFi 
   `book tree alive: internal N KB free (largest M KB)` —— **JSON 树存活时的内部 RAM 余量**。
   1.0.0 实测 833 词时仍有 86 KB 空闲 / 40 KB 最大连续块（修复前该窗口被抽到接近 0）；
 - `word_load_from_sd()` 的成功日志带字节数：`loaded 833 words from 'words/cet6.json' (120311 B)`。
+
+## v1.7.0：词库改成后台加载（roadmap A2）
+
+### 为什么
+
+`word_service_init()` 原来**在主任务上同步**读 120 KB 的 `cet6.json` 并解析 833 词，
+真机实测 **343 ms**（`build/after_ui.log`，6333 → 6412 ms）。那一刻屏幕上只有启动日志，
+没有人会来取词——这 343 ms 全是白等的开机时间。
+
+现在词库由一个后台任务 `th_word_book` 加载，`init()` 只负责起任务就返回。
+
+### 对外契约：没好之前要**明确**说没好
+
+| 接口 | 词库还在加载 | 词库加载失败 |
+|---|---|---|
+| `word_get_today()` / `word_next()` / `word_get()` / `word_queue_position()` | `ESP_ERR_NOT_FINISHED` | `ESP_ERR_INVALID_STATE` |
+| `word_stats()` | `ESP_ERR_NOT_FINISHED` | `ESP_ERR_INVALID_STATE` |
+| `word_count()` | `0`（用 `word_book_state()` 区分「还没好」和「空词库」） | `0` |
+
+**绝不能**返回一个空列表：那在页面上会显示成「今天没有单词」，在网页上会显示成空数组，
+看起来像功能坏了，而不是「还在加载」。
+
+「加载中」和「加载失败」必须能分开：
+
+```c
+word_book_state_t word_book_state(void);  /* LOADING / READY / FAILED */
+esp_err_t word_book_error(void);          /* 失败的具体原因（ESP_OK = 没失败过） */
+```
+
+**顺带挡住的坑**（都是「词库还没好」带来的）：
+
+- `word_save_progress()` 在加载期间返回 `ESP_ERR_NOT_FINISHED` **并且不写盘**——
+  否则它会把**空**词表序列化后覆盖掉卡上的进度（加载器紧接着就会把进度读回来，
+  那是唯一的真相）。去抖保存 worker 会等最多 2 s 再重试。
+- `word_reset_progress()` 在加载期间同样拒绝（`ESP_ERR_NOT_FINISHED` + 一条 WARN）：
+  那时根本没有进度可清，而且加载器紧接着会把旧进度读回来，清除会「看起来成功又自己撤销」。
+- `word_count()` 在加载期间是 `0`，用 `word_book_state()` 区分「还没好」和「空词库」。
+
+### 事件
+
+| 事件 | 载荷 | 什么时候 |
+|---|---|---|
+| `WORD_EVENT_BOOK_LOADING` | 无 | `init()` 起了后台加载任务 |
+| `WORD_EVENT_LOADED` | `size_t` 词数 | 词库解析完成（**v1.4.0 就有这个事件，page_word 已经订阅**） |
+| `WORD_EVENT_LOAD_FAILED` | `esp_err_t` | 加载失败（原因同时存进 `word_book_error()`） |
+
+### 页面侧还需要别人做一件事
+
+`page_word.c` 现在收到 `WORD_EVENT_LOADED` 只调 `render_progress()`（`word_on_event()`），
+**不会重新取卡**，而且加载期间页面是空白的。要让用户看到「词库加载中…」而不是空白页，
+需要改 `page_word.c`：
+
+1. `word_next()` 返回 `ESP_ERR_NOT_FINISHED` 时显示「词库加载中…」；
+2. 收到 `WORD_EVENT_LOADED` 后重新 `word_next()` 一次（`word_on_event()` 里补）。
+
+> 本轮 `word_service` 不动 `page_word.c`（不在本分区的文件范围内）。
+
+### 加载任务的两个参数
+
+- **栈 4 KB**（`WORD_BOOK_TASK_STACK`）：读 SD 卡 + 解析 JSON。cJSON 的 7000 个节点在堆上，
+  栈上的递归被 `sys_json_parse()` 的深度限制（32 层）压平，所以 4 KB 够用。
+  任务结束时打印栈水位，判据见下面 B1 一节。
+- **优先级 1（和主任务一样）**：这是重点。**更高的优先级不会省开机时间**——加载器会直接
+  抢占主任务，343 ms 只是从主任务身上挪到加载器身上，开机照样等那么久。
+  同优先级时两者分时，主任务把剩下的 init 做完，加载器在后台慢慢磨，
+  还能顺手吃掉主任务那些阻塞等待（NVS、SD、网络）的时间。
+  UI 不受影响：LVGL 任务优先级是 6（`esp_lv_adapter.h`）。
+
+建不出任务时（内部 RAM 太紧）**回退为就地同步加载**：慢，但功能不缺。
+
+## v1.7.0：云端队列等 IP（roadmap C1）
+
+### 事实
+
+```
+I (6546) TH:mm: sync started
+E (6018) esp-tls: couldn't get hostname for ...: getaddrinfo() returns 202
+I (7032) TH:wifi: got ip 192.168.137.95
+```
+
+云端队列在拿到 DHCP 地址**之前**就发起了，DNS 根本解析不出来：每次开机白跑一轮
+DNS 查询 + 一次连接尝试。
+
+### 现在的做法
+
+1. **触发时机**变了：不再是「开机就建」，而是「**拿到 IP 之后**才建」。
+   `word_service` 订阅了 `wifi_manager` 的事件基（`WIFI_MGR_EVENT`），
+   订阅的是**全部事件**而不是写死某个 id——写死 id 就得把 `wifi_manager.h` 里的枚举值
+   抄到这个文件里（枚举一改就悄悄失效）。真正要判断的是「现在有没有地址」，
+   而 `wifi_manager` 会在发事件**之前**把地址写进 `sys_status`（本工程唯一被认可的
+   跨组件状态通道，见 `sys_status.h`），所以处理函数里读 `sys_status.wifi_ip` 即可。
+   触发条件是**状态跳变**（原来没地址 → 现在有地址）：这样扫描 WiFi（也会发
+   `WIFI_MGR` 事件）不会误触发一次云端请求。
+2. **建队列前会等**：worker 先等「有 IP」且「本地词库已就绪」，最多等 30 s
+   （`WORD_CLOUD_WAIT_MS`）。等 IP 是因为没有地址 DNS 必然失败；等词库是因为
+   云端词要从本地书取内容（实测 20 词里 12 词命中）。
+3. **兜底**：30 s 内两样都没齐，也**照样建**——网络不通时 `word_cloud_refresh()`
+   失败会退回本地书，绝不能让用户没有卡可翻。日志：
+   `no IP (or no wordbook) after 30000 ms; building the cloud queue anyway`。
+4. `MAIMEMO_EVENT_SYNC_DONE` 仍然会重建队列（同步成功说明网络是通的，直接建，不用等）。
+
+> **和 `maimemo_client` 的退避闸门的关系**（v1.7.0，两个分区同时改的）：
+> 开机那次「还没有 IP」的失败会被 `maimemo_client` 记成传输层失败，于是**自动路径**
+> 在 60 s 内不发请求（`maimemo_fetch_today()` 会直接返回上次的错误码）。
+> 所以拿到 IP 的那一刻，`word_service` 会调 `maimemo_allow_request_now()` 把闸门打开——
+> 地址都到手了，开机那次失败已经过时了。少了这一步，云端队列要等退避窗口结束
+> （约 60 s）才建得起来。
+
+> **为什么没有把 `wifi_manager` 加进 `REQUIRES`**：本轮禁止新增组件依赖，而且 L3 → L3
+> 的边正是本工程刻意避免的（`sys_status.h`：「服务把状态发到 sys_status，别人来读」）。
+> 只声明了 `extern esp_event_base_t const WIFI_MGR_EVENT;` 这一个符号
+> （`wifi_manager.c` 里 `ESP_EVENT_DEFINE_BASE` 生成的全局常量）。
+> 万一 `wifi_manager` 没被链进来，那是**链接错误**，不会变成静默的行为异常。
+
+## v1.7.0：`th_word_cq` 的栈 —— 试过 4 KB，板子不接受（roadmap B1）
+
+- FreeRTOS 的任务栈**只能来自内部 RAM**，所以这个栈是开机后内部 RAM 的固定开销；
+  任务跑完 `vTaskDelete(NULL)` 自我删除（它是一次性任务），这一点保留。
+- v1.7.0 一度按「省 2 KB 内部 RAM」的直觉把它从 6144 降到 **4096**，
+  **真机直接崩了**：
+
+  ```
+  ***ERROR*** A stack overflow in task th_word_cq has been detected.
+  ```
+
+  这个任务里要做一次完整的 TLS 握手（`maimemo_fetch_today()`），
+  实测一次握手用掉 **4184 字节** —— 4 KB 不够。
+- **现在是 6144**（跑完打印的水位是 `1960 stack item(s) never used`，
+  即 6144 - 1960 = 4184 字节用掉，与上面的实测吻合，还剩约 2 KB 富余）。
+- 要省这 2 KB，得先**腾出更大的内部连续块**（`docs/ROADMAP_v1.8.0.md` §1 的 D1/D2），
+  在那之前这个栈就按 6144 来。
+
+### 判据（固件会自己报）
+
+```
+I (xxxx) TH:word: cloud queue worker: N stack item(s) (~M B) never used
+```
+
+`N` 是这块栈里**从未被用到**的字节数（`uxTaskGetStackHighWaterMark()`，
+IDF 返回的是 `StackType_t` 个数，本目标上 1 个 = 1 字节）。
+
+- `N ≥ 512`：还有 ≥ 512 B 没动过，栈够用；
+- `N < 512`：TLS 握手把栈用得太满，要加。
+
+同样的水位日志也由词库加载任务打印：
+
+```
+I (xxxx) TH:word: book loader: N stack item(s) (~M B) never used
+```
+
+词库加载任务（`WORD_BOOK_TASK_STACK` = 4096）实测水位是 **1808 B**，
+也就是用掉约 2288 B、还剩 1.8 KB 富余 —— 读 SD 卡 + 解析 JSON（cJSON 的
+7000 个节点在堆上，栈上的递归被 `sys_json_parse()` 的深度限制压平），够用。
+
+## v1.7.0：中间缓冲显式走 PSRAM（roadmap B3）
+
+`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096` 让**≤4 KB 的分配优先落内部堆**，
+而内部堆正是这块板子最紧的资源（`AGENT.md §9.0.3`：PHY 重新使能需要约 30 KB 连续块）。
+所以这条链路上的大缓冲都改成显式要 PSRAM：
+
+| 缓冲 | 位置 | 改法 |
+|---|---|---|
+| 今日队列的词条下标数组 | `build_queue()` | `heap_caps_calloc_prefer(..., MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT)` |
+| HTTP `/words/today` 的卡片数组 | `word_service_http.c` | `heap_caps_calloc_prefer(..., MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT)`（最多 100 张卡 ≈ 65 KB） |
+| 词条本体 / 进度数组 | `parse_book()` | 本来就是 `heap_caps_malloc_prefer` / `calloc_prefer`，**保持不变** |
+| 云端队列的词条数组 | `word_cloud_refresh()` | 本来就是 `heap_caps_calloc_prefer`，**保持不变** |
+| cJSON 的节点与打印出的 JSON | 全局 | 由 `sys_json_use_psram()` 的钩子统一改成 PSRAM 优先 |
+
+释放仍用 `free()` / `heap_caps_free()` 混用没问题：IDF 的 `esp_heap_caps.h` 写明
+「`free(p)` 等价于 `heap_caps_free(p)`」。
+
+> 词库文件本身（120 KB）由 `storage_manager` 的 `file_read_text()` 读进来，
+> 那是 B2 条目（另一个分区改 `components/storage_manager/src/storage_manager.c`）。
+
 
 ## 内置起始词库与导出
 
@@ -203,7 +378,8 @@ if (local == UINT16_MAX) { out[i].id = WORD_ID_CLOUD; }  /* 连释义都没有 *
   本项目的事件发到**自定义** `s_loop`（`sys_event_post_to()` →
   `esp_event_post_to(s_loop, ...)`），用 ESP-IDF 默认循环注册**永远不触发，而且不报任何错**。
 - 处理函数里**不能**直接建队列：它在 `sys_evt` 任务上（栈很小），而 `word_cloud_refresh()`
-  要做 TLS 与 SD 写 → 交给一个一次性 worker（`th_word_cq`，6 KB）。
+  要做 TLS 与 SD 写 → 交给一个一次性 worker（`th_word_cq`，见上面 B1 一节）。
+  worker 自己会**先等 IP**（v1.7.0 C1），再重建队列。
 
 ### `words/maimemo.json`（`word_cloud_export()`）
 
@@ -323,7 +499,8 @@ job 由 worker 拥有并释放。只有"堆上分配、所有权明确转移给 
 4. **存储不可用**：`word_save_progress()` 返回 `ESP_ERR_INVALID_STATE`，但内存里的复习照常进行，
    `word_review()` 会把该错误原样返回给调用方。
 5. **事件**：`WORD_EVENT` 的 `LOADED`（payload `size_t` 词数）、`REVIEWED`（`uint32_t id`）、
-   `PROGRESS_SAVED`（无 payload）、`LOAD_FAILED`（`esp_err_t`）。
+   `PROGRESS_SAVED`（无 payload）、`LOAD_FAILED`（`esp_err_t`）、
+   `BOOK_LOADING`（无 payload，v1.7.0：后台加载已开始）。
 6. **解析外部输入一律用 `sys_json_parse(json, 32)`**（v1.5.0）：词库文件、`progress.json`、
    `review_log.jsonl` 的每一行、以及三个 HTTP 请求体都不再用裸 `cJSON_Parse()`。
    cJSON 1.7.19 的嵌套上限是 1000、每层约 96 字节栈帧，而开机主任务的栈只有 12 KB ——
@@ -336,12 +513,15 @@ job 由 worker 拥有并释放。只有"堆上分配、所有权明确转移给 
 |---|---|---|
 | GET | `/api/v1/words/today` | 今日队列 + `count`、`book`、`server_ts`、嵌套 `stats` |
 | GET | `/api/v1/words/stats` | 统计（含 `book`、`daily_count`） |
-| GET | `/api/v1/words/next` | 下一张卡 + `position`、`queue_total`；队空 → 404 |
-| POST | `/api/v1/words/{id}/review` | body `{"result":"known"\|"fuzzy"\|"unknown"}`，返回该词最新状态 |
+| GET | `/api/v1/words/next` | 下一张卡 + `position`、`queue_total`；队空 → 404 || POST | `/api/v1/words/{id}/review` | body `{"result":"known"\|"fuzzy"\|"unknown"}`，返回该词最新状态 |
 | POST | `/api/v1/words/config` | body 可含 `daily_count` / `book` / `reset:true`，返回统计 |
 | GET | `/api/v1/words/history` | **（v1.4.0）** 设备端学习记录。查询参数 `today=1`、`limit=N`（≤200，默认 50）。返回 `items[]`（`spelling`/`result`/`at`/`cloud`）、`count`、`today_only`、`server_ts`。**没有记录不是错误**，返回空数组 |
 | POST | `/api/v1/words/history` | **（v1.4.0）** body `{"clear":true}` 清空学习记录。做成 POST 以免浏览器预取误触发 |
 | POST | `/api/v1/words/export` | **（v1.4.0）** 把当前云端队列重写成 `words/maimemo.json`；没有云端队列时 400 |
+
+> **v1.7.0**：词库还在后台加载时，`/today`、`/stats`、`/next` 返回 **503**
+> （`{"code":503,"msg":"the wordbook is still loading"}`），而不是 500——
+> 「还没好」和「坏了」是两回事。加载失败仍然是 500。
 
 ```powershell
 # 背几张卡之后看记录（设备端）
@@ -370,17 +550,25 @@ idf.py -p COM34 flash monitor
 首次上电（无词库文件时）：
 
 ```
+I (xxx) TH:word: ready (book 'cet6', 10/day, loading in the background)
 I (xxx) TH:word: starter wordbook written to 'words/cet6.json'
 I (xxx) TH:word: using the compiled-in starter wordbook
-I (xxx) TH:word: ready (book 'cet6', 32 words, 10/day)
+I (xxx) TH:word: the wordbook is ready
+I (xxx) TH:word: book loader: 2048 stack item(s) (~2048 B) never used
 ```
 
 第二次上电（文件已在存储上）：
 
 ```
+I (xxx) TH:word: ready (book 'cet6', 10/day, loading in the background)
 I (xxx) TH:word: loaded 32 words from 'words/cet6.json'
 I (xxx) TH:word: progress restored for 3 word(s)
+I (xxx) TH:word: the wordbook is ready
 ```
+
+> v1.7.0 起 `ready (book 'cet6', 10/day, ...)` **不再带词数**：词数要等后台加载完才有。
+> 词的条数看后面那行 `loaded N words from '...'`。
+> 栈水位那两行的判据见上面「`th_word_cq` 的栈 —— 试过 4 KB，板子不接受」一节。
 
 手工验证：
 

@@ -609,7 +609,25 @@ static bool id_taken_locked(uint32_t id)
     return false;
 }
 
-esp_err_t todo_import_json(const char *json)
+/**
+ * @brief 从一份 JSON 文档整体替换清单，可选是否立刻落盘。
+ *
+ * @param json    清单 JSON（todo_export_json() 的输出格式）
+ * @param persist true  = 装载完立刻写盘；
+ *                false = 只改内存（条目、next_id、版本号），**不碰存储介质**。
+ *
+ * 为什么要有 persist 这一个开关：
+ *
+ * - **persist=true** 用在「内容此刻只在这块内存里」的场合。HTTP 导入是
+ *   **整体替换**：不立刻落盘，断电就会把用户刚导入的整份清单丢掉；
+ *   认领 SD 卡上遗留的 `.tmp` 同理 —— 那份内容此刻还只躺在卡上，
+ *   不落盘等于没认领。
+ * - **persist=false** 用在「内容本来就是从这份文件里读出来的」场合：
+ *   开机装载缓存。读进来又原样写回去是白写一次 —— LittleFS 的第一次写
+ *   要擦块、要分配，真机实测这一步约 500 ms（"todo: imported" 到
+ *   "todo: ready" 之间），白等半秒还白磨一次 flash。
+ */
+static esp_err_t todo_import_json_ex(const char *json, bool persist)
 {
     if (json == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -718,6 +736,17 @@ esp_err_t todo_import_json(const char *json)
 
     (void)sys_event_post_to(TODO_EVENT, TODO_EVENT_LIST_CHANGED, NULL, 0);
 
+    if (!persist) {
+        /*
+         * 只装载、不落盘：内容就是刚从文件里读出来的那份，介质上已经
+         * 有它了，没有「未落盘的改动」可记账，所以连变更序号都不动
+         * （动了也不会有人来写——去抖写盘线程要等第一次 todo_mark_dirty()
+         * 才会起来）。
+         */
+        SYS_LOGD(TAG, "import loaded without persisting");
+        return ESP_OK;
+    }
+
     /*
      * An import replaces the whole list, so it must hit the medium right
      * away: waiting for the debounce window would lose the import on a power
@@ -730,6 +759,18 @@ esp_err_t todo_import_json(const char *json)
         SYS_LOGW(TAG, "import could not be persisted: %s", esp_err_to_name(save_err));
     }
     return ESP_OK;
+}
+
+/**
+ * @brief 公开的导入入口：语义是「整体替换 + 立刻落盘」。
+ *
+ * HTTP 导入走的就是这条：内容只在内存里，断电就丢，所以必须马上写盘。
+ * 开机装载缓存那种「内容本来就在文件里」的情况走内部的
+ * todo_import_json_ex(json, false)，不落盘。
+ */
+esp_err_t todo_import_json(const char *json)
+{
+    return todo_import_json_ex(json, true);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -851,7 +892,11 @@ static bool todo_adopt_leftover(void)
         }
 
         SYS_LOGW(TAG, "adopting the leftover '%s' as the todo list", name);
-        const esp_err_t imported = todo_import_json(json);
+        /*
+         * 必须落盘：这份内容此刻还只躺在卡上的 .tmp/.new/.bak 里，
+         * 不写进正式缓存就等于没认领。
+         */
+        const esp_err_t imported = todo_import_json_ex(json, true);
         free(json);
         if (imported != ESP_OK) {
             SYS_LOGW(TAG, "adopting '%s' failed (%s)", name, esp_err_to_name(imported));
@@ -924,13 +969,28 @@ esp_err_t todo_manager_init(void)
                          take_root ? "card" : "internal");
             }
 
-            const esp_err_t parse = todo_import_json(chosen);
+            /*
+             * 开机装载要不要落盘，取决于**选中的那份来自哪个介质**：
+             *
+             * - 选中的就是片内那份（take_root == false）：内容本来就在介质上，
+             *   读进来又原样写回去是白写一次——LittleFS 第一次写要擦块，
+             *   真机实测约 500 ms（"todo: imported" 到 "todo: ready" 之间），
+             *   白等半秒还白磨一次 flash。**不落盘。**
+             * - 选中的是卡上那份（take_root == true）：**必须落盘**，把它
+             *   提升到片内。否则拔卡/换卡（且期间没改过清单）之后，设备会
+             *   退回片内那份旧清单 —— 清单看起来「变回旧版」。这正是 v1.5.0
+             *   在真机上遇到过的场景（卡上 4 条 / 片内 2 条）。
+             *   存储层的迁移只在片内**没有**该文件时才搬（storage_manager.c
+             *   的迁移逻辑），不会替这次「提升」兜底。
+             */
+            const bool persist = take_root;
+            const esp_err_t parse = todo_import_json_ex(chosen, persist);
             if (parse != ESP_OK) {
                 SYS_LOGW(TAG, "cache file unreadable (%s), starting empty",
                          esp_err_to_name(parse));
             }
         } else if (todo_adopt_leftover()) {
-            /* 认领成功，todo_import_json() 已经把内容装进内存并落盘。 */
+            /* 认领成功，todo_import_json_ex(..., true) 已经把内容装进内存并落盘。 */
         } else {
             SYS_LOGI(TAG, "no todo cache yet, starting empty");
         }

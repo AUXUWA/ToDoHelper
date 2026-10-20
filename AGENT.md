@@ -582,6 +582,50 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
    → 令牌**只从 `X-Auth-Token` 头**读；令牌由**设备设置页**或**网页「连接设置」**生成；
    用户随时能在设置页清掉它，所以局域网里被人抢先设了令牌也锁不死人。
 
+### 9.0.1.4 v1.7.0 补进来的六条实测结论（都踩过，别再踩）
+
+1. **工作流里的构建闸门会「exit 0」但根本没构建。**
+   `world.run("bash", ["tools/build.sh", "build"])` 返回 0，日志里还写着「构建通过」，
+   但 `build/todohelper.bin` 的时间戳**没变** —— 那个二进制里根本没有最新代码。
+   害处：烧上去的是**上一版**固件，然后你在新代码里找 bug。
+   → **永远自己看一眼二进制的 mtime**，或者用一条新代码里的独有字符串去 `grep` ELF：
+   ```bash
+   grep -qa "某个新加的日志字符串" build/todohelper.elf && echo IN || echo MISSING
+   ls -l --time-style=+%H:%M:%S build/todohelper.bin
+   ```
+   同理，`world.run` 的 stdout 也不能当成「构建日志」看。
+2. **`-0x008D` 就是「内存不够」，不是 TLS 证书问题。**
+   `esp-tls-mbedtls: mbedtls_ssl_setup returned -0x008D` ——
+   esp-tls 打的是 `-0x%04X`，`-0x008D` = -141 = `PSA_ERROR_INSUFFICIENT_MEMORY`
+   = `MBEDTLS_ERR_SSL_ALLOC_FAILED`。它出现在 `mbedtls_ssl_setup()` 里，
+   也就是**分配 TLS 会话内存失败**，跟证书、跟 DNS 都没关系。
+   → 本工程的病因是**内部堆被切碎**：地址刚到时天气、墨墨同步、云端队列三个
+   HTTPS 同时握手，各要几 KB 连续空间，内部堆最大连续块只有 12~28 KB，
+   于是其中一个握手分配失败。
+   → 治法是**腾内部 RAM**（WiFi 静态缓冲降到 10、项目静态数组搬 PSRAM），
+   **不是**加重试。
+3. **任务栈水位那个数字，单位是「字节」不是「字」。**
+   `uxTaskGetStackHighWaterMark()` 返回的是「从未碰过的 StackType 个数」，
+   而本目标上 `sizeof(StackType_t) == 1`，所以 4096 字节的栈会报出 1800 左右
+   （= 用了约 2300 字节）。看到「水位 1800」别以为栈有 1800 字节富余。
+4. **跑 TLS 握手的任务栈不能低于 6 KB（实测）。**
+   `th_word_cq`（云端队列）按「省 2 KB 内部 RAM」的直觉从 6144 降到 4096，
+   真机直接 `***ERROR*** A stack overflow in task th_word_cq has been detected.`
+   实测这个任务一次握手用了 **4184 字节**。6144 才是对的。
+   → 「省内部 RAM」和「省出栈空间」只能二选一，**先量再改**：
+   让任务跑完打印水位，数字在手再决定。
+5. **`sys_status.wifi_ip` 在没有地址时是 `"0.0.0.0"`，不是空串。**
+   `wifi_manager` 的 `s_ip` 初值就是 `"0.0.0.0"`，开机第一次 `push_status()`
+   就把它抄进了 `sys_status`。所以「`wifi_ip[0] != '\0'` 就算有网」这个判据
+   **恒为真** —— 我据此写的「等 IP 再发请求」那段代码一次都没进过，是死代码。
+   → 判据必须是「非空 **且** 不等于 `"0.0.0.0"`」，工程里 `word_service` 的
+   `have_ip()` 就是这么写的，抄它。
+6. **拿到 IP 不等于网络能用了。**
+   DHCP 把 DNS 服务器地址、路由、lwIP 的解析器跟地址一起送到，比 IP 事件晚一点到。
+   刚拿到地址就发请求，DNS 可能还解析不出来（`getaddrinfo() returns 202`）。
+   → 天气与墨墨在发请求前都要**歇一下**（天气 3 s 重试、墨墨 2 s 沉降），
+   而且「地址到了」要能**补一次**请求（天气已订阅 `WIFI_MGR_EVENT_GOT_IP`）。
+
 ### 9.0.1.1 流畅度五条铁律（v1.2.0 加入，**改 UI 前必读**）
 
 这五条是"界面卡顿/掉帧"的全部真实根因，都已在真机复现并修掉。它们是 §9.0.1

@@ -40,6 +40,72 @@
 
 ---
 
+## 内存策略：读文件的缓冲走 PSRAM（roadmap v1.7.0 B2）
+
+### 问题
+
+`file_read_text()` 原来用**裸 `malloc()`** 读文件内容：
+
+```c
+char *buf = malloc(size + 1);
+```
+
+而 `sdkconfig.defaults` 里有 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`，
+意思是**所有 ≤ 4096 字节的普通分配优先落内部堆**。于是每次读一个几百字节到
+4 KB 的文件（`todos.json` 550 B、`weather.json` 211 B、`words/maimemo.json` …）
+都在**内部 RAM**上占一块，把内部堆切碎。
+
+内部堆的连续性不是小事：AGENT.md §9.0.3 写着 WiFi PHY 重新使能需要约 **30 KB
+连续**内部块，判据是「最大连续块」而不是总空闲量。真机实测（v1.6.0，联网）：
+开机结束时内部 RAM 还剩 55 KB，但**最大连续块只剩 12 KB**。
+
+### 改法
+
+新增一个私有分配器（`storage_malloc()`），与 `sys_utils` 的 `json_malloc()`
+（`components/sys_utils/src/sys_json.c`）同一套写法：
+
+```c
+heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT)
+```
+
+三处分配都改用它：
+
+| 位置 | 内容 | 原来 |
+|---|---|---|
+| `file_read_text()` | 整个文件的内容 | 裸 `malloc()`（≤4 KB 时落内部堆） |
+| `storage_recover_tree()` | 目录项名副本 | 裸 `malloc()` |
+| `storage_migrate_cache_to_pinned()` | 目录项名副本 | 裸 `malloc()` |
+
+后两处是开机恢复 / 升级迁移时按目录项分配的小字符串，同样会在内部堆上留下
+小碎片，而这两条路径都跑在开机最要紧的时候。
+
+### 释放端不用改
+
+IDF 的 `esp_heap_caps.h` 写明「In IDF, `free(p)` is equivalent to
+`heap_caps_free(p)`」，所以调用方现有的 `free(out)` 对 PSRAM 块**同样正确**，
+不需要跨文件改（`todo_manager` / `weather_service` / `word_service` /
+`maimemo_client` / `ai_service` 都不用动）。
+
+### 没动的东西
+
+- **双槽落盘协议（`X.new` → `X.bak` → `X`）与启动恢复逻辑完全没动**，
+  只换了缓冲的分配位置；
+- `storage_read_file()`（调用方自带缓冲）、`file_copy_atomic()`（1 KB 栈上
+  缓冲，只在升级迁移时用）没动。
+
+### 怎么验证
+
+烧板后看启动日志里的 `TH:heap` 读数（`sys_heap_log()`）：
+
+```
+after boot complete   internal  55 KB (largest  12 KB)  psram  11973 KB
+```
+
+`largest` 那列就是「最大连续块」。v1.7.0 的验收目标是
+**联网状态下 `largest ≥ 20 KB`**（见 `docs/ROADMAP_v1.7.0.md` §5）。
+
+---
+
 ## B2 落盘原子性：双槽 + 启动恢复
 
 ### 为什么不是"写 .tmp 再 rename"

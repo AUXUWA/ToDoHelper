@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #include "http_router.h"
@@ -205,6 +206,8 @@ static esp_err_t config_reply(httpd_req_t *req, const char *verify_note)
 static void config_verify_worker(httpd_req_t *req, void *arg)
 {
     (void)arg;
+    /* 显式的用户动作：无视退避闸门，真的发一次请求。 */
+    maimemo_allow_request_now();
     const esp_err_t err = maimemo_verify_token();
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "token verification failed: %s", esp_err_to_name(err));
@@ -306,7 +309,20 @@ static void today_worker(httpd_req_t *req, void *arg)
 {
     (void)arg;
 
-    maimemo_item_t *items = calloc(MAIMEMO_MAX_TODAY, sizeof(maimemo_item_t));
+    /* 显式的用户动作：无视退避闸门，真的发一次请求。 */
+    maimemo_allow_request_now();
+
+    /*
+     * 64 个词条数组有十几 KB，**必须显式走 PSRAM**（roadmap B3）：
+     * 裸 calloc 会按 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 的规则先试内部堆，
+     * 十几 KB 的块虽然最终会落到 PSRAM，但先占内部堆、再释放，留下的洞
+     * 正是开机末期「最大连续块」掉到 12 KB 的原因之一。
+     * 释放用 heap_caps_free()：IDF 里 free(p) 与 heap_caps_free(p) 等价。
+     */
+    maimemo_item_t *items = heap_caps_calloc_prefer(MAIMEMO_MAX_TODAY,
+                                                    sizeof(maimemo_item_t), 2,
+                                                    MALLOC_CAP_SPIRAM,
+                                                    MALLOC_CAP_DEFAULT);
     if (items == NULL) {
         (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
         return;
@@ -315,7 +331,7 @@ static void today_worker(httpd_req_t *req, void *arg)
     size_t count = 0;
     const esp_err_t err = maimemo_fetch_today(items, MAIMEMO_MAX_TODAY, &count);
     if (err != ESP_OK) {
-        free(items);
+        heap_caps_free(items);
         (void)http_reply_esp_error(req, err, "fetch today items");
         return;
     }
@@ -323,7 +339,7 @@ static void today_worker(httpd_req_t *req, void *arg)
     cJSON *obj = cJSON_CreateObject();
     cJSON *array = (obj != NULL) ? cJSON_AddArrayToObject(obj, "items") : NULL;
     if (obj == NULL || array == NULL) {
-        free(items);
+        heap_caps_free(items);
         cJSON_Delete(obj);
         (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "today items");
         return;
@@ -340,7 +356,7 @@ static void today_worker(httpd_req_t *req, void *arg)
         cJSON_AddStringToObject(entry, "first_response", items[i].first_response);
         cJSON_AddItemToArray(array, entry);
     }
-    free(items);
+    heap_caps_free(items);
 
     cJSON_AddNumberToObject(obj, "count", (double)count);
     char *json = cJSON_PrintUnformatted(obj);
@@ -370,6 +386,9 @@ static void enrich_worker(httpd_req_t *req, void *arg)
     /* Owned by the worker: the handler's query buffer is gone by now. Freed on
      * every path below, hence the single-exit shape. */
     char *spelling = (char *)arg;
+
+    /* 显式的用户动作：无视退避闸门，真的发一次请求。 */
+    maimemo_allow_request_now();
 
     maimemo_enrich_t enrich;
     const esp_err_t err = maimemo_enrich(spelling, &enrich);
@@ -462,7 +481,9 @@ static void push_job_free(push_job_t *job)
     for (size_t i = 0; i < job->count; i++) {
         free(job->spellings[i]);
     }
-    free(job->spellings);
+    /* 指针数组是 PSRAM 块：IDF 里 free() 与 heap_caps_free() 等价，
+     * 这里写 heap_caps_free() 只是让「谁分配的」一眼可见。 */
+    heap_caps_free(job->spellings);
     free(job);
 }
 
@@ -487,6 +508,9 @@ static void push_worker(httpd_req_t *req, void *arg)
 {
     push_job_t *job = (push_job_t *)arg;
     int accepted = 0;
+
+    /* 显式的用户动作：无视退避闸门，真的发一次请求。 */
+    maimemo_allow_request_now();
 
     const esp_err_t err = maimemo_push_words((const char **)job->spellings,
                                              job->count, job->advance, &accepted);
@@ -557,7 +581,10 @@ static esp_err_t push_post_handler(httpd_req_t *req)
         cJSON_Delete(root);
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "push");
     }
-    job->spellings = calloc((size_t)count + 1, sizeof(char *));
+    /* 词条指针数组：1000 个指针 = 8 KB，**显式走 PSRAM**（roadmap B3）。
+     * 裸 calloc 会先占内部堆再回落，留下的洞会切碎开机末期的连续块。 */
+    job->spellings = heap_caps_calloc_prefer((size_t)count + 1, sizeof(char *), 2,
+                                             MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     if (job->spellings == NULL) {
         cJSON_Delete(root);
         push_job_free(job);
@@ -614,6 +641,9 @@ static esp_err_t push_post_handler(httpd_req_t *req)
 static void probe_worker(httpd_req_t *req, void *arg)
 {
     (void)arg;
+
+    /* 显式的用户动作：无视退避闸门，真的发一次请求。 */
+    maimemo_allow_request_now();
 
     maimemo_probe_result_t results[MAIMEMO_PROBE_MAX];
     size_t count = 0;
@@ -698,7 +728,7 @@ static void advance_job_free(advance_job_t *job)
     for (size_t i = 0; i < job->count; i++) {
         free(job->spellings[i]);
     }
-    free(job->spellings);
+    heap_caps_free(job->spellings);
     free(job);
 }
 
@@ -706,6 +736,10 @@ static void advance_worker(httpd_req_t *req, void *arg)
 {
     advance_job_t *job = (advance_job_t *)arg;
     int advanced = 0;
+
+    /* 显式的用户动作：无视退避闸门，真的发一次请求。 */
+    maimemo_allow_request_now();
+
     const esp_err_t err = maimemo_advance_spellings((const char **)job->spellings,
                                                     job->count, &advanced);
 
@@ -772,7 +806,10 @@ static esp_err_t advance_post_handler(httpd_req_t *req)
         cJSON_Delete(root);
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "advance words");
     }
-    job->spellings = calloc(count, sizeof(char *));
+    /* 词条指针数组（最多 64 个）：显式走 PSRAM，与推送那条路保持一致
+     * （roadmap B3）。 */
+    job->spellings = heap_caps_calloc_prefer(count, sizeof(char *), 2,
+                                               MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     if (job->spellings == NULL) {
         cJSON_Delete(root);
         advance_job_free(job);

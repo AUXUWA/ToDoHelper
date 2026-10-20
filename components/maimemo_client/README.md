@@ -255,6 +255,109 @@ common_invalid_param: {base} must have required property 'advance'
 回应 `{"data":{"advanced_count":N}}`。**它和 `add_words` 的字段名不一样**
 （`voc_ids` vs `words[].id`），这是照着官方 CLI 的 `types/study.ts` 抄的，不要凭印象写。
 
+## 失败退避与重试策略（v1.7.0）
+
+**一句话：网络不通 → 退避后重试（分钟级）；令牌无效 → 一律不重试，等用户改配置。**
+
+### 为什么必须先分类
+
+墨墨的错误模型让「重试」这件事变得有陷阱：
+
+1. **权限错误也是 HTTP 200**，错误写在信封里（`errors[].code`）；
+2. **HTTP 401 在 IDF 里会让 `esp_http_client_perform()` 直接失败** —— 401 没有
+   `WWW-Authenticate` 头时，`esp_http_client_add_auth()` 打一句
+   `This request requires authentication, but does not provide header information
+   for that` 就返回 `ESP_ERR_NOT_SUPPORTED`
+   （`esp-idf/components/esp_http_client/esp_http_client.c:2126`），
+   于是 perform() 以失败告终 —— **状态码已经是 401，但函数返回的是「没拿到应答」**。
+
+所以同一个「令牌无效」有两种完全不同的长相：401（perform 失败）与
+200 + 信封里的 `unauthorized`/`token`。只看其中一处，就会把「重试也不会成功」
+当成「网络抖了一下」。
+
+### 现在的规矩
+
+| 失败 | 分类 | 怎么处理 |
+|---|---|---|
+| HTTP 401 / 403，或信封里 `unauthorized`/`token` | **认证** | **不重试**。锁存「令牌被拒」，自动路径不再发请求，直到用户换令牌（`maimemo_set_token()` 清锁存） |
+| 作用域不够（`common_permission_denied`）| 终态 | 不重试（也不锁存令牌 —— 令牌是好的，只是这个端点没授权） |
+| 服务端给了别的错误信封、响应超限、不是 JSON | 终态 | 不重试 |
+| DNS 解析失败 / 连不上 / 超时 / 握手失败 | **传输层** | **退避后重试**，间隔按轮数指数增长 |
+
+- **传输层退避**：第 1 轮等 **60 s**，第 2 轮 **120 s**，第 3 轮 **240 s**，
+  第 4 轮 **480 s**，**上限 15 分钟**。
+  「一轮」的定义：相邻两次失败之间至少隔了当前的退避间隔 ——
+  否则一次 `maimemo_enrich()` 里连着失败的三次请求会把退避一次顶到上限。
+- **退避窗口内不再发请求**：`maimemo_fetch_today()` / `maimemo_fetch_progress()`
+  直接返回上一次的错误码；`maimemo_enrich()` 按「查不到这个词」处理
+  （网络不通时它本来也是这个结果）。**调用方看到的错误分类与真发一次完全一样**，
+  省掉的是整条 TLS 往返（外加一次 DNS 查询）。
+- **开机同步**（`maimemo_sync_start()` → `th_mm_sync`）最多试 **3 次**
+  （60 s → 120 s），仍失败才发 `MAIMEMO_EVENT_SYNC_FAILED`。
+  这解决了真机日志里那一幕：开机时还没有 IP，第一次必然失败，
+  旧代码失败就完事，于是墨墨云端队列直到用户手动点同步才会出现。
+- **一次成功就清零**：成功一次，退避计数与「令牌被拒」锁存一起清掉。
+
+### 开机同步：先等地址，退避期间不占名额（v1.7.0 C1/C2 的落地）
+
+- **先等地址再发请求**：worker 开头先看 `sys_status.wifi_ip`
+  （判据与 `word_service` 的 `have_ip()` 一样：**不是空串**，也不能是 `"0.0.0.0"`
+  —— `wifi_manager` 在还没有地址时发布的就是 `"0.0.0.0"`）。
+  最多等 `MM_SYNC_IP_WAIT_MS = 30 s`；到点还没地址就照常发一次。
+  没有地址时 DNS 根本解析不出来（真机日志：`getaddrinfo() returns 202`），
+  开机那一次尝试因此从「注定失败」变成「大概率成功」。
+- **拿到地址之后再沉降 2 秒**（`MM_SYNC_NET_SETTLE_MS`）：地址到了不等于网络能用了 ——
+  DHCP 把 DNS 服务器地址、路由、lwIP 的解析器跟地址一起送到，比 IP 事件晚一点到；
+  这一刻就发请求，DNS 可能还解析不出来。歇两秒再发。
+- **退避期间任务就退出**：退避是分钟级的，如果 worker 在任务里 `vTaskDelay`，
+  那 6 KB 的内部栈（FreeRTOS 的栈只能来自内部 RAM）会被占上一分钟，
+  而且「一次只允许一个同步」的名额也会被占着 —— 网页控制台的「立即同步」
+  会一直拿到 400 “a sync is already running”。
+  现在失败后只排一个**一次性定时器**（`esp_timer`），worker 立刻退出
+  （栈还回内部堆），到点再拉起一个新的 worker（这一轮算**续**，不重置次数）。
+- **「忙」的判据是「电线上有请求」，不是「有一个任务」**：
+  `maimemo_sync_start()` 只在**真的有一个请求在飞**时才返回
+  `ESP_ERR_INVALID_STATE`；等地址、退避等待都不算。
+  控制台的「立即同步」因此随时可用（它走 raw 路径，不会被退避闸门挡掉）。
+- 同一时刻只发**一个**请求：多个 worker（开机同步 + 控制台同步）用一把
+  互斥锁串起来，不会同时在电线上。
+
+### 哪些是「自动路径」，哪些是「用户显式动作」
+
+| 路径 | 退避/锁存生效吗 | 为什么 |
+|---|---|---|
+| 开机同步、云端词队列、翻卡片时的助记/释义补全 | **生效** | 没人盯着，重试只是白烧电台 |
+| 网页控制台的「拉取今日词表」「助记/例句」「推送」「回传」 | 不生效 | 用户点的按钮必须真的发一次请求 |
+| 网页控制台的「测试令牌」（`verify`） | 不生效 | 那是一次显式的连通性检查 |
+| 「探测令牌能力」（`probe`） | 不生效 | 它的用途就是回答「这个令牌到底能做什么」，必须真问 |
+
+显式动作怎么绕过闸门：`maimemo_allow_request_now()`（`maimemo_http.c` 的每个
+worker 开头都调一次）把传输层的退避窗口关掉。**令牌锁存不受它影响** ——
+锁存只由「用户改了配置」（`maimemo_set_token()`）解除。
+
+### 关于 401 的那句日志
+
+真机日志里的 `HTTP_CLIENT: This request requires authentication...` 之后
+**IDF 并没有重发请求**：没有 `WWW-Authenticate` 头时 `add_auth()` 直接失败，
+一次 401 = 一次往返。
+
+**但应用层过去会一遍遍重问**：令牌被拒这件事没有被记下来，
+于是每翻一张卡都重新问一次 `/vocabulary`，每次都拿回同一个 401。
+现在这个 401 会被锁存住（`mm_resolve_voc_id()` 看到锁存就直接放弃），
+自动路径不再重复问；等用户换了令牌再重新开始。
+
+### 中间缓冲一律走 PSRAM（roadmap B3）
+
+- HTTP 响应体（24 KB 上限）、词条数组（`MAIMEMO_MAX_TODAY` × `maimemo_item_t`）、
+  推送/回传的词条指针数组：**显式 `MALLOC_CAP_SPIRAM`**，
+  用 `heap_caps_calloc_prefer()`；释放用 `heap_caps_free()`
+  （IDF 里 `free(p)` 与 `heap_caps_free(p)` 等价）。
+- cJSON 的树与打印出来的文本走**全局钩子**（`sys_json_use_psram()`），
+  本组件在 `maimemo_client_init()` 里再调一次，保证无论初始化顺序如何都是
+  PSRAM 优先。
+- 已经在用 `heap_caps_calloc_prefer()` 的地方（助记缓存数组、
+  回传用的 id 数组）保持不变。
+
 ## 线程规则（**最重要的一条**）
 
 **本组件里所有会做 TLS 的函数都是阻塞的，绝不允许从 LVGL 任务调用。**

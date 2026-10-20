@@ -36,6 +36,10 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+/* 只为了 ESP_ERR_ESP_TLS_* 这一段错误码（DNS/连接/握手失败），
+ * 用来把「传输层失败」和「服务端给了结论」分开。 */
+#include "esp_tls_errors.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -72,7 +76,23 @@ ESP_EVENT_DEFINE_BASE(MAIMEMO_EVENT);
 
 static SemaphoreHandle_t s_lock;
 static StaticSemaphore_t s_lock_buf;
-static TaskHandle_t s_sync_task;
+/**
+ * Sync workers that are **on the wire** (waiting for the request lock, or doing
+ * the request). Only these make a sync "busy".
+ *
+ * The old rule was "a sync task exists -> busy". That made the console's
+ * "sync now" button answer 400 "a sync is already running" for as long as the
+ * worker sat in its backoff sleep (minutes). The slot now belongs to the
+ * **request**, not to the task: waiting for an address or sleeping between
+ * attempts does not block the console.
+ */
+static int s_sync_on_wire;
+/** Serialises the sync requests: at most one TLS round trip at a time. */
+static SemaphoreHandle_t s_sync_req_lock;
+/** One-shot timer that re-launches the sync after a backoff. */
+static esp_timer_handle_t s_sync_retry_timer;
+/** How many requests this round has already made. */
+static uint32_t s_sync_attempts;
 static bool s_initialized;
 
 /** Last successful progress, kept so the UI can paint without the network. */
@@ -112,6 +132,229 @@ static size_t s_cache_count;
 static bool s_cache_loaded;
 
 /* ------------------------------------------------------------------------ */
+/* 失败分类与退避（roadmap v1.7.0 C2）                                       */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * 一次网络失败属于哪一类 —— 决定「要不要再试、隔多久再试」。
+ *
+ * ## 为什么必须分类
+ *
+ * 墨墨的错误模型很特别：**权限错误也返回 HTTP 200**，错误写在信封里
+ * （见 mm_classify）；而 **HTTP 401 在 IDF 里会让
+ * `esp_http_client_perform()` 直接失败** —— 401 没有 WWW-Authenticate 头时，
+ * `esp_http_client_add_auth()` 打一句
+ * "This request requires authentication, but does not provide header
+ * information for that" 就返回 ESP_ERR_NOT_SUPPORTED
+ * （esp_http_client.c:2126），于是 perform() 以失败告终，
+ * **状态码已经是 401，但函数返回的是「没拿到应答」**。
+ *
+ * 于是同一个「令牌无效」有两种完全不同的长相：
+ *   - 401 + 没有 WWW-Authenticate → perform() 失败（看起来像网络问题）；
+ *   - 200 + `errors[].code` 含 unauthorized/token → 走信封分类。
+ * 只看其中一处就会把「重试也不会成功」当成「网络抖了一下」，
+ * 然后一遍遍地重试 —— 这正是 C2 要治的毛病。
+ */
+typedef enum {
+    MM_FAIL_NONE = 0,     /**< 成功 */
+    MM_FAIL_AUTH,         /**< 401/403/令牌被拒：重试也不会成功 */
+    MM_FAIL_TRANSPORT,    /**< DNS/连接/超时：退避之后值得再试 */
+    MM_FAIL_FINAL,        /**< 服务端已经给出结论（错误信封等）：不用再试 */
+} mm_fail_t;
+
+/** 连续传输层失败轮数；成功一次就清零（指数退避的指数）。 */
+static uint32_t s_fail_streak;
+/** 退避窗口的到期时刻（tick）。窗口内不再发自动请求。 */
+static TickType_t s_backoff_until;
+/** 上一次传输层失败的时刻（tick）：用来判断「这是不是同一轮失败」。 */
+static TickType_t s_last_fail_tick;
+/** 上一次失败的错误码：窗口内原样返回，调用方看到的错误分类不变。 */
+static esp_err_t s_last_err;
+/** 上一次失败的性质（存成整数，原子读写更稳）。 */
+static uint32_t s_last_fail;
+/**
+ * 令牌被服务端拒绝（401/403）后置位。
+ *
+ * 置位期间**自动路径不再发请求**：重试同一个被拒的令牌不会成功，
+ * 要等用户改配置（换令牌）才有意义。网页控制台里显式点的按钮仍然是
+ * 一次真实请求 —— 那是用户的诊断动作，不是自动重试。
+ */
+static bool s_token_rejected;
+
+/** 退避窗口的起始间隔：第一次传输层失败后等 1 分钟。 */
+#define MM_BACKOFF_BASE_MS   (60 * 1000)
+/** 退避上限：15 分钟。 */
+#define MM_BACKOFF_MAX_MS    (15 * 60 * 1000)
+/** 开机同步最多试几次（含第一次）。 */
+#define MM_SYNC_MAX_ATTEMPTS 3
+/**
+ * 同步 worker 在发请求前最多等多久才放弃等地址。
+ *
+ * 真机日志：开机 6546 ms 发起同步，7032 ms 才拿到 IP —— 没有地址时
+ * DNS 根本解析不出来（「getaddrinfo() returns 202」），那一次尝试是**注定
+ * 失败**的。所以先等地址（roadmap v1.7.0 C1）。
+ * 30 秒足够覆盖慢一点的 DHCP；到点还没地址就照常发一次（失败也比不发强）。
+ */
+#define MM_SYNC_IP_WAIT_MS 30000
+/** 等地址时的轮询周期。 */
+#define MM_SYNC_IP_POLL_MS 500
+/**
+ * 拿到地址之后还要等多久，网络才算真的能用。
+ *
+ * DHCP 把 DNS 服务器地址、路由和 lwIP 的解析器跟地址一起送到，
+ * 比 IP 事件晚一点到。这两秒是在真机日志上量出来的：地址到了就立刻发请求，
+ * 十有八九是 "couldn't get hostname"（DNS 还没就绪），然后白等一个
+ * 60 秒的退避窗口才有机会再试。
+ */
+#define MM_SYNC_NET_SETTLE_MS 2000
+/** 一次同步最多等「一次只允许一个请求」这把锁多久。 */
+#define MM_SYNC_REQ_LOCK_MS 30000
+
+/**
+ * 第 @p streak 轮失败之后要等多久。
+ *
+ * 指数退避 + 上限：60 s → 120 s → 240 s → 480 s → 900 s（封顶）。
+ * 「分钟级」是刻意的 —— 每 15 秒重试一次 TLS 握手只会把电台和 CPU
+ * 白白烧掉，而 DNS 失败到网络真正可用之间往往就是几十秒到几分钟。
+ */
+static uint32_t mm_backoff_delay_ms(uint32_t streak)
+{
+    if (streak == 0) {
+        streak = 1;
+    }
+    uint32_t delay = MM_BACKOFF_BASE_MS;
+    for (uint32_t i = 1; i < streak; i++) {
+        if (delay >= MM_BACKOFF_MAX_MS) {
+            break;
+        }
+        delay *= 2;
+    }
+    return (delay > MM_BACKOFF_MAX_MS) ? MM_BACKOFF_MAX_MS : delay;
+}
+
+/** 原子读：这些字段会被同步 worker、HTTP worker、UI worker 同时碰。 */
+static mm_fail_t mm_state_last_fail(void)
+{
+    return (mm_fail_t)__atomic_load_n(&s_last_fail, __ATOMIC_ACQUIRE);
+}
+
+static esp_err_t mm_state_last_err(void)
+{
+    return (esp_err_t)__atomic_load_n(&s_last_err, __ATOMIC_ACQUIRE);
+}
+
+static uint32_t mm_state_streak(void)
+{
+    return __atomic_load_n(&s_fail_streak, __ATOMIC_ACQUIRE);
+}
+
+static bool mm_state_token_rejected(void)
+{
+    return __atomic_load_n(&s_token_rejected, __ATOMIC_ACQUIRE);
+}
+
+/**
+ * 记下一次请求的结果，并把退避状态推进一格。
+ *
+ * @param kind 失败分类（MM_FAIL_NONE 表示成功）。
+ * @param err  本次返回给调用方的错误码（原样存下来，窗口内照抄）。
+ */
+static void mm_record_outcome(mm_fail_t kind, esp_err_t err)
+{
+    __atomic_store_n(&s_last_fail, (uint32_t)kind, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_last_err, (int)err, __ATOMIC_RELEASE);
+
+    if (kind == MM_FAIL_NONE) {
+        /* 成功：退避计数与「令牌被拒」标记一起清掉。
+         * 令牌可能是刚被换好的（改配置后第一次调用就会走到这里）。 */
+        __atomic_store_n(&s_fail_streak, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_backoff_until, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_token_rejected, false, __ATOMIC_RELEASE);
+        return;
+    }
+    if (kind == MM_FAIL_AUTH) {
+        /* 令牌被拒：不再自动重试，等用户改配置。 */
+        __atomic_store_n(&s_token_rejected, true, __ATOMIC_RELEASE);
+        return;
+    }
+    if (kind != MM_FAIL_TRANSPORT) {
+        return;   /* 服务端已给出结论：与退避无关 */
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    uint32_t streak = mm_state_streak();
+    /* 只有「隔了至少一个退避间隔」的失败才算新的一轮。
+     * 否则一次 enrich 里的三个端点会连着失败，把退避直接顶到上限。 */
+    if (streak == 0 ||
+        (int32_t)(now - __atomic_load_n(&s_last_fail_tick, __ATOMIC_ACQUIRE)) >=
+            (int32_t)pdMS_TO_TICKS(mm_backoff_delay_ms(streak))) {
+        streak++;
+    }
+    __atomic_store_n(&s_fail_streak, streak, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_last_fail_tick, now, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_backoff_until,
+                     (TickType_t)(now + pdMS_TO_TICKS(mm_backoff_delay_ms(streak))),
+                     __ATOMIC_RELEASE);
+}
+
+/**
+ * 现在处于传输层退避窗口内吗？
+ *
+ * 窗口内自动路径**不发请求**，直接返回上一次失败的错误码 ——
+ * 调用方看到的错误分类与真发一次完全一样，只是省掉了整个 TLS 往返。
+ */
+static bool mm_backoff_active(void)
+{
+    if (mm_state_last_fail() != MM_FAIL_TRANSPORT) {
+        return false;
+    }
+    const TickType_t until = __atomic_load_n(&s_backoff_until, __ATOMIC_ACQUIRE);
+    if (until == 0) {
+        return false;
+    }
+    /* tick 会回绕，用有符号差值比较。 */
+    return (int32_t)(xTaskGetTickCount() - until) < 0;
+}
+
+void maimemo_allow_request_now(void)
+{
+    /*
+     * 关掉退避闸门（保留失败计数）。
+     *
+     * 闸门只管**自动**路径：用户在网页控制台上点按钮是一次显式动作，
+     * 它必须真的发一次请求 —— 网络很可能已经在窗口里恢复了
+     * （开机时还没有 IP 的那一次失败，窗口要开 60 秒，
+     *  而 IP 通常几秒后就到了）。
+     * 下一次失败会照常把窗口重新打开。
+     */
+    __atomic_store_n(&s_backoff_until, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_last_fail, (uint32_t)MM_FAIL_NONE, __ATOMIC_RELEASE);
+}
+
+/** 这个错误码是不是「网络/传输层」的问题（值得退避后重试）。 */
+static bool mm_err_is_transport(esp_err_t err)
+{
+    switch (err) {
+    case ESP_ERR_TIMEOUT:
+    case ESP_ERR_HTTP_CONNECT:            /**< 连不上（含 DNS 解析失败） */
+    case ESP_ERR_HTTP_CONNECTING:
+    case ESP_ERR_HTTP_WRITE_DATA:
+    case ESP_ERR_HTTP_FETCH_HEADER:
+    case ESP_ERR_HTTP_READ_TIMEOUT:
+    case ESP_ERR_HTTP_EAGAIN:
+    case ESP_ERR_HTTP_CONNECTION_CLOSED:
+    case ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME:
+    case ESP_ERR_ESP_TLS_FAILED_CONNECT_TO_HOST:
+    case ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT:
+    case ESP_ERR_ESP_TLS_SERVER_HANDSHAKE_TIMEOUT:
+    case ESP_ERR_ESP_TLS_TCP_CLOSED_FIN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Token / config                                                            */
 /* ------------------------------------------------------------------------ */
 
@@ -137,6 +380,9 @@ esp_err_t maimemo_set_token(const char *token)
 {
     if (token == NULL || token[0] == '\0') {
         (void)sys_config_erase(SYS_KEY_MAIMEMO_TOKEN);
+        /* 令牌被换掉（或者清空）= 「用户改了配置」，退避与锁存一起清掉，
+         * 下一次请求重新从头来过。 */
+        mm_record_outcome(MM_FAIL_NONE, ESP_OK);
         SYS_LOGI(TAG, "token cleared");
         return ESP_OK;
     }
@@ -145,6 +391,9 @@ esp_err_t maimemo_set_token(const char *token)
      * truncated paste without revealing the secret. */
     const esp_err_t err = sys_config_set_str(SYS_KEY_MAIMEMO_TOKEN, token);
     if (err == ESP_OK) {
+        /* 换了令牌就等于「用户改了配置」：之前那次 401 不再作数，
+         * 自动路径可以重新试一次（新令牌对不对，让这一次请求去回答）。 */
+        mm_record_outcome(MM_FAIL_NONE, ESP_OK);
         SYS_LOGI(TAG, "token stored (%u chars)", (unsigned)strlen(token));
     }
     return err;
@@ -232,12 +481,21 @@ typedef enum {
  *
  * HTTP 200 with success:false is the normal shape of a MaiMemo permission or
  * validation error, so this is not an edge case - it is the main error path.
+ *
+ * @param out_err   Receives the esp_err_t to return to the caller.
+ * @param out_class Optional; receives the raw class, which the failure
+ *                  classification (C2) needs: MM_ERR_AUTH means "the token was
+ *                  rejected", which must never be retried.
  */
-static mm_err_class_t mm_classify(const cJSON *root, esp_err_t *out_err)
+static mm_err_class_t mm_classify(const cJSON *root, esp_err_t *out_err,
+                                  mm_err_class_t *out_class)
 {
     const cJSON *success = cJSON_GetObjectItemCaseSensitive(root, "success");
     if (cJSON_IsBool(success) && cJSON_IsTrue(success)) {
         *out_err = ESP_OK;
+        if (out_class != NULL) {
+            *out_class = MM_ERR_NONE;
+        }
         return MM_ERR_NONE;
     }
 
@@ -252,11 +510,17 @@ static mm_err_class_t mm_classify(const cJSON *root, esp_err_t *out_err)
          * the feature degrades by design. */
         SYS_LOGI(TAG, "endpoint not in token scope (%s)", code_str);
         *out_err = ESP_ERR_NOT_SUPPORTED;
+        if (out_class != NULL) {
+            *out_class = MM_ERR_PERMISSION;
+        }
         return MM_ERR_PERMISSION;
     }
     if (strstr(code_str, "unauthorized") != NULL || strstr(code_str, "token") != NULL) {
         SYS_LOGW(TAG, "token rejected (%s)", code_str);
         *out_err = ESP_ERR_INVALID_STATE;
+        if (out_class != NULL) {
+            *out_class = MM_ERR_AUTH;
+        }
         return MM_ERR_AUTH;
     }
 
@@ -264,6 +528,9 @@ static mm_err_class_t mm_classify(const cJSON *root, esp_err_t *out_err)
     SYS_LOGW(TAG, "api error: %s (%s)", cJSON_IsString(msg) ? msg->valuestring : "?",
              code_str);
     *out_err = ESP_ERR_INVALID_RESPONSE;
+    if (out_class != NULL) {
+        *out_class = MM_ERR_OTHER;
+    }
     return MM_ERR_OTHER;
 }
 
@@ -272,10 +539,17 @@ static mm_err_class_t mm_classify(const cJSON *root, esp_err_t *out_err)
  *
  * On success the caller owns *out_root. The returned esp_err_t already carries
  * the permission/auth distinction described in mm_classify().
+ *
+ * @param fail Optional; receives the failure classification (C2) so the caller
+ *             can decide whether the call deserves another try.
  */
-static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
+static esp_err_t mm_post_ex(const char *path, const char *body, cJSON **out_root,
+                            mm_fail_t *fail)
 {
     *out_root = NULL;
+    if (fail != NULL) {
+        *fail = MM_FAIL_NONE;
+    }
 
     char token[MM_TOKEN_MAX];
     if (!mm_token(token, sizeof(token))) {
@@ -301,6 +575,7 @@ static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
 
@@ -316,6 +591,28 @@ static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "POST %s failed: %s", path, esp_err_to_name(err));
         free(resp.buf);
+        /*
+         * 失败也可能是「服务端已经答复了 401」：IDF 的 add_auth() 在没有
+         * WWW-Authenticate 头时让 perform() 以失败告终（状态码已经是 401）。
+         * 所以先看状态码，再看传输层错误码 —— 顺序反了就会把
+         * 「令牌无效」当成「网络不通」然后一遍遍重试。
+         */
+        mm_fail_t kind;
+        if (status == 401 || status == 403) {
+            kind = MM_FAIL_AUTH;
+        } else if (mm_err_is_transport(err)) {
+            kind = MM_FAIL_TRANSPORT;
+        } else {
+            kind = MM_FAIL_FINAL;
+        }
+        if (kind == MM_FAIL_AUTH) {
+            SYS_LOGW(TAG, "POST %s -> HTTP %d: the token was refused; not retrying",
+                     path, status);
+        }
+        mm_record_outcome(kind, err);
+        if (fail != NULL) {
+            *fail = kind;
+        }
         return err;
     }
     if (status != 200) {
@@ -324,13 +621,25 @@ static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
         if (resp.buf == NULL || resp.overflow) {
             SYS_LOGW(TAG, "POST %s -> HTTP %d (no parsable body)", path, status);
             free(resp.buf);
-            return (status == 401 || status == 403) ? ESP_ERR_INVALID_STATE
-                                                    : ESP_ERR_INVALID_RESPONSE;
+            const esp_err_t mapped = (status == 401 || status == 403)
+                                         ? ESP_ERR_INVALID_STATE
+                                         : ESP_ERR_INVALID_RESPONSE;
+            const mm_fail_t kind = (status == 401 || status == 403) ? MM_FAIL_AUTH
+                                                                   : MM_FAIL_FINAL;
+            mm_record_outcome(kind, mapped);
+            if (fail != NULL) {
+                *fail = kind;
+            }
+            return mapped;
         }
         SYS_LOGD(TAG, "POST %s -> HTTP %d, inspecting the error envelope", path, status);
     } else if (resp.buf == NULL || resp.overflow) {
         SYS_LOGW(TAG, "POST %s: response missing or over %d bytes", path, MM_MAX_RESPONSE);
         free(resp.buf);
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_INVALID_SIZE);
+        if (fail != NULL) {
+            *fail = MM_FAIL_FINAL;
+        }
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -340,18 +649,37 @@ static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
     free(resp.buf);
     if (root == NULL) {
         SYS_LOGW(TAG, "POST %s: response is not JSON", path);
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_INVALID_RESPONSE);
+        if (fail != NULL) {
+            *fail = MM_FAIL_FINAL;
+        }
         return ESP_ERR_INVALID_RESPONSE;
     }
 
     esp_err_t api_err = ESP_OK;
-    (void)mm_classify(root, &api_err);
+    mm_err_class_t api_class = MM_ERR_NONE;
+    (void)mm_classify(root, &api_err, &api_class);
     if (api_err != ESP_OK) {
         cJSON_Delete(root);
+        /* 信封说「令牌被拒」→ 不重试；「作用域不够」也是终态（永久性的），
+         * 但那不是令牌坏了，不许锁存。 */
+        const mm_fail_t kind = (api_class == MM_ERR_AUTH) ? MM_FAIL_AUTH : MM_FAIL_FINAL;
+        mm_record_outcome(kind, api_err);
+        if (fail != NULL) {
+            *fail = kind;
+        }
         return api_err;
     }
 
+    mm_record_outcome(MM_FAIL_NONE, ESP_OK);
     *out_root = root;
     return ESP_OK;
+}
+
+/** mm_post() 的对外语义原样保留（返回码与错误分类都不动）。 */
+static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
+{
+    return mm_post_ex(path, body, out_root, NULL);
 }
 
 /**
@@ -367,10 +695,16 @@ static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
  * so using POST to read returns the wrong thing entirely. Verified against the
  * official CLI (`memo-api-cli`), which lists notes as
  * `GET /api/v1/notes?voc_id=...`.
+ *
+ * @param fail Optional; receives the failure classification (C2).
  */
-static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
+static esp_err_t mm_get_ex(const char *path, const char *query, cJSON **out_root,
+                           mm_fail_t *fail)
 {
     *out_root = NULL;
+    if (fail != NULL) {
+        *fail = MM_FAIL_NONE;
+    }
 
     char token[MM_TOKEN_MAX];
     if (!mm_token(token, sizeof(token))) {
@@ -405,6 +739,7 @@ static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) {
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
     esp_http_client_set_header(client, "Authorization", auth);
@@ -416,6 +751,21 @@ static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
     if (err != ESP_OK) {
         SYS_LOGW(TAG, "GET %s failed: %s", path, esp_err_to_name(err));
         free(resp.buf);
+        /* 与 mm_post_ex() 同一套判断：401 也会让 perform() 失败。 */
+        mm_fail_t kind;
+        if (status == 401 || status == 403) {
+            kind = MM_FAIL_AUTH;
+            SYS_LOGW(TAG, "GET %s -> HTTP %d: the token was refused; not retrying",
+                     path, status);
+        } else if (mm_err_is_transport(err)) {
+            kind = MM_FAIL_TRANSPORT;
+        } else {
+            kind = MM_FAIL_FINAL;
+        }
+        mm_record_outcome(kind, err);
+        if (fail != NULL) {
+            *fail = kind;
+        }
         return err;
     }
     if (status != 200) {
@@ -436,12 +786,24 @@ static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
         if (resp.buf == NULL || resp.overflow) {
             SYS_LOGW(TAG, "GET %s -> HTTP %d (no parsable body)", path, status);
             free(resp.buf);
-            return (status == 401 || status == 403) ? ESP_ERR_INVALID_STATE
-                                                    : ESP_ERR_INVALID_RESPONSE;
+            const esp_err_t mapped = (status == 401 || status == 403)
+                                         ? ESP_ERR_INVALID_STATE
+                                         : ESP_ERR_INVALID_RESPONSE;
+            const mm_fail_t kind = (status == 401 || status == 403) ? MM_FAIL_AUTH
+                                                                   : MM_FAIL_FINAL;
+            mm_record_outcome(kind, mapped);
+            if (fail != NULL) {
+                *fail = kind;
+            }
+            return mapped;
         }
         SYS_LOGD(TAG, "GET %s -> HTTP %d, inspecting the error envelope", path, status);
     } else if (resp.buf == NULL || resp.overflow) {
         free(resp.buf);
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_INVALID_SIZE);
+        if (fail != NULL) {
+            *fail = MM_FAIL_FINAL;
+        }
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -449,18 +811,35 @@ static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
     free(resp.buf);
     if (root == NULL) {
         SYS_LOGW(TAG, "GET %s: response is not JSON", path);
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_INVALID_RESPONSE);
+        if (fail != NULL) {
+            *fail = MM_FAIL_FINAL;
+        }
         return ESP_ERR_INVALID_RESPONSE;
     }
 
     esp_err_t api_err = ESP_OK;
-    (void)mm_classify(root, &api_err);
+    mm_err_class_t api_class = MM_ERR_NONE;
+    (void)mm_classify(root, &api_err, &api_class);
     if (api_err != ESP_OK) {
         cJSON_Delete(root);
+        const mm_fail_t kind = (api_class == MM_ERR_AUTH) ? MM_FAIL_AUTH : MM_FAIL_FINAL;
+        mm_record_outcome(kind, api_err);
+        if (fail != NULL) {
+            *fail = kind;
+        }
         return api_err;
     }
 
+    mm_record_outcome(MM_FAIL_NONE, ESP_OK);
     *out_root = root;
     return ESP_OK;
+}
+
+/** mm_get() 的对外语义原样保留（返回码与错误分类都不动）。 */
+static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
+{
+    return mm_get_ex(path, query, out_root, NULL);
 }
 
 /** `data` object of a parsed envelope (borrowed, do not delete). */
@@ -483,15 +862,19 @@ static void mm_copy(char *dst, size_t len, const cJSON *obj, const char *field)
 /* Plan A: study sync                                                        */
 /* ------------------------------------------------------------------------ */
 
-esp_err_t maimemo_fetch_progress(maimemo_progress_t *out)
+/**
+ * Fetch the account progress. The raw variant: always talks to the network.
+ *
+ * Split out from maimemo_fetch_progress() so the callers that must make a
+ * *live* attempt (the console's "verify" button, the sync worker) are not
+ * silently short-circuited by the backoff gate.
+ */
+static esp_err_t mm_fetch_progress_raw(maimemo_progress_t *out, mm_fail_t *fail)
 {
-    if (out == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
     memset(out, 0, sizeof(*out));
 
     cJSON *root = NULL;
-    esp_err_t err = mm_post("study/get_study_progress", "{}", &root);
+    esp_err_t err = mm_post_ex("study/get_study_progress", "{}", &root, fail);
     if (err != ESP_OK) {
         return err;
     }
@@ -519,9 +902,37 @@ esp_err_t maimemo_fetch_progress(maimemo_progress_t *out)
             out->due_count = (int)count->valuedouble;
         }
         cJSON_Delete(rec_root);
+    } else {
+        /*
+         * 这一步是「锦上添花」，它失败**不许**动退避状态。
+         *
+         * 上面的进度调用已经成功了 —— 令牌是好的、网络当时也是通的。
+         * 如果让这次可选调用的失败把退避窗口打开，随后的云端队列构建
+         * （紧跟着 SYNC_DONE 发生）就会被闸门挡掉：一次成功的同步，
+         * 队列反而建不出来。
+         */
+        mm_record_outcome(MM_FAIL_NONE, ESP_OK);
     }
 
     return ESP_OK;
+}
+
+esp_err_t maimemo_fetch_progress(maimemo_progress_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /*
+     * 退避窗口内：不发请求，直接照抄上一次的错误码。
+     * 调用方看到的错误分类与真发一次完全一样，省掉的只是整个 TLS 往返
+     * （以及一次 DNS 查询）。
+     */
+    if (mm_backoff_active()) {
+        return mm_state_last_err();
+    }
+    return mm_fetch_progress_raw(out, NULL);
 }
 
 /**
@@ -598,6 +1009,9 @@ static size_t mm_fetch_today_from_records(maimemo_item_t *out, size_t max)
 
     cJSON *root = NULL;
     if (mm_post("study/query_study_records", body, &root) != ESP_OK) {
+        /* 与上面那个可选调用同理：主调用（today_items）已经成功了，
+         * 这次兜底失败不该把退避窗口打开，把随后的云端队列构建挡在外面。 */
+        mm_record_outcome(MM_FAIL_NONE, ESP_OK);
         return 0;
     }
 
@@ -644,13 +1058,16 @@ static size_t mm_fetch_today_from_records(maimemo_item_t *out, size_t max)
     return index;
 }
 
-esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
+/**
+ * Fetch today's queue. The raw variant: always talks to the network.
+ *
+ * Split out from maimemo_fetch_today() for the same reason as
+ * mm_fetch_progress_raw(): the backoff gate must not turn an explicit
+ * "拉取今日词表" into a cached error.
+ */
+static esp_err_t mm_fetch_today_raw(maimemo_item_t *out, size_t max, size_t *count,
+                                    mm_fail_t *fail)
 {
-    if (out == NULL || count == NULL || max == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *count = 0;
-
     /*
      * Ask for the unfinished words explicitly.
      *
@@ -665,7 +1082,7 @@ esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
              (unsigned)((max > 1000) ? 1000 : max));
 
     cJSON *root = NULL;
-    const esp_err_t err = mm_post("study/get_today_items", body, &root);
+    const esp_err_t err = mm_post_ex("study/get_today_items", body, &root, fail);
     if (err != ESP_OK) {
         return err;
     }
@@ -674,6 +1091,10 @@ esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
     const cJSON *items = data ? cJSON_GetObjectItemCaseSensitive(data, "today_items") : NULL;
     if (!cJSON_IsArray(items)) {
         cJSON_Delete(root);
+        mm_record_outcome(MM_FAIL_FINAL, ESP_ERR_INVALID_RESPONSE);
+        if (fail != NULL) {
+            *fail = MM_FAIL_FINAL;
+        }
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -698,6 +1119,123 @@ esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
     return ESP_OK;
 }
 
+esp_err_t maimemo_fetch_today(maimemo_item_t *out, size_t max, size_t *count)
+{
+    if (out == NULL || count == NULL || max == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+
+    /* 退避窗口内：照抄上一次的错误码，不发请求（见 maimemo_fetch_progress）。 */
+    if (mm_backoff_active()) {
+        return mm_state_last_err();
+    }
+    return mm_fetch_today_raw(out, max, count, NULL);
+}
+
+/**
+ * Does the station have an IPv4 address?
+ *
+ * Same rule as word_service's have_ip(): wifi_manager publishes "0.0.0.0"
+ * while there is no address yet, so "not empty" is not enough - the check has
+ * to look at the value, not at its length.
+ */
+static bool mm_have_ip(void)
+{
+    sys_status_t status;
+    if (sys_status_get(&status) != ESP_OK) {
+        return false;
+    }
+    return status.wifi_ip[0] != '\0' && strcmp(status.wifi_ip, "0.0.0.0") != 0;
+}
+
+/**
+ * Wait until the station has an address (at most @p timeout_ms).
+ *
+ * Waiting here does **not** hold the "one sync at a time" slot: nothing has
+ * been sent yet, so the console's "sync now" must not be refused because of it.
+ */
+static bool mm_wait_for_ip(uint32_t timeout_ms)
+{
+    const int64_t deadline = sys_time_ms() + (int64_t)timeout_ms;
+    for (;;) {
+        if (mm_have_ip()) {
+            /*
+             * 地址到了不等于网络能用了：DHCP 带来的 DNS 服务器地址、路由和
+             * lwIP 的解析器是随地址一起到的，比 IP 事件晚几十到几百毫秒。
+             * 这一刻就发请求，DNS 解析不出来
+             * （真机日志："couldn't get hostname for :open.maimemo.com"），
+             * 白等一个 60 秒的退避窗口才有机会再试。
+             *
+             * 歇两秒再发，这一下就把「开机同步失败」变成「开机同步成功」。
+             */
+            vTaskDelay(pdMS_TO_TICKS(MM_SYNC_NET_SETTLE_MS));
+            return mm_have_ip();
+        }
+        if (sys_time_ms() >= deadline) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(MM_SYNC_IP_POLL_MS));
+    }
+}
+
+/** The sync worker (defined below). */
+static void mm_sync_worker(void *arg);
+
+/** Launch the sync worker (one request per worker instance). */
+static esp_err_t mm_sync_launch(void)
+{
+    /* 6 KB stack: TLS plus a 24 KB heap body (AGENT.md 9.0.2 on stack sizing). */
+    if (xTaskCreate(mm_sync_worker, "th_mm_sync", 6144, NULL, 3, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/** Re-launch the sync after the backoff delay (the timer callback). */
+static void mm_sync_retry_cb(void *arg)
+{
+    (void)arg;
+
+    if (__atomic_load_n(&s_sync_on_wire, __ATOMIC_ACQUIRE) > 0) {
+        /* A request is on the wire right now: that round covers the retry. */
+        return;
+    }
+    if (!maimemo_has_token()) {
+        return;
+    }
+    const esp_err_t err = mm_sync_launch();
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "sync retry not started: %s", esp_err_to_name(err));
+    }
+}
+
+/**
+ * Arm the backoff retry.
+ *
+ * The worker does **not** sleep here: the backoff is minutes long, and
+ * sleeping inside the task would hold 6 KB of internal RAM (a FreeRTOS stack
+ * can only come from internal RAM) plus the "one sync at a time" slot for
+ * that whole time - the console's "sync now" button would keep answering
+ * 400 "a sync is already running".
+ */
+static void mm_sync_arm_retry(uint32_t delay_ms)
+{
+    if (s_sync_retry_timer == NULL) {
+        return;
+    }
+    (void)esp_timer_stop(s_sync_retry_timer);
+    (void)esp_timer_start_once(s_sync_retry_timer, (uint64_t)delay_ms * 1000ULL);
+}
+
+/** Drop a pending retry (a new round supersedes it). */
+static void mm_sync_cancel_retry(void)
+{
+    if (s_sync_retry_timer != NULL) {
+        (void)esp_timer_stop(s_sync_retry_timer);
+    }
+}
+
 /** Worker body of the asynchronous sync. */
 static void mm_sync_worker(void *arg)
 {
@@ -706,8 +1244,56 @@ static void mm_sync_worker(void *arg)
     (void)sys_event_post_to(MAIMEMO_EVENT, MAIMEMO_EVENT_SYNC_STARTED, NULL, 0);
 
     maimemo_progress_t progress = { 0 };
-    esp_err_t err = maimemo_fetch_progress(&progress);
+    esp_err_t err = ESP_FAIL;
+    mm_fail_t fail = MM_FAIL_NONE;
+
+    /*
+     * 先等地址，再发请求（roadmap v1.7.0 C1）。
+     *
+     * 开机这一刻常常还没有 IP（DNS 解析不出来），第一次调用必然失败；
+     * 真机日志里「esp-tls: couldn't get hostname ...」后面紧跟着的就是它。
+     * 等地址这段时间**不算一次尝试**，也**不占「一次只允许一个同步」的名额**
+     * —— 网页控制台的「立即同步」在开机这几秒里照样能发起。
+     */
+    if (!mm_wait_for_ip(MM_SYNC_IP_WAIT_MS)) {
+        SYS_LOGW(TAG, "no IP address after %u s - sending anyway",
+                 (unsigned)(MM_SYNC_IP_WAIT_MS / 1000));
+    }
+
+    /*
+     * 一次只发一个请求：控制台的同步与开机同步可能同时在跑（两者都是
+     * 只读的进度查询），但**不能同时在电线上**。
+     */
+    __atomic_add_fetch(&s_sync_on_wire, 1, __ATOMIC_ACQ_REL);
+    if (s_sync_req_lock == NULL) {
+        /* The lock could not be created (init failed): go ahead anyway. */
+        s_sync_attempts++;
+        err = mm_fetch_progress_raw(&progress, &fail);
+    } else if (xSemaphoreTake(s_sync_req_lock, pdMS_TO_TICKS(MM_SYNC_REQ_LOCK_MS)) != pdTRUE) {
+        SYS_LOGW(TAG, "another sync is still running - this one is skipped");
+        err = ESP_ERR_TIMEOUT;
+        fail = MM_FAIL_TRANSPORT;
+    } else {
+        s_sync_attempts++;
+        err = mm_fetch_progress_raw(&progress, &fail);
+        xSemaphoreGive(s_sync_req_lock);
+    }
+    __atomic_sub_fetch(&s_sync_on_wire, 1, __ATOMIC_ACQ_REL);
+
+    /*
+     * 失败退避（roadmap v1.7.0 C2）。
+     *
+     * 现在的规矩：
+     *   - 令牌被拒（401/403）→ **不重试**，重试也不会成功，等用户改配置；
+     *   - 传输层失败（DNS/连接/超时）→ 指数退避（60 s → 120 s）后再试；
+     *   - 服务端已给出结论（错误信封等）→ 不重试。
+     * 最多 MM_SYNC_MAX_ATTEMPTS 次，之后发 SYNC_FAILED。
+     *
+     * 这里用的是 raw 变体：退避由本轮自己控制，不能被闸门挡掉。
+     * 重试由一次性定时器重新拉起 worker（见 mm_sync_arm_retry）。
+     */
     if (err == ESP_OK) {
+        s_sync_attempts = 0;
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_progress = progress;
         s_have_progress = true;
@@ -718,12 +1304,18 @@ static void mm_sync_worker(void *arg)
                  progress.due_count);
         (void)sys_event_post_to(MAIMEMO_EVENT, MAIMEMO_EVENT_SYNC_DONE,
                                 &progress, sizeof(progress));
+    } else if (fail == MM_FAIL_TRANSPORT && s_sync_attempts < MM_SYNC_MAX_ATTEMPTS) {
+        const uint32_t wait_ms = mm_backoff_delay_ms(mm_state_streak());
+        SYS_LOGW(TAG, "sync failed (%s); retrying in %u s (attempt %u/%u)",
+                 esp_err_to_name(err), (unsigned)(wait_ms / 1000),
+                 (unsigned)(s_sync_attempts + 1), (unsigned)MM_SYNC_MAX_ATTEMPTS);
+        mm_sync_arm_retry(wait_ms);
     } else {
+        s_sync_attempts = 0;
         (void)sys_event_post_to(MAIMEMO_EVENT, MAIMEMO_EVENT_SYNC_FAILED,
                                 &err, sizeof(err));
     }
 
-    s_sync_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -732,14 +1324,17 @@ esp_err_t maimemo_sync_start(void)
     if (!maimemo_has_token()) {
         return ESP_ERR_NOT_FOUND;
     }
-    if (s_sync_task != NULL) {
-        return ESP_ERR_INVALID_STATE;   /* one in flight is enough */
+    if (__atomic_load_n(&s_sync_on_wire, __ATOMIC_ACQUIRE) > 0) {
+        return ESP_ERR_INVALID_STATE;   /* a request is on the wire */
     }
 
-    /* 6 KB stack: TLS plus a 24 KB heap body (AGENT.md 9.0.2 on stack sizing). */
-    if (xTaskCreate(mm_sync_worker, "th_mm_sync", 6144, NULL, 3, &s_sync_task) != pdPASS) {
-        s_sync_task = NULL;
-        return ESP_ERR_NO_MEM;
+    /* A new round supersedes a pending retry. */
+    mm_sync_cancel_retry();
+    s_sync_attempts = 0;
+
+    const esp_err_t err = mm_sync_launch();
+    if (err != ESP_OK) {
+        return err;
     }
     return ESP_OK;
 }
@@ -747,7 +1342,11 @@ esp_err_t maimemo_sync_start(void)
 esp_err_t maimemo_verify_token(void)
 {
     maimemo_progress_t progress = { 0 };
-    const esp_err_t err = maimemo_fetch_progress(&progress);
+    /*
+     * 刻意走 raw 变体：网页控制台上的「测试」是一次**显式**的连通性检查，
+     * 它必须真的发一次请求，不能被退避闸门换成一句缓存的错误。
+     */
+    const esp_err_t err = mm_fetch_progress_raw(&progress, NULL);
     if (err == ESP_OK) {
         SYS_LOGI(TAG, "token OK: %d/%d finished today", progress.finished, progress.total);
     }
@@ -932,15 +1531,30 @@ static mm_cache_entry_t *mm_cache_add(const char *spelling)
     return slot;
 }
 
-/** Resolve a spelling to a voc_id. Returns false when unknown to MaiMemo. */
 /** Resolve a spelling to a voc_id via `GET /vocabulary?spelling=`.
  *
  * Returns false when the word is unknown to MaiMemo, the token is missing, or
  * the request fails - the caller cannot act differently on those cases, so they
- * are deliberately collapsed. */
-static bool mm_resolve_voc_id(const char *spelling, char *out, size_t len)
+ * are deliberately collapsed.
+ *
+ * @param ignore_token_state  true 时不理会「令牌被拒」的锁存，强制发一次请求。
+ *        网页控制台的「探测令牌能力」必须真的去问 —— 它的用途就是回答
+ *        「这个令牌到底能做什么」，拿缓存答案顶替就没有意义了。
+ */
+static bool mm_resolve_voc_id_ex(const char *spelling, char *out, size_t len,
+                                 bool ignore_token_state)
 {
     out[0] = '\0';
+
+    /*
+     * 令牌已经被服务端拒绝（401/403）：再问一次也是同一个答案。
+     * 自动路径（翻卡片、回传词条）到这里直接放弃，不再消耗一次 HTTPS 往返；
+     * 等用户换了令牌（maimemo_set_token 会清掉锁存）才重新开始。
+     */
+    if (!ignore_token_state && mm_state_token_rejected()) {
+        SYS_LOGD(TAG, "the token was refused earlier; not asking the cloud again");
+        return false;
+    }
 
     /* Spellings are single ASCII words, so no percent-encoding is needed. */
     char query[128];
@@ -962,6 +1576,12 @@ static bool mm_resolve_voc_id(const char *spelling, char *out, size_t len)
     return found;
 }
 
+/** Resolve a spelling to a voc_id. Returns false when unknown to MaiMemo. */
+static bool mm_resolve_voc_id(const char *spelling, char *out, size_t len)
+{
+    return mm_resolve_voc_id_ex(spelling, out, len, false);
+}
+
 /**
  * Read one field of the enrichment (`/notes` or `/phrases`).
  *
@@ -974,18 +1594,23 @@ static bool mm_resolve_voc_id(const char *spelling, char *out, size_t len)
  *   ESP_OK                -> @p out filled in
  *   ESP_ERR_NOT_FOUND     -> endpoint answered, nothing for this word
  *   ESP_ERR_NOT_SUPPORTED -> token scope excludes the endpoint (cached as such)
+ *
+ * @param fail Optional; receives the failure classification (C2).
  */
-static esp_err_t mm_fetch_field(const char *path, const char *voc_id,
-                                const char *array_key, const char *text_key,
-                                char *out, size_t len)
+static esp_err_t mm_fetch_field_ex(const char *path, const char *voc_id,
+                                   const char *array_key, const char *text_key,
+                                   char *out, size_t len, mm_fail_t *fail)
 {
     out[0] = '\0';
+    if (fail != NULL) {
+        *fail = MM_FAIL_NONE;
+    }
 
     char query[128];
     snprintf(query, sizeof(query), "voc_id=%s", voc_id);
 
     cJSON *root = NULL;
-    const esp_err_t err = mm_get(path, query, &root);
+    const esp_err_t err = mm_get_ex(path, query, &root, fail);
     if (err != ESP_OK) {
         return err;
     }
@@ -1005,6 +1630,14 @@ static esp_err_t mm_fetch_field(const char *path, const char *voc_id,
     }
     cJSON_Delete(root);
     return result;
+}
+
+/** mm_fetch_field() 的对外语义原样保留。 */
+static esp_err_t mm_fetch_field(const char *path, const char *voc_id,
+                                const char *array_key, const char *text_key,
+                                char *out, size_t len)
+{
+    return mm_fetch_field_ex(path, voc_id, array_key, text_key, out, len, NULL);
 }
 
 /**
@@ -1144,32 +1777,63 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
         return ESP_ERR_NOT_FOUND;
     }
 
+    /*
+     * 退避窗口内：不再发请求。
+     * 返回值与「真的发一次然后失败」一模一样（解析不出词也是 NOT_FOUND），
+     * 所以 UI 与网页都看不出区别，省掉的却是整条 HTTPS 往返。
+     */
+    if (mm_backoff_active()) {
+        SYS_LOGD(TAG, "'%s': skipped, the network is inside its backoff window",
+                 spelling);
+        return ESP_ERR_NOT_FOUND;
+    }
+
     char voc_id[MAIMEMO_VOC_ID_MAX];
     if (!mm_resolve_voc_id(spelling, voc_id, sizeof(voc_id))) {
         SYS_LOGD(TAG, "'%s' is not in the MaiMemo vocabulary", spelling);
         return ESP_ERR_NOT_FOUND;
     }
 
-    /* Both endpoints are permission-gated for a study-scoped token; probing one
-     * is enough to decide, so the second call is skipped when the first says
-     * "not in scope". That halves the wasted requests on the common path. */
-    esp_err_t notes_err = mm_fetch_field("notes", voc_id, "notes", "note",
-                                         out->mnemonic, sizeof(out->mnemonic));
-    esp_err_t phrases_err = ESP_ERR_NOT_SUPPORTED;
-    if (notes_err != ESP_ERR_NOT_SUPPORTED) {
-        phrases_err = mm_fetch_field("phrases", voc_id, "phrases", "phrase",
-                                     out->example, sizeof(out->example));
-    }
-
     /*
-     * 释义 is a separate endpoint with its own scope, so it is attempted even
-     * when the note pair was refused - that combination (queue readable, notes
-     * refused, interpretations readable) is the common study-scoped token, and
-     * the meaning is the field that actually matters for a card.
+     * 三个端点依次问，失败分类决定还要不要问下一个：
+     *   - 传输层失败（DNS/连接/超时）→ **不再往下问**。网络已经断了，
+     *     再连两次只是把同一次失败重复三遍（每次都是一次 TLS 握手）；
+     *     剩下的端点等退避窗口过去、下次翻这张卡时再问。
+     *   - 其它失败 → 按原来的规矩继续（作用域不够是终态，释义仍要单独问）。
      */
-    const esp_err_t meaning_err = mm_fetch_field("interpretations", voc_id,
-                                                 "interpretations", "interpretation",
-                                                 out->meaning, sizeof(out->meaning));
+    mm_fail_t fail = MM_FAIL_NONE;
+    esp_err_t notes_err = mm_fetch_field_ex("notes", voc_id, "notes", "note",
+                                            out->mnemonic, sizeof(out->mnemonic),
+                                            &fail);
+    esp_err_t phrases_err = ESP_ERR_NOT_SUPPORTED;
+    esp_err_t meaning_err = ESP_ERR_NOT_SUPPORTED;
+    if (fail == MM_FAIL_TRANSPORT) {
+        phrases_err = notes_err;
+        meaning_err = notes_err;
+    } else {
+        /* Both endpoints are permission-gated for a study-scoped token; probing one
+         * is enough to decide, so the second call is skipped when the first says
+         * "not in scope". That halves the wasted requests on the common path. */
+        if (notes_err != ESP_ERR_NOT_SUPPORTED) {
+            phrases_err = mm_fetch_field_ex("phrases", voc_id, "phrases", "phrase",
+                                            out->example, sizeof(out->example),
+                                            &fail);
+        }
+        if (fail == MM_FAIL_TRANSPORT) {
+            meaning_err = phrases_err;
+        } else {
+            /*
+             * 释义 is a separate endpoint with its own scope, so it is attempted even
+             * when the note pair was refused - that combination (queue readable, notes
+             * refused, interpretations readable) is the common study-scoped token, and
+             * the meaning is the field that actually matters for a card.
+             */
+            meaning_err = mm_fetch_field_ex("interpretations", voc_id,
+                                            "interpretations", "interpretation",
+                                            out->meaning, sizeof(out->meaning),
+                                            &fail);
+        }
+    }
 
     const bool out_of_scope = (notes_err == ESP_ERR_NOT_SUPPORTED &&
                                phrases_err == ESP_ERR_NOT_SUPPORTED);
@@ -1600,7 +2264,10 @@ static bool mm_probe_voc_id(char *out, size_t len)
     static const char *const CANDIDATES[] = { "abrupt", "abolish", "absolute" };
 
     for (size_t i = 0; i < sizeof(CANDIDATES) / sizeof(CANDIDATES[0]); i++) {
-        if (mm_resolve_voc_id(CANDIDATES[i], out, len)) {
+        /* ignore_token_state = true：探测必须真的发请求。
+         * 就算之前有一次 401 把「令牌被拒」锁存住了，这次探测也要问出
+         * 每个端点自己的结论 —— 那正是这个接口存在的理由。 */
+        if (mm_resolve_voc_id_ex(CANDIDATES[i], out, len, true)) {
             return true;
         }
     }
@@ -1706,7 +2373,42 @@ esp_err_t maimemo_client_init(void)
     if (s_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    /* Serialises the sync requests (see s_sync_on_wire). */
+    s_sync_req_lock = xSemaphoreCreateMutex();
+    if (s_sync_req_lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /*
+     * The backoff retry is driven by a one-shot timer, not by a sleeping
+     * task: the worker exits after a failed attempt, so its 6 KB internal
+     * stack is back in the heap during the (minutes long) wait and the
+     * console's "sync now" is not refused meanwhile.
+     */
+    const esp_timer_create_args_t timer_args = {
+        .callback = mm_sync_retry_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "th_mm_sync",
+    };
+    if (esp_timer_create(&timer_args, &s_sync_retry_timer) != ESP_OK) {
+        SYS_LOGW(TAG, "sync retry timer unavailable: a failed sync will not retry");
+    }
+
     s_initialized = true;
+
+    /*
+     * 让 cJSON 的分配钩子一定是「PSRAM 优先」的样子。
+     *
+     * 本组件用 cJSON 拼请求体（`/study/add_words`、`/study/advance_study`）
+     * 与整份助记缓存（`words/enrich.json`），而 cJSON 的每一次分配都走
+     * 全局钩子。app_main() 早就在开机时调过 sys_json_use_psram()，这里
+     * 再调一次是**幂等**的，只是保证「无论初始化顺序如何」本组件的 JSON
+     * 树与打印出来的文本都落在 PSRAM，而不是把内部堆切碎
+     * （roadmap B3；AGENT.md §9.0.5）。
+     */
+    sys_json_use_psram();
 
     esp_err_t http_err = maimemo_register_http();
     if (http_err != ESP_OK) {
