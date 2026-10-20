@@ -278,6 +278,37 @@ typedef struct {
 } face_objects_t;
 
 /**
+ * The values last written to one eye.
+ *
+ * LVGL style writes do not compare: every lv_obj_set_style_*() call marks the
+ * object dirty and the whole 150x150 eye is repainted, even when the new value
+ * is bit-identical to the old one. The animator ticks 30 times a second and
+ * used to write 32 properties per tick (two eyes: outline, pupil, X strokes),
+ * i.e. ~970 unconditional writes per second - most of them for values that had
+ * not changed at all (ROADMAP v1.8.1 §5, AGENT.md 9.0.1.1 rule 2: compare
+ * first, then write).
+ *
+ * So every value that is written to an eye is remembered here, and a write is
+ * skipped when the value is the same as last time. `valid` is false until the
+ * first write after the objects were created, so nothing is ever left at its
+ * default.
+ */
+typedef struct {
+    bool valid;                  /**< false -> the next tick writes everything */
+    int32_t eye_w;
+    int32_t eye_h;
+    int32_t border_width;
+    lv_opa_t border_opa;
+    lv_border_side_t border_side;
+    int32_t radius;
+    lv_opa_t line_opa[2];
+    int32_t line_width[2];
+    int32_t pupil_size;
+    int32_t pupil_radius;
+    lv_opa_t pupil_bg_opa;
+} eye_style_cache_t;
+
+/**
  * A cross-fade in flight.
  *
  * Expression switches used to snap because `s_current` was lerped towards the
@@ -296,6 +327,9 @@ typedef struct {
 
 static face_objects_t s_face;
 static bool s_attached;
+
+/** Last style values written to each eye (see eye_style_cache_t). */
+static eye_style_cache_t s_style_cache[2];
 
 static idle_face_state_t s_state = IDLE_FACE_NORMAL;
 static face_params_t s_current;
@@ -605,6 +639,104 @@ static void update_xfade(uint32_t dt_ms)
 /* Rendering                                                                 */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * The eye's box.
+ *
+ * The height only moves with the breath, the drowsiness and the blinks, so it
+ * is usually the same number for many ticks in a row. Writing it anyway
+ * invalidates the whole 150x150 eye, so it is compared first.
+ */
+static void eye_size_apply(lv_obj_t *eye, eye_style_cache_t *cache, int32_t w, int32_t h)
+{
+    if (cache->valid && cache->eye_w == w && cache->eye_h == h) {
+        return;
+    }
+    lv_obj_set_size(eye, w, h);
+    cache->eye_w = w;
+    cache->eye_h = h;
+}
+
+/**
+ * The eye's outline: border width, opacity, side and the circular radius.
+ *
+ * These four only change when the expression changes (a thicker outline for
+ * some states, no border in the X shape, a half outline for the happy arc),
+ * so they are written on change only.
+ */
+static void eye_outline_apply(lv_obj_t *eye, eye_style_cache_t *cache, int32_t border,
+                              lv_opa_t border_opa, lv_border_side_t border_side)
+{
+    if (cache->valid &&
+        cache->border_width == border &&
+        cache->border_opa == border_opa &&
+        cache->border_side == border_side &&
+        cache->radius == LV_RADIUS_CIRCLE) {
+        return;
+    }
+
+    lv_obj_set_style_border_width(eye, border, 0);
+    lv_obj_set_style_border_opa(eye, border_opa, 0);
+    lv_obj_set_style_border_side(eye, border_side, 0);
+    /* A radius equal to half the height turns the outline into an ellipse;
+     * for the happy arc the bottom half is simply not drawn. */
+    lv_obj_set_style_radius(eye, LV_RADIUS_CIRCLE, 0);
+
+    cache->border_width = border;
+    cache->border_opa = border_opa;
+    cache->border_side = border_side;
+    cache->radius = LV_RADIUS_CIRCLE;
+}
+
+/** The pupil: size, circular shape and opacity. */
+static void pupil_style_apply(lv_obj_t *pupil, eye_style_cache_t *cache, int32_t size,
+                              lv_opa_t bg_opa)
+{
+    if (!cache->valid) {
+        lv_obj_set_size(pupil, size, size);
+        lv_obj_set_style_radius(pupil, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(pupil, bg_opa, 0);
+        cache->pupil_size = size;
+        cache->pupil_radius = LV_RADIUS_CIRCLE;
+        cache->pupil_bg_opa = bg_opa;
+        return;
+    }
+
+    if (cache->pupil_size != size) {
+        lv_obj_set_size(pupil, size, size);
+        cache->pupil_size = size;
+    }
+    if (cache->pupil_radius != LV_RADIUS_CIRCLE) {
+        lv_obj_set_style_radius(pupil, LV_RADIUS_CIRCLE, 0);
+        cache->pupil_radius = LV_RADIUS_CIRCLE;
+    }
+    if (cache->pupil_bg_opa != bg_opa) {
+        lv_obj_set_style_bg_opa(pupil, bg_opa, 0);
+        cache->pupil_bg_opa = bg_opa;
+    }
+}
+
+/** One stroke of the X shape: opacity and width. */
+static void line_style_apply(lv_obj_t *line, eye_style_cache_t *cache, int k, lv_opa_t opa,
+                             int32_t width)
+{
+    if (!cache->valid) {
+        lv_obj_set_style_line_opa(line, opa, 0);
+        lv_obj_set_style_line_width(line, width, 0);
+        cache->line_opa[k] = opa;
+        cache->line_width[k] = width;
+        return;
+    }
+
+    if (cache->line_opa[k] != opa) {
+        lv_obj_set_style_line_opa(line, opa, 0);
+        cache->line_opa[k] = opa;
+    }
+    if (cache->line_width[k] != width) {
+        lv_obj_set_style_line_width(line, width, 0);
+        cache->line_width[k] = width;
+    }
+}
+
 static void apply_params(uint32_t now)
 {
     if (!s_attached) {
@@ -696,6 +828,7 @@ static void apply_params(uint32_t now)
     for (int i = 0; i < 2; i++) {
         lv_obj_t *eye = s_face.eye[i];
         lv_obj_t *pupil = s_face.pupil[i];
+        eye_style_cache_t *cache = &s_style_cache[i];
         if (eye == NULL) {
             continue;
         }
@@ -703,15 +836,12 @@ static void apply_params(uint32_t now)
         const int32_t eye_x = (i == 0) ? -(int32_t)(s_eye_gap / 2 + s_eye_base_w / 2)
                                        : (int32_t)(s_eye_gap / 2 + s_eye_base_w / 2);
 
-        lv_obj_set_size(eye, eye_w, arc_mode ? eye_h_eye[i] / 2 : eye_h_eye[i]);
+        eye_size_apply(eye, cache, eye_w, arc_mode ? eye_h_eye[i] / 2 : eye_h_eye[i]);
         lv_obj_align(eye, LV_ALIGN_CENTER, eye_x + face_x, face_y);
 
-        lv_obj_set_style_border_width(eye, border, 0);
-        lv_obj_set_style_border_opa(eye, cross_mode ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
-        lv_obj_set_style_border_side(eye, arc_mode ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL, 0);
-        /* A radius equal to half the height turns the outline into an ellipse;
-         * for the happy arc the bottom half is simply not drawn. */
-        lv_obj_set_style_radius(eye, LV_RADIUS_CIRCLE, 0);
+        eye_outline_apply(eye, cache, border,
+                          cross_mode ? LV_OPA_TRANSP : LV_OPA_COVER,
+                          arc_mode ? LV_BORDER_SIDE_TOP : LV_BORDER_SIDE_FULL);
 
         /* Pupil: kept inside the eye and shifted by dx/dy. */
         if (pupil != NULL) {
@@ -730,9 +860,6 @@ static void apply_params(uint32_t now)
             const int32_t travel_x = (eye_w - pupil_size) / 2 - border;
             const int32_t travel_y = (eye_h_eye[i] - pupil_size) / 2 - border;
 
-            lv_obj_set_size(pupil, pupil_size, pupil_size);
-            lv_obj_set_style_radius(pupil, LV_RADIUS_CIRCLE, 0);
-
             float opacity = s_current.pupil;
             if (arc_mode || cross_mode) {
                 opacity = 0.0f;
@@ -744,7 +871,7 @@ static void apply_params(uint32_t now)
             if (opacity > 1.0f) {
                 opacity = 1.0f;
             }
-            lv_obj_set_style_bg_opa(pupil, (lv_opa_t)(opacity * LV_OPA_COVER), 0);
+            pupil_style_apply(pupil, cache, pupil_size, (lv_opa_t)(opacity * LV_OPA_COVER));
 
             /* The table's dx/dy, plus the idle glance, plus this eye's own
              * micro-saccade offset, plus the continuous gaze wander. */
@@ -770,10 +897,12 @@ static void apply_params(uint32_t now)
             if (line == NULL) {
                 continue;
             }
-            lv_obj_set_style_line_opa(line, cross_mode ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            lv_obj_set_style_line_width(line, border, 0);
+            line_style_apply(line, cache, k, cross_mode ? LV_OPA_COVER : LV_OPA_TRANSP, border);
             lv_obj_align(line, LV_ALIGN_CENTER, eye_x + face_x, face_y);
         }
+
+        /* Everything of this eye has been written at least once now. */
+        cache->valid = true;
     }
 }
 
@@ -1701,6 +1830,10 @@ esp_err_t idle_face_attach(lv_obj_t *parent)
 
     s_face.container = canvas;
     s_attached = true;
+
+    /* Fresh objects: the cached "last written" values belong to the previous
+     * ones, so forget them and let the next tick write everything once. */
+    memset(s_style_cache, 0, sizeof(s_style_cache));
 
     /* Start from the current state without a visible jump. */
     s_current = *params_for(s_state);

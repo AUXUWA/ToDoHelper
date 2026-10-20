@@ -57,6 +57,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "ai_service.h"
 #include "http_router.h"
 #include "sys_keys.h"
 #include "sys_status.h"
@@ -334,6 +335,7 @@ static void cmd_help(dbg_out_t *o)
         "  click <target>           press a widget (by label text or index)\n"
         "  text <target> <value>    set a label's text\n"
         "  slider <target> <value>  move a slider (fires VALUE_CHANGED, like a tap)\n"
+        "  scroll <target> <dy>     scroll a scrollable object by dy pixels\n"
         "  page <id|name>           switch page (0..10 or splash/home/...)\n"
         "  tap <x> <y>              report which widget is at a screen point\n"
         "  idle <enter|exit>        force idle-face enter/leave\n"
@@ -640,6 +642,7 @@ typedef struct {
     int index;
     bool do_text;
     bool do_slider;
+    bool do_scroll;
     const char *value;
 } click_args_t;
 
@@ -661,6 +664,36 @@ static void ui_click_cb(void *arg)
         }
         lv_label_set_text(obj, c->value);
         out_printf(c->out, "set %s text to '%s'\n", class_name_of(obj), c->value);
+        return;
+    }
+
+    if (c->do_scroll) {
+        /*
+         * Scroll a scrollable widget by a number of pixels.
+         *
+         * The windowed lists (the WiFi scan list, the todo list) only build the
+         * rows inside the viewport; the rows outside are represented by two gap
+         * objects. Whether the window actually follows the scroll is the one
+         * thing a dump of the object tree cannot show - and it is exactly what a
+         * regression would look like ("the list shows the same 8 rows no matter
+         * how far you scroll").
+         *
+         * So: scroll it, and then look at the tree again.
+         */
+        if (!lv_obj_check_type(obj, &lv_obj_class)) {
+            out_printf(c->out, "'%s' is a %s, not an object\n", c->target,
+                       class_name_of(obj));
+            return;
+        }
+        const int32_t dy = (int32_t)atoi(c->value);
+        /* _bounded, not the raw one: a real finger gesture is clamped to the
+         * content (lv_indev_scroll_handler -> scroll_limit_diff), and an
+         * unbounded scroll would happily move past the end and then look like
+         * "the list can scroll into nowhere". */
+        lv_obj_scroll_by_bounded(obj, 0, dy, LV_ANIM_OFF);
+        out_printf(c->out, "scrolled %s by %d -> y=%d (scrollable=%d)\n", c->target,
+                   (int)dy, (int)lv_obj_get_scroll_y(obj),
+                   (int)lv_obj_has_flag(obj, LV_OBJ_FLAG_SCROLLABLE));
         return;
     }
 
@@ -1170,6 +1203,21 @@ static void dbg_exec(char *line, dbg_out_t *out)
         if (!run_on_lvgl(ui_click_cb, &args, 5000)) {
             out_printf(out, "LVGL task did not respond\n");
         }
+    } else if (strcmp(cmd, "scroll") == 0) {
+        if (a1 == NULL || argc < 3) {
+            out_printf(out, "usage: scroll <target> <dy> [index]\n");
+            return;
+        }
+        click_args_t args = {
+            .out = out,
+            .target = a1,
+            .index = (argc >= 4) ? atoi(argv[3]) : 0,
+            .do_scroll = true,
+            .value = argv[2],
+        };
+        if (!run_on_lvgl(ui_click_cb, &args, 5000)) {
+            out_printf(out, "LVGL task did not respond\n");
+        }
     } else if (strcmp(cmd, "slider") == 0) {
         if (a1 == NULL || argc < 3) {
             out_printf(out, "usage: slider <label-or-class> <value> [index]\n");
@@ -1237,7 +1285,14 @@ static void dbg_exec(char *line, dbg_out_t *out)
              */
             char value[256];
             esp_err_t err = sys_config_get_str(a2, value, sizeof(value));
-            if (err == ESP_OK) {
+            if (strcmp(a2, SYS_KEY_AI_API_KEY) == 0) {
+                /*
+                 * The API key is never read back (requirement 8.8) - not even
+                 * here. Only "is it set" is answered.
+                 */
+                out_printf(out, "%s = %s\n", a2,
+                           (err == ESP_OK && value[0] != '\0') ? "(set)" : "(unset)");
+            } else if (err == ESP_OK) {
                 out_printf(out, "%s = %s (%s)\n", a2, value, esp_err_to_name(err));
             } else {
                 int32_t number = 0;
@@ -1249,8 +1304,21 @@ static void dbg_exec(char *line, dbg_out_t *out)
                 }
             }
         } else if (strcmp(a1, "set") == 0 && a2 != NULL && argc > 3) {
-            const esp_err_t err = sys_config_set_str(a2, argv[3]);
-            out_printf(out, "set %s = %s -> %s\n", a2, argv[3], esp_err_to_name(err));
+            if (strcmp(a2, SYS_KEY_AI_API_KEY) == 0) {
+                /*
+                 * Go through the service, not straight to NVS: ai_service keeps
+                 * a cached "is a key configured" flag (the home page reads it
+                 * every 5 s from the LVGL task), and writing the key behind its
+                 * back would leave that flag stale until the next reboot.
+                 *
+                 * The value is not echoed back either - it is a secret.
+                 */
+                const esp_err_t err = ai_service_set_api_key(argv[3]);
+                out_printf(out, "set %s -> %s\n", a2, esp_err_to_name(err));
+            } else {
+                const esp_err_t err = sys_config_set_str(a2, argv[3]);
+                out_printf(out, "set %s = %s -> %s\n", a2, argv[3], esp_err_to_name(err));
+            }
         } else {
             out_printf(out, "usage: cfg get <key> | cfg set <key> <value>\n");
         }
@@ -1259,8 +1327,14 @@ static void dbg_exec(char *line, dbg_out_t *out)
             out_printf(out, "usage: nvs <key>   (erases the key)\n");
             return;
         }
-        const esp_err_t err = sys_config_erase(a1);
-        out_printf(out, "erase %s -> %s\n", a1, esp_err_to_name(err));
+        if (strcmp(a1, SYS_KEY_AI_API_KEY) == 0) {
+            /* Through the service again, so the cached flag follows. */
+            const esp_err_t err = ai_service_set_api_key("");
+            out_printf(out, "erase %s -> %s\n", a1, esp_err_to_name(err));
+        } else {
+            const esp_err_t err = sys_config_erase(a1);
+            out_printf(out, "erase %s -> %s\n", a1, esp_err_to_name(err));
+        }
     } else if (strcmp(cmd, "http-auth") == 0) {
         /*
          * Read or replace the HTTP auth token.

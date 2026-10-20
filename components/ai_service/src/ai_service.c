@@ -75,6 +75,24 @@ static EXT_RAM_BSS_ATTR char s_last_reply[AI_MESSAGE_MAX];
 static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
 
+/*
+ * 「是否已配置 API Key」缓存。
+ *
+ * 首页的状态卡每 5 秒调一次 ai_service_has_api_key()，而这个调用跑在**持有
+ * 适配器锁的 LVGL 任务**里。改之前每次调用都要 sys_config_get_str() →
+ * xSemaphoreTake() + nvs_get_str()，会和网页端 / 设置页的 NVS 写抢同一把分区
+ * 锁，整个 UI 会冻到写完为止（ROADMAP v1.8.1 §3）。
+ *
+ * 这里**只缓存一个布尔量**：Key 本身永远不进缓存，也不写日志、不通过任何
+ * 接口读回（requirement 8.8）。缓存的更新走 ai_service 自己那把互斥锁
+ * s_lock，不另造全局锁。
+ *
+ * 缓存值只在两种情况下变化：开机初始化、ai_service_set_api_key() 成功之后。
+ * 语义与改之前一致 —— 设备上「AI 对话」卡片该显示「未配置 API Key」时，
+ * 依然显示未配置。
+ */
+static volatile bool s_has_api_key;
+
 static TaskHandle_t s_task;
 static QueueHandle_t s_requests;
 static volatile bool s_abort;
@@ -155,8 +173,29 @@ static bool api_key(char *out, size_t len)
     return out[0] != '\0';
 }
 
+/**
+ * 更新「Key 是否已配置」缓存。
+ *
+ * 在 ai_service 现有的互斥锁（s_lock）下做，调用方不得持有该锁。
+ * s_lock 还没建出来（init 之前）时直接写 —— 那时还没有别的任务在跑。
+ */
+static void api_key_flag_set(bool has_key)
+{
+    if (s_lock != NULL) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_has_api_key = has_key;
+        xSemaphoreGive(s_lock);
+    } else {
+        s_has_api_key = has_key;
+    }
+}
+
 bool ai_service_has_api_key(void)
 {
+    if (s_initialized) {
+        return s_has_api_key;
+    }
+    /* 还没初始化就还没有缓存：直接读 NVS，行为与加缓存之前完全一样。 */
     char key[128];
     return api_key(key, sizeof(key));
 }
@@ -907,12 +946,15 @@ esp_err_t ai_service_set_api_key(const char *key)
 {
     if (key == NULL || key[0] == '\0') {
         (void)sys_config_erase(SYS_KEY_AI_API_KEY);
+        api_key_flag_set(false);
         SYS_LOGI(TAG, "API key cleared");
         return ESP_OK;
     }
     /* Stored only: never logged, never returned by any API (requirement 8.8). */
     esp_err_t err = sys_config_set_str(SYS_KEY_AI_API_KEY, key);
     if (err == ESP_OK) {
+        /* 只有写成功才改缓存：写失败时磁盘上的 Key 没变，缓存也不该变。 */
+        api_key_flag_set(true);
         SYS_LOGI(TAG, "API key stored");
     }
     return err;
@@ -1005,6 +1047,18 @@ esp_err_t ai_service_init(void)
     s_save_history = sys_config_get_bool_or(SYS_KEY_AI_SAVE_HIST, CONFIG_TODOHELPER_AI_SAVE_HISTORY);
     s_message_count = 0;
     s_messages = NULL;   /* 历史缓冲区按需分配，不在开机时占内存 */
+
+    /*
+     * 开机读一次 NVS，把「Key 是否已配置」记进内存。之后每次查询都读缓存，
+     * 首页的 5 秒刷新就不再去抢 NVS 的分区锁了。
+     * Key 本身只在这一瞬间出现在栈上的临时缓冲里，用完即弃，不进缓存。
+     */
+    {
+        char key[128];
+        const bool has_key = api_key(key, sizeof(key));
+        memset(key, 0, sizeof(key));   /* 不在栈上留下密钥的残留 */
+        api_key_flag_set(has_key);
+    }
 
     s_initialized = true;
     (void)ai_service_clear_history();

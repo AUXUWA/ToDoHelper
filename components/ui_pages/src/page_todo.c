@@ -28,6 +28,14 @@
  * The rows are rebuilt from a snapshot each time the *shape* of the list
  * changes; otherwise the widgets are updated in place.
  *
+ * The row widgets are **destroyed when the page is hidden** and rebuilt from the
+ * cached snapshot when it comes back (ROADMAP v1.8.1 §2): ui_core only *hides*
+ * the page container, so without this the rows (the biggest batch of objects on
+ * this page) would stay in the heap forever and shred the internal heap into
+ * unusable fragments. The page's chrome (header, filter bar, stats line, the
+ * two height placeholders) stays alive - it is tiny, and rebuilding it would
+ * make the page flicker.
+ *
  * Every LVGL call below runs in the LVGL task: create()/on_show()/on_event()
  * are invoked by ui_core, and ui_event_bind() marshals into that task — see
  * AGENT.md 9.0.1.
@@ -177,6 +185,15 @@ static int32_t row_pitch(void)
 {
     return (s_row_h > 0) ? (s_row_h + TODO_ROW_GAP) : TODO_ROW_PITCH;
 }
+
+/**
+ * 记住的滚动位置。
+ *
+ * 页面被切走时行控件会被销毁（on_hide），列表的内容因此会塌回顶部；回来时
+ * 要按这个位置复原。改动之前行控件一直留在页面上，滚动位置自然不会丢，
+ * 所以这里复刻的是改动前的观感 —— 不是「回到顶部」。
+ */
+static int32_t s_scroll_y;
 
 /**
  * Make sure the row table can hold @p need entries. Returns false on OOM.
@@ -549,7 +566,12 @@ fail:
     return false;
 }
 
-/** Drop every row (structural change, or an empty list). */
+/**
+ * Drop every row (structural change, an empty list, or the page being hidden).
+ *
+ * 「行还在不在」由 s_row_count / s_win_start 这两个标志说了算，所以这里必须
+ * 把它们一起清掉 —— 否则第二次进页面时会以为行还在，结果屏幕上空空如也。
+ */
 static void rows_clear(void)
 {
     if (s_rows != NULL) {
@@ -1150,20 +1172,93 @@ static esp_err_t todo_create(lv_obj_t *parent)
     return ESP_OK;
 }
 
+/**
+ * 页面回来之后把列表滚回离开时的位置。
+ *
+ * 行控件被销毁又重建之后，列表的内容高度变了：内容不够高时 LVGL 会把滚动
+ * 位置夹回 0（lv_obj_readjust_scroll），这时按 s_scroll_y 复原。目标位置超出
+ * 内容高度时 lv_obj_scroll_to_y() 自己会夹到最大值，所以这里不用再算一遍上限。
+ *
+ * 如果位置还在（LVGL 一直保留着它，或者惯性滚动又往后走了），就一点都不动 ——
+ * 改动之前行控件一直留在页面上，列表停在它自己滚到的位置，观感不能变。
+ */
+static void scroll_restore(void)
+{
+    if (s_list == NULL || s_scroll_y <= 0) {
+        return;
+    }
+
+    /*
+     * 判据是「跟记住的值一样吗」，**不是**「是不是 0」。
+     *
+     * 原来的写法（`if (lv_obj_get_scroll_y(s_list) != 0) return;`）在复核里被判成
+     * 一个用户可见的回归：行控件被销毁后列表内容塌成两个占位对象，LVGL 会在
+     * 下一次布局时把滚动位置**夹**到「剩余内容允许的最大值」
+     * （lv_obj.c 的 readjust_scroll_after_layout → lv_obj_pos.c →
+     * lv_obj_scroll.c 的 readjust_scroll）。于是列表里留下的是**夹断后的值**
+     * （例如 30 条 / 槽位 10 / 视口 435 时，原始 1477 被夹成 837，差约 10 行），
+     * 而上面那条判据只看「是不是 0」，夹断后的值不是 0 → 直接返回 →
+     * **位置根本没复原**。这条路径最常被触发的是「点开一条待办 → 从详情页返回」。
+     */
+    if (lv_obj_get_scroll_y(s_list) == s_scroll_y) {
+        /* 位置正是我们要的：什么都不要做。 */
+        return;
+    }
+
+    /* LV_ANIM_OFF：不带动画，直接落位。
+     * lv_obj_scroll_to_y 内部会先 lv_obj_update_layout()，这时行控件已经重建，
+     * 所以夹断是按**最终内容**算的 —— 位置能精确复原。 */
+    lv_obj_scroll_to_y(s_list, s_scroll_y, LV_ANIM_OFF);
+
+    /* 滚动事件会把渲染窗口挪到对应的位置；万一事件没来（例如目标位置没变），
+     * 这里再补一次重画，保证窗口和滚动位置对得上。 */
+    render_window(false);
+}
+
 static esp_err_t todo_on_show(void)
 {
+    /* 行控件在 on_hide 里被销毁了，这里按缓存里的数据重建。
+     * 数据取自 todo_manager 的内存缓存：todo_list_filtered() 只在 RAM 里拷
+     * 一份快照，不碰 SD 卡 / flash（落盘是 todo_manager 自己异步做的）。 */
     refresh();
+
+    /* 回到离开本页时的滚动位置（跟改动前的观感一致）。 */
+    scroll_restore();
     return ESP_OK;
 }
 
 static esp_err_t todo_on_hide(void)
 {
+    /* 先记住滚动位置：行控件马上要被销毁，列表的内容会塌回顶部。 */
+    if (s_list != NULL) {
+        /*
+         * 惯性滚动（手指甩出去之后的那段动画）要停掉。
+         * 否则记住的是**动画中途**的值，而动画还在跑 —— 回来时复原到的位置
+         * 会跟动画打架（两边都以为自己说了算），位置就飘了。
+         */
+        lv_anim_delete(s_list, NULL);
+        s_scroll_y = lv_obj_get_scroll_y(s_list);
+    }
+
+    /* 行控件是这一页最大的一批对象（每行 8 个控件），页面被切走时它们留在堆里
+     * 正是内部堆碎片化的来源之一（ROADMAP v1.8.1 §2）：ui_core 只把别的页面
+     * 藏起来（lv_obj_add_flag(HIDDEN)），对象并不销毁。这里把它们销毁掉，
+     * 页面外壳（标题、筛选条、统计行、两个占位对象）留着 —— 它们很少，
+     * 销毁重建只会让页面闪一下。
+     *
+     * on_hide 由 ui_core 的 page_switch_locked() 调用，跑在 LVGL 任务里，
+     * 所以这里动 LVGL 对象是安全的（不在 httpd 回调里）。 */
+    const size_t released = s_row_count;
+    rows_clear();
+
     /* 离开本页就把快照放了：滚动时要用它重画窗口里的行，别的页面用不上。 */
     if (s_items != NULL) {
         todo_free_list(s_items);
         s_items = NULL;
         s_item_count = 0;
     }
+
+    SYS_LOGD(TAG, "todo page hidden: %u row widgets released", (unsigned)released);
     return ESP_OK;
 }
 

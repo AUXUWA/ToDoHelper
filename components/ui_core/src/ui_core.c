@@ -74,6 +74,18 @@ static ui_page_id_t s_nav[UI_NAV_STACK_MAX];
 static size_t s_nav_depth;
 static bool s_initialized;
 
+/**
+ * The 1 Hz clock timer.
+ *
+ * It writes the status bar's clock once a second, so it may only run while the
+ * status bar is on display. The standby screen hides the whole status bar
+ * (enter_idle()), and a timer that keeps running then writes into a hidden
+ * label every second - which is exactly the "timer without an owner" that
+ * AGENT.md 9.0.1.1 rule 3 forbids. The handle is kept here so the idle
+ * transition can pause it and the wake-up can resume it.
+ */
+static lv_timer_t *s_clock_timer;
+
 /** Page that was visible when the idle timer fired (FR6 11.4). */
 static ui_page_id_t s_page_before_idle = UI_PAGE_HOME;
 
@@ -696,9 +708,30 @@ static esp_err_t on_button(int32_t event_id, void *data)
     return ESP_OK;
 }
 
+/**
+ * Start or stop the 1 Hz clock timer.
+ *
+ * Runs in the LVGL task (the idle/wake events are marshalled into it), so
+ * touching the timer handle is safe.
+ */
+static void clock_timer_set_running(bool running)
+{
+    if (s_clock_timer == NULL) {
+        return;
+    }
+    if (running) {
+        lv_timer_resume(s_clock_timer);
+    } else {
+        lv_timer_pause(s_clock_timer);
+    }
+}
+
 static esp_err_t enter_idle(void)
 {
     if (s_current == UI_PAGE_IDLE_FACE) {
+        /* Already on the standby screen: the status bar is hidden (and the
+         * clock timer paused) since the first entry. */
+        clock_timer_set_running(false);
         return ESP_OK;
     }
 
@@ -713,6 +746,9 @@ static esp_err_t enter_idle(void)
         /* Requirement 11.1: the idle screen is full black, so the status bar
          * (which lives outside the page container) has to go too. */
         lv_obj_add_flag(s_statusbar, LV_OBJ_FLAG_HIDDEN);
+        /* The status bar is gone, so the clock has nobody to write to: stop
+         * the 1 Hz timer instead of filling a hidden label once a second. */
+        clock_timer_set_running(false);
     }
 
     /*
@@ -749,6 +785,12 @@ static esp_err_t leave_idle(void)
     if (s_statusbar != NULL) {
         lv_obj_remove_flag(s_statusbar, LV_OBJ_FLAG_HIDDEN);
     }
+
+    /* The status bar is back: the clock timer may run again. The refresh below
+     * makes the clock correct on the very first visible frame instead of up to
+     * a second later. */
+    clock_timer_set_running(true);
+    (void)ui_statusbar_refresh();
 
     if (s_current == UI_PAGE_IDLE_FACE) {
         (void)ui_page_switch(s_page_before_idle);
@@ -835,7 +877,10 @@ esp_err_t ui_core_init(void)
         lv_obj_remove_flag(s_content, LV_OBJ_FLAG_SCROLLABLE);
     }
 
-    (void)lv_timer_create(clock_tick_cb, 1000, NULL);
+    s_clock_timer = lv_timer_create(clock_tick_cb, 1000, NULL);
+    if (s_clock_timer == NULL) {
+        SYS_LOGW(TAG, "clock timer unavailable, the status bar clock will not tick");
+    }
 
     /* Drains the cross-task event queue. 20 ms keeps a notification within about
      * one frame of being published without waking the LVGL task when idle: the

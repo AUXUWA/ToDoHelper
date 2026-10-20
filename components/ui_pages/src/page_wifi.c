@@ -13,10 +13,19 @@
  *
  * Scanning is always started with wifi_manager_start_scan(): the blocking
  * variant would stall the LVGL task for up to 15 s and freeze the UI.
+ *
+ * The AP list is windowed: only the rows inside the viewport exist as
+ * widgets, the rows outside are height padding (two spacer objects). Building
+ * all 24 rows meant 72 widgets on this page, which fragmented the internal
+ * heap so badly that its largest free block fell to 1.9 KB - too small for
+ * the WiFi PHY to re-enable (AGENT.md 9.0.3). The windowing keeps the list
+ * height, the scrollbar and the row positions exactly as they were.
  */
 
 #include "pages_internal.h"
 
+#include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "wifi_manager.h"
@@ -38,6 +47,81 @@ static lv_obj_t *s_pass_area;
 static lv_obj_t *s_status_detail;
 static char s_pending_ssid[WIFI_MANAGER_SSID_MAX + 1];
 static wifi_view_t s_view_current = WIFI_VIEW_SCAN;
+
+/* ------------------------------------------------------------------------ */
+/* Scan list windowing                                                        */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * 行距：行高（UI_LIST_ROW_HEIGHT = 56）+ 列表的行间距（s_scan_list 的 pad_row 6 px）。
+ *
+ * 视口里放得下几行、滚动时窗口往哪挪、占位对象要撑多高，全靠这个数。行高是
+ * 固定的（lv_obj_set_height(row, 56)），所以这个数是准的（第一次布局之后
+ * 还会用实测行高再校准一次，见 s_row_h）。
+ */
+#define WIFI_ROW_GAP    6
+#define WIFI_ROW_PITCH  (UI_LIST_ROW_HEIGHT + WIFI_ROW_GAP)
+
+/** 视口上下各多渲染一行：滚动时这一行已经在屏外，不会看到空白。 */
+#define WIFI_WINDOW_BUFFER 1
+
+/** 同时存活的行数上限（可视行数 + 上下缓冲）。 */
+#define WIFI_WINDOW_MAX_ROWS 10
+
+/** 视口高度还量不出来时按这个值算（页面刚建好、还没排版时）。 */
+#define WIFI_FALLBACK_VIEW_H 300
+
+/**
+ * 扫描结果的静态副本（PSRAM）。
+ *
+ * wifi_manager_get_scan_result() 每次都把结果拷出来，点击那一刻的栈上副本
+ * 早没了，所以必须留一份在手上：行槽号 → AP 下标 → 这份副本里的 SSID。
+ */
+static EXT_RAM_BSS_ATTR wifi_ap_info_t s_aps[WIFI_MANAGER_MAX_APS];
+
+/** 当前扫描结果的条数（≤ WIFI_MANAGER_MAX_APS）。 */
+static size_t s_ap_count;
+
+/** 行槽号 → 当前 AP 下标（窗口挪动时更新）。 */
+static uint8_t s_slot_ap[WIFI_WINDOW_MAX_ROWS];
+
+/** 一行的三个控件（复用：窗口挪动时只换内容，不重建）。 */
+typedef struct {
+    lv_obj_t *row;
+    lv_obj_t *name;
+    lv_obj_t *meta;
+} wifi_row_t;
+
+static wifi_row_t s_rows[WIFI_WINDOW_MAX_ROWS];
+
+/** 已经建好控件的行数。 */
+static size_t s_row_count;
+
+/** 当前渲染的窗口起点（AP 下标）。 */
+static size_t s_win_start;
+
+/** 窗口上方 / 下方的占位对象（空对象，只占高度）。 */
+static lv_obj_t *s_gap_top;
+static lv_obj_t *s_gap_bottom;
+
+/** 占位对象上一次写入的高度（-1 = 没写过 / 已隐藏）。 */
+static int32_t s_gap_top_h = -1;
+static int32_t s_gap_bottom_h = -1;
+
+/** 视口（列表可见区）高度，量一次用一阵。 */
+static int32_t s_view_h;
+
+/** 实测行高：第一次布局之后才知道，用来校准行距。 */
+static int32_t s_row_h = UI_LIST_ROW_HEIGHT;
+
+/** 「还没有扫描结果」的提示标签（列表里一个 AP 都没有时才在）。 */
+static lv_obj_t *s_scan_empty;
+
+/** 现在的行距（实测行高 + 行间距）。 */
+static int32_t row_pitch(void)
+{
+    return (s_row_h > 0) ? (s_row_h + WIFI_ROW_GAP) : WIFI_ROW_PITCH;
+}
 
 /* ------------------------------------------------------------------------ */
 /* View switching                                                            */
@@ -62,12 +146,24 @@ static void show_view(wifi_view_t view)
 /* Scan view                                                                 */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * 点了一行：事件的用户数据是行槽号，不是 AP 下标。
+ *
+ * 窗口挪动后同一批行控件会换成另一批 AP，所以下标不能写死在事件里 ——
+ * 先用槽号查「槽号 → AP 下标」表，再从静态副本里取 SSID。
+ */
 static void ap_clicked_cb(lv_event_t *e)
 {
-    const char *ssid = (const char *)lv_event_get_user_data(e);
-    if (ssid == NULL) {
+    const size_t slot = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    if (slot >= s_row_count || slot >= WIFI_WINDOW_MAX_ROWS) {
         return;
     }
+    const size_t ap_idx = s_slot_ap[slot];
+    if (ap_idx >= s_ap_count) {
+        return;
+    }
+
+    const char *ssid = s_aps[ap_idx].ssid[0] ? s_aps[ap_idx].ssid : "(隐藏网络)";
 
     strlcpy(s_pending_ssid, ssid, sizeof(s_pending_ssid));
     if (s_pass_ssid != NULL) {
@@ -92,55 +188,351 @@ static void scan_clicked_cb(lv_event_t *e)
     }
 }
 
+/**
+ * 建一个只占高度的空对象（窗口之外的行用它占位）。
+ *
+ * 没有背景、没有边框，也不接收触摸：它唯一的作用是让列表的总高度跟
+ * 「全部行都在」时一模一样，滚动条长度因此跟以前一样。
+ */
+static lv_obj_t *gap_create(void)
+{
+    lv_obj_t *gap = lv_obj_create(s_scan_list);
+    if (gap == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(gap);
+    lv_obj_set_width(gap, LV_PCT(100));
+    lv_obj_set_height(gap, 0);
+    lv_obj_remove_flag(gap, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(gap, LV_OBJ_FLAG_HIDDEN);
+    return gap;
+}
+
+/**
+ * 让列表的总高度跟「全部行都在」时一模一样。
+ *
+ * 窗口上方缺 start 行、下方缺 (total - start - slots) 行，这两段高度由两个
+ * 占位对象补出来。算式是照着 flex 的排版来的：行与行之间有一个 WIFI_ROW_GAP
+ * 的间距，所以占位对象的高度要减掉这个间距（而且占位对象如果高度归零就整个
+ * 藏起来 —— 藏起来之后 flex 不再给它留间距，总高度才对得上）。
+ *
+ * 高度没变就不写（滚动事件每个像素都来一次，无脑重设样式会让整页重排）。
+ */
+static void window_gaps(size_t start, size_t slots, size_t total)
+{
+    if (s_gap_top == NULL || s_gap_bottom == NULL) {
+        return;
+    }
+
+    if (slots == 0 || total == 0) {
+        if (!lv_obj_has_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (!lv_obj_has_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_gap_top_h = -1;
+        s_gap_bottom_h = -1;
+        return;
+    }
+
+    if (start > 0) {
+        const int32_t h = (int32_t)(start * (size_t)row_pitch()) - WIFI_ROW_GAP;
+        if (lv_obj_has_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (h != s_gap_top_h) {
+            s_gap_top_h = h;
+            lv_obj_set_height(s_gap_top, h);
+        }
+    } else {
+        if (!lv_obj_has_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_top, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_gap_top_h = -1;
+    }
+
+    /* rest 是窗口下面还差几行。调用方保证 start + slots <= total，这里再兜
+     * 一次底：size_t 相减一旦下溢就是天文数字，占位对象会撑出一个巨大的高度。 */
+    const size_t rest = (start + slots < total) ? (total - start - slots) : 0;
+    if (rest > 0) {
+        const int32_t h = (int32_t)(rest * (size_t)row_pitch()) - WIFI_ROW_GAP;
+        if (lv_obj_has_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_remove_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (h != s_gap_bottom_h) {
+            s_gap_bottom_h = h;
+            lv_obj_set_height(s_gap_bottom, h);
+        }
+    } else {
+        if (!lv_obj_has_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_gap_bottom, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_gap_bottom_h = -1;
+    }
+}
+
+/**
+ * 把窗口里的每一行画成对应的那一条 AP。
+ *
+ * 行控件是复用的：窗口挪动时同一批控件换成另一批 AP，所以这里只改内容，
+ * 不重建控件（铁律二：先比较再写）。
+ */
+static void window_paint(size_t start, size_t slots)
+{
+    for (size_t i = 0; i < slots; i++) {
+        const size_t idx = start + i;
+        if (idx >= s_ap_count || i >= WIFI_WINDOW_MAX_ROWS) {
+            break;
+        }
+        wifi_row_t *r = &s_rows[i];
+        if (r->name == NULL || r->meta == NULL) {
+            break;
+        }
+
+        /* 槽号 → AP 下标：点击回调靠它找到要连的 SSID。 */
+        s_slot_ap[i] = (uint8_t)idx;
+
+        const char *ssid = s_aps[idx].ssid[0] ? s_aps[idx].ssid : "(隐藏网络)";
+        if (strcmp(lv_label_get_text(r->name), ssid) != 0) {
+            lv_label_set_text(r->name, ssid);
+        }
+
+        char meta[64];
+        snprintf(meta, sizeof(meta), "%d dBm · ch%u · %s", (int)s_aps[idx].rssi,
+                 s_aps[idx].channel,
+                 s_aps[idx].authmode == WIFI_AUTH_OPEN ? "开放" : "加密");
+        if (strcmp(lv_label_get_text(r->meta), meta) != 0) {
+            lv_label_set_text(r->meta, meta);
+        }
+    }
+}
+
+/**
+ * 建一行的控件（只建一次，之后只改内容）。
+ *
+ * 事件的用户数据是行槽号：窗口挪动后 AP 下标会变，槽号不会。
+ */
+static bool row_create(size_t slot)
+{
+    wifi_row_t *r = &s_rows[slot];
+
+    lv_obj_t *row = lv_button_create(s_scan_list);
+    if (row == NULL) {
+        return false;
+    }
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, UI_LIST_ROW_HEIGHT);
+    lv_obj_set_style_bg_color(row, UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_radius(row, UI_CARD_RADIUS, 0);
+    lv_obj_set_style_pad_hor(row, 14, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *name = lv_label_create(row);
+    if (name == NULL) {
+        lv_obj_delete(row);
+        return false;
+    }
+    lv_obj_set_flex_grow(name, 1);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_font(name, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(name, UI_COLOR_TEXT, 0);
+
+    lv_obj_t *meta = lv_label_create(row);
+    if (meta == NULL) {
+        lv_obj_delete(row);
+        return false;
+    }
+    lv_obj_set_style_text_font(meta, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(meta, UI_COLOR_TEXT_MUTED, 0);
+
+    lv_obj_add_event_cb(row, ap_clicked_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)slot);
+
+    r->row = row;
+    r->name = name;
+    r->meta = meta;
+    return true;
+}
+
+/** 把建好的行控件全删掉（下次按新的行数重建）。 */
+static void rows_clear(void)
+{
+    for (size_t i = 0; i < s_row_count; i++) {
+        if (s_rows[i].row != NULL) {
+            lv_obj_delete(s_rows[i].row);
+            s_rows[i].row = NULL;
+        }
+        s_rows[i].name = NULL;
+        s_rows[i].meta = NULL;
+    }
+    s_row_count = 0;
+    s_win_start = 0;
+}
+
+/** 列表里一个 AP 都没有时的提示（跟改动前一字不差）。 */
+static void scan_empty_show(void)
+{
+    if (s_scan_list == NULL || s_scan_empty != NULL) {
+        return;
+    }
+    s_scan_empty = lv_label_create(s_scan_list);
+    if (s_scan_empty == NULL) {
+        return;
+    }
+    lv_label_set_text(s_scan_empty, "还没有扫描结果，点“重新扫描”。");
+    lv_obj_set_style_text_font(s_scan_empty, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(s_scan_empty, UI_COLOR_TEXT_MUTED, 0);
+}
+
+static void scan_empty_hide(void)
+{
+    if (s_scan_empty != NULL) {
+        lv_obj_delete(s_scan_empty);
+        s_scan_empty = NULL;
+    }
+}
+
+/**
+ * 画列表：只画视口里的那几行。
+ *
+ * @param measure true = 重新量视口高度（数据变了 / 页面刚显示时），false =
+ *                沿用上次量到的高度（滚动的时候用，免得每滚一个像素就重排一次）。
+ */
+static void render_scan_window(bool measure)
+{
+    if (s_scan_list == NULL) {
+        return;
+    }
+
+    const size_t total = s_ap_count;
+
+    if (total == 0) {
+        if (s_row_count != 0) {
+            rows_clear();
+        }
+        window_gaps(0, 0, 0);
+        scan_empty_show();
+        return;
+    }
+
+    /* 有 AP 就没有「还没有扫描结果」这句：它会占一行，把下面的行挤下去。 */
+    scan_empty_hide();
+
+    if (measure) {
+        /* 视口多高？量一次就够，滚动时不再量。 */
+        lv_obj_update_layout(s_scan_list);
+        const int32_t h = lv_obj_get_height(s_scan_list);
+        if (h > 0) {
+            s_view_h = h;
+        }
+        if (s_row_count > 0 && s_rows[0].row != NULL) {
+            const int32_t rh = lv_obj_get_height(s_rows[0].row);
+            if (rh > 0) {
+                s_row_h = rh;
+            }
+        }
+    }
+    if (s_view_h <= 0) {
+        s_view_h = WIFI_FALLBACK_VIEW_H;
+    }
+
+    /* 视口里放得下几行 —— 再加上下各一行缓冲。 */
+    const size_t visible = (size_t)((s_view_h + row_pitch() - 1) / row_pitch());
+    size_t win = visible + 2 * WIFI_WINDOW_BUFFER;
+    if (win > WIFI_WINDOW_MAX_ROWS) {
+        win = WIFI_WINDOW_MAX_ROWS;
+    }
+    if (win < visible) {
+        /* 视口比上限还高时宁可多建几行，也不能让视口底部留空白。 */
+        win = visible;
+    }
+    const size_t slots = (win < total) ? win : total;
+
+    /* 窗口起点：视口里第一条行往上留一行缓冲。 */
+    size_t first = 0;
+    const int32_t scroll_y = lv_obj_get_scroll_y(s_scan_list);
+    if (scroll_y > 0) {
+        first = (size_t)(scroll_y / row_pitch());
+    }
+    size_t start = (first > WIFI_WINDOW_BUFFER) ? first - WIFI_WINDOW_BUFFER : 0;
+    if (start + slots > total) {
+        start = total - slots;
+    }
+
+    if (measure) {
+        /* 行的个数变了才重建控件；只是换了内容就原地改。 */
+        if (slots != s_row_count) {
+            /* 先把占位对象撑到最终的样子：建行期间列表总高不变，滚动位置
+             * 就不会被 LVGL 夹断（夹断了用户会被弹回列表顶上）。 */
+            window_gaps(start, slots, total);
+            rows_clear();
+            for (size_t i = 0; i < slots; i++) {
+                if (!row_create(i)) {
+                    SYS_LOGE(TAG, "scan list out of memory");
+                    break;
+                }
+                s_row_count++;
+            }
+            /* 占位对象要排在所有行后面（flex 按子对象顺序排版）。 */
+            if (s_gap_bottom != NULL) {
+                lv_obj_move_to_index(s_gap_bottom, -1);
+            }
+            SYS_LOGD(TAG, "scan list: %u aps, %u rows in window", (unsigned)total,
+                     (unsigned)s_row_count);
+        }
+    } else {
+        /* 滚动路径：控件已经在，只挪窗口，不重建。 */
+        if (s_row_count == 0) {
+            return;
+        }
+        if (start + s_row_count > total) {
+            start = total - s_row_count;
+        }
+        if (start == s_win_start) {
+            /* 窗口没动：内容也不用重画（滚动事件每个像素都来一次）。 */
+            return;
+        }
+    }
+
+    s_win_start = start;
+    window_gaps(start, s_row_count, total);
+    window_paint(start, s_row_count);
+}
+
+/**
+ * 列表滚动了：窗口跟着挪。
+ *
+ * 只换内容、不重建控件（窗口外面那几行用占位对象顶着，滚动条长度不变）。
+ */
+static void scan_list_scroll_cb(lv_event_t *e)
+{
+    (void)e;
+    render_scan_window(false);
+}
+
+/**
+ * 重新读一次扫描结果并画列表。
+ *
+ * 结果直接拷进 PSRAM 里的静态副本 —— 点击那一刻已经没有栈上副本可用了。
+ */
 static void render_scan_list(void)
 {
     if (s_scan_list == NULL) {
         return;
     }
-    lv_obj_clean(s_scan_list);
 
-    wifi_ap_info_t aps[WIFI_MANAGER_MAX_APS];
     size_t count = 0;
-    if (wifi_manager_get_scan_result(aps, WIFI_MANAGER_MAX_APS, &count) != ESP_OK || count == 0) {
-        lv_obj_t *empty = lv_label_create(s_scan_list);
-        lv_label_set_text(empty, "还没有扫描结果，点“重新扫描”。");
-        lv_obj_set_style_text_font(empty, ui_font(UI_FONT_BODY), 0);
-        lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
+    if (wifi_manager_get_scan_result(s_aps, WIFI_MANAGER_MAX_APS, &count) != ESP_OK ||
+        count == 0) {
+        s_ap_count = 0;
+        render_scan_window(true);
         return;
     }
 
-    const size_t shown = (count > WIFI_MANAGER_MAX_APS) ? WIFI_MANAGER_MAX_APS : count;
-    for (size_t i = 0; i < shown; i++) {
-        /* AP records are only valid until the next scan, so copy the SSID into
-         * a per-row buffer that lives as long as the widget. */
-        static EXT_RAM_BSS_ATTR char ssid_bufs[WIFI_MANAGER_MAX_APS][WIFI_MANAGER_SSID_MAX + 1];
-        strlcpy(ssid_bufs[i], aps[i].ssid[0] ? aps[i].ssid : "(隐藏网络)", sizeof(ssid_bufs[i]));
-
-        lv_obj_t *row = lv_button_create(s_scan_list);
-        lv_obj_set_width(row, LV_PCT(100));
-        lv_obj_set_height(row, UI_LIST_ROW_HEIGHT);
-        lv_obj_set_style_bg_color(row, UI_COLOR_SURFACE, 0);
-        lv_obj_set_style_radius(row, UI_CARD_RADIUS, 0);
-        lv_obj_set_style_pad_hor(row, 14, 0);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-
-        lv_obj_t *name = lv_label_create(row);
-        lv_label_set_text(name, ssid_bufs[i]);
-        lv_obj_set_flex_grow(name, 1);
-        lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
-        lv_obj_set_style_text_font(name, ui_font(UI_FONT_BODY), 0);
-        lv_obj_set_style_text_color(name, UI_COLOR_TEXT, 0);
-
-        lv_obj_t *meta = lv_label_create(row);
-        lv_label_set_text_fmt(meta, "%d dBm · ch%u · %s", (int)aps[i].rssi, aps[i].channel,
-                              aps[i].authmode == WIFI_AUTH_OPEN ? "开放" : "加密");
-        lv_obj_set_style_text_font(meta, ui_font(UI_FONT_SMALL), 0);
-        lv_obj_set_style_text_color(meta, UI_COLOR_TEXT_MUTED, 0);
-
-        lv_obj_add_event_cb(row, ap_clicked_cb, LV_EVENT_CLICKED, ssid_bufs[i]);
-    }
+    s_ap_count = (count > WIFI_MANAGER_MAX_APS) ? WIFI_MANAGER_MAX_APS : count;
+    render_scan_window(true);
 }
 
 static void open_status_cb(lv_event_t *e)
@@ -175,6 +567,18 @@ static esp_err_t wifi_create_scan_view(lv_obj_t *parent)
     lv_obj_set_style_pad_right(s_scan_list, 6, 0);
     lv_obj_add_flag(s_scan_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_scan_list, LV_DIR_VER);
+
+    /* 窗口上下的占位对象：把窗口之外的行的高度补出来，滚动条长度不变。
+     * 上面的那个必须是列表的第一个子对象，下面的那个排在所有行后面
+     * （行是后来才建的，建完要把占位对象挪到末尾）。 */
+    s_gap_top = gap_create();
+    s_gap_bottom = gap_create();
+    if (s_gap_top == NULL || s_gap_bottom == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 滚动：窗口跟着挪，只换内容。 */
+    lv_obj_add_event_cb(s_scan_list, scan_list_scroll_cb, LV_EVENT_SCROLL, NULL);
 
     lv_obj_t *bar = lv_obj_create(s_view[WIFI_VIEW_SCAN]);
     lv_obj_remove_style_all(bar);
@@ -461,6 +865,9 @@ static esp_err_t wifi_on_show(void)
 {
     refresh_scan_hint();
     refresh_status();
+    /* The page is on screen now, so the viewport height can finally be
+     * measured: re-measure it and let the window follow the real viewport. */
+    render_scan_window(true);
     /* A fresh scan on entry keeps the list current without a manual tap. */
     (void)wifi_manager_start_scan();
     return ESP_OK;
