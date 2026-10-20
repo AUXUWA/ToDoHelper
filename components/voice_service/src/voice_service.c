@@ -65,6 +65,16 @@ static SemaphoreHandle_t s_init_sem;
 /** How long the codec gets to answer before we stop waiting for it. */
 #define VOICE_INIT_TIMEOUT_MS 3000
 
+/**
+ * Stack for the tasks that talk to a cloud endpoint.
+ *
+ * They do HTTPS requests, and the mbedTLS handshake eats the caller's stack:
+ * AGENT.md §9.0.1.4 records that a TLS task must not go below 6 KB (a smaller one
+ * panics at random). 8192 is the size the AI service uses for the same kind of
+ * request, verified on this board.
+ */
+#define VOICE_HTTP_TASK_STACK 8192
+
 static int16_t *s_pcm;          /* VOICE_MAX_SAMPLES mono samples, in PSRAM */
 static size_t s_pcm_count;
 static uint32_t s_pcm_ms;
@@ -740,7 +750,9 @@ esp_err_t voice_service_start_transcribe(void)
     if (s_pcm_count == 0) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (xTaskCreate(asr_task, "th_asr", 4096, NULL, 4, NULL) != pdPASS) {
+    /* 8192: this task does an HTTPS request, and the mbedTLS handshake eats the
+     * caller's stack (AGENT.md 9.0.1.4: a TLS task must not go below 6 KB). */
+    if (xTaskCreate(asr_task, "th_asr", VOICE_HTTP_TASK_STACK, NULL, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -754,9 +766,10 @@ esp_err_t voice_service_start_transcribe(void)
  */
 static void tts_task(void *arg)
 {
-    (void)arg;
-    const char *text = (const char *)arg;
+    char *text = (char *)arg;
     (void)voice_service_speak(text);
+    /* The text was copied for us by voice_service_speak_async(). */
+    free(text);
     vTaskDelete(NULL);
 }
 
@@ -780,7 +793,7 @@ esp_err_t voice_service_speak_async(const char *text)
     }
     memcpy(copy, text, len);
 
-    if (xTaskCreate(tts_task, "th_tts", 4096, copy, 4, NULL) != pdPASS) {
+    if (xTaskCreate(tts_task, "th_tts", VOICE_HTTP_TASK_STACK, copy, 4, NULL) != pdPASS) {
         free(copy);
         return ESP_ERR_NO_MEM;
     }
