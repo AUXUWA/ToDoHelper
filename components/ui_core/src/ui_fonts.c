@@ -183,7 +183,12 @@ static bool ft_load_from_file(void)
     if (sys_config_get_str(UI_FONT_CACHE_NVS_KEY, limit_buf, sizeof(limit_buf)) == ESP_OK) {
         limit = atoi(limit_buf);
     }
-    if (limit < 16 || limit > 4096) {
+    /* The upper bound is not arbitrary: the bitmaps live in PSRAM now, and the
+     * worst case is 48 px glyphs (2.3 KB each). 1024 of them is ~2.4 MB -
+     * that fits in the ~9.8 MB of PSRAM this board has. A bigger limit would
+     * fill PSRAM, and then lv_draw_buf_create_ex() fails and the characters
+     * silently do not appear at all. */
+    if (limit < 16 || limit > 1024) {
         SYS_LOGW(TAG, "glyph cache limit %d out of range, using %d", (int)limit,
                  UI_FONT_GLYPH_CACHE_CNT);
         limit = UI_FONT_GLYPH_CACHE_CNT;

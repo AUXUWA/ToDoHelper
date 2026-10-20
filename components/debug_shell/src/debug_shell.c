@@ -44,6 +44,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -342,6 +343,7 @@ static void cmd_help(dbg_out_t *o)
         "  slider <target> <value>  move a slider (fires VALUE_CHANGED, like a tap)\n"
         "  scroll <target> <dy>     scroll a scrollable object by dy pixels\n"
         "  bench <target> <text>    time a redraw (index, repeats optional)\n"
+        "  bench-screen [repeats]  time full-screen redraws (one scroll frame)\n"
         "  page <id|name>           switch page (0..10 or splash/home/...)\n"
         "  tap <x> <y>              report which widget is at a screen point\n"
         "  idle <enter|exit>        force idle-face enter/leave\n"
@@ -679,6 +681,7 @@ typedef struct {
     bool do_slider;
     bool do_scroll;
     bool do_bench;
+    bool do_bench_screen;
     int repeats;
     const char *value;
 } click_args_t;
@@ -687,7 +690,31 @@ static void ui_click_cb(void *arg)
 {
     click_args_t *c = (click_args_t *)arg;
     int count = 0;
-    lv_obj_t *obj = find_target(c->target, c->index, &count);
+    lv_obj_t *obj = (c->do_bench_screen) ? NULL : find_target(c->target, c->index, &count);
+    if (c->do_bench_screen) {
+        /*
+         * Time a full-screen redraw.
+         *
+         * This is what one frame of a scrolling list costs: everything visible
+         * is drawn again, and every character that is not in the FreeType
+         * cache has to be rasterised again (read the TTF from the SD card and
+         * render - about 9 ms each). If the cache is too small to hold what a
+         * screen shows, this number stays high forever; if it is big enough,
+         * the first redraw is slow and the rest are fast.
+         */
+        lv_display_t *disp = lv_display_get_default();
+        const int repeats = c->repeats > 0 ? c->repeats : 1;
+        for (int i = 0; i < repeats; i++) {
+            const int64_t t0 = esp_timer_get_time();
+            lv_obj_invalidate(lv_screen_active());
+            if (disp != NULL) {
+                lv_refr_now(disp);
+            }
+            const int64_t dt = esp_timer_get_time() - t0;
+            out_printf(c->out, "bench %d: %lld us\n", i + 1, (long long)dt);
+        }
+        return;
+    }
     if (obj == NULL) {
         out_printf(c->out, "no widget matching '%s' (index %d); %d match(es) total\n",
                    c->target, c->index, count);
@@ -1296,6 +1323,15 @@ static void dbg_exec(char *line, dbg_out_t *out)
         if (!run_on_lvgl(ui_click_cb, &args, 15000)) {
             out_printf(out, "LVGL task did not respond\n");
         }
+    } else if (strcmp(cmd, "bench-screen") == 0) {
+        click_args_t args = {
+            .out = out,
+            .do_bench_screen = true,
+            .repeats = (a1 != NULL) ? atoi(a1) : 5,
+        };
+        if (!run_on_lvgl(ui_click_cb, &args, 30000)) {
+            out_printf(out, "LVGL task did not respond\n");
+        }
     } else if (strcmp(cmd, "scroll") == 0) {
         if (a1 == NULL || argc < 3) {
             out_printf(out, "usage: scroll <target> <dy> [index]\n");
@@ -1522,12 +1558,34 @@ static esp_err_t exec_common(httpd_req_t *req, const char *cmd)
     return err;
 }
 
+/** URL-decode in place: %XX and '+'. */
+static void url_decode(char *s)
+{
+    char *out = s;
+    for (char *in = s; *in != '\0'; in++) {
+        if (*in == '+') {
+            *out++ = ' ';
+        }
+        else if (*in == '%' && isxdigit((unsigned char)in[1]) && isxdigit((unsigned char)in[2])) {
+            const char hex[3] = { in[1], in[2], '\0' };
+            *out++ = (char)strtol(hex, NULL, 16);
+            in += 2;
+        }
+        else {
+            *out++ = *in;
+        }
+    }
+    *out = '\0';
+}
+
 static esp_err_t exec_get_handler(httpd_req_t *req)
 {
     char cmd[512];
     if (!http_query_get(req, "cmd", cmd, sizeof(cmd))) {
         cmd[0] = '\0';
     }
+    /* A Chinese target in the query string arrives percent-encoded. */
+    url_decode(cmd);
     return exec_common(req, cmd);
 }
 
@@ -1544,25 +1602,29 @@ static esp_err_t exec_post_handler(httpd_req_t *req)
      * The raw form is what makes this pleasant from a shell:
      *   curl -X POST -d 'widgets token' http://dev/api/v1/debug/exec
      * and it keeps working without a JSON encoder on the caller's side.
+     *
+     * The JSON form is parsed with cJSON, not by hand: a hand-rolled parser
+     * that copies the text between the quotes leaves the escape sequences
+     * alone, so a client that sends "\u4f60\u597d" (which is what every
+     * standard JSON encoder does for non-ASCII) would run the literal
+     * characters - and a measurement of "how long does drawing 30 hanzi
+     * take" would silently measure nothing at all.
      */
     char cmd[512];
     cmd[0] = '\0';
     if (body[0] == '{') {
-        const char *key = strstr(body, "\"cmd\"");
-        if (key != NULL) {
-            const char *colon = strchr(key, ':');
-            const char *q1 = (colon != NULL) ? strchr(colon, '"') : NULL;
-            if (q1 != NULL) {
-                const char *q2 = strchr(q1 + 1, '"');
-                if (q2 != NULL) {
-                    size_t n = (size_t)(q2 - q1 - 1);
-                    if (n >= sizeof(cmd)) {
-                        n = sizeof(cmd) - 1;
-                    }
-                    memcpy(cmd, q1 + 1, n);
-                    cmd[n] = '\0';
-                }
+        cJSON *root = cJSON_Parse(body);
+        if (root != NULL) {
+            const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+            if (cJSON_IsString(item) && item->valuestring != NULL) {
+                strlcpy(cmd, item->valuestring, sizeof(cmd));
             }
+            cJSON_Delete(root);
+        }
+        if (cmd[0] == '\0') {
+            /* Not a cJSON object with a "cmd" string: fall back to the raw
+             * text so a hand-written body still works. */
+            strlcpy(cmd, body, sizeof(cmd));
         }
     } else {
         strlcpy(cmd, body, sizeof(cmd));

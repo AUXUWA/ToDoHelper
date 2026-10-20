@@ -115,8 +115,26 @@ void *lv_realloc_core(void *p, size_t new_size)
     if (p == NULL) {
         return lv_malloc_core(new_size);
     }
-    /* realloc() knows how to grow a block in the heap it came from, so it
-     * works for both internal RAM and PSRAM blocks. */
+
+    if (s_font_scope) {
+        /*
+         * A block that lives in PSRAM has to stay there.
+         *
+         * realloc() is heap_caps_realloc_default(), which asks for INTERNAL
+         * memory for anything up to CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL bytes.
+         * And heap_caps_realloc_base() only keeps a block in its own heap when
+         * the requested caps are compatible with that heap's - so a PSRAM block
+         * reallocated to a small size would be copied into internal RAM and
+         * the PSRAM block freed. That is exactly the memory this change is
+         * trying to keep free.
+         *
+         * MALLOC_CAP_8BIT is satisfied by both internal RAM and PSRAM, so
+         * asking for it keeps the block in whichever heap it came from.
+         */
+        return heap_caps_realloc(p, new_size, MALLOC_CAP_8BIT);
+    }
+
+    /* An internal RAM block: exactly what LVGL's C library backend did. */
     return realloc(p, new_size);
 }
 
