@@ -736,6 +736,132 @@ esp_err_t todo_import_json(const char *json)
 /* Init                                                                      */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * @brief 清单的「时间标尺」：用来判断两份清单哪一份更新。
+ *
+ * 文件系统的时间戳在两个后端上都不可靠（LittleFS 不保留源文件时间戳），
+ * 实测还真的判错过：卡上是 4 条、内部是 2 条，却因为内部那份的 mtime
+ * 「更新」而留了旧的。所以比较的依据必须来自清单**自己**带的信息：
+ * 最新一条待办的 updated_at，其次是 next_id（越大说明被加过更多次），
+ * 最后是条数。
+ */
+typedef struct {
+    int64_t max_updated;  /**< 最新的 updated_at */
+    uint32_t next_id;     /**< 下一个可用 id */
+    size_t count;         /**< 条数 */
+} todo_meta_t;
+
+static void todo_meta_of(const char *json, todo_meta_t *out)
+{
+    out->max_updated = 0;
+    out->next_id = 0;
+    out->count = 0;
+    if (json == NULL) {
+        return;
+    }
+
+    cJSON *root = sys_json_parse(json, 32);
+    if (root == NULL) {
+        return;
+    }
+
+    const cJSON *next = cJSON_GetObjectItemCaseSensitive(root, "next_id");
+    if (cJSON_IsNumber(next)) {
+        out->next_id = (uint32_t)next->valuedouble;
+    }
+
+    const cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "items");
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, items) {
+        if (!cJSON_IsObject(entry)) {
+            continue;
+        }
+        out->count++;
+        const cJSON *updated = cJSON_GetObjectItemCaseSensitive(entry, "updated_at");
+        if (cJSON_IsNumber(updated) && (int64_t)updated->valuedouble > out->max_updated) {
+            out->max_updated = (int64_t)updated->valuedouble;
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+/** a 是否比 b 更新。 */
+static bool todo_meta_newer(const todo_meta_t *a, const todo_meta_t *b)
+{
+    if (a->max_updated != b->max_updated) {
+        return a->max_updated > b->max_updated;
+    }
+    if (a->next_id != b->next_id) {
+        return a->next_id > b->next_id;
+    }
+    return a->count > b->count;
+}
+
+/**
+ * @brief 片内没有清单时，认领旧版本遗留在存储根上的临时件。
+ *
+ * v1.4.0 及更早的落盘协议是「写 X.tmp → remove(X) → rename(X.tmp, X)」。
+ * 掉电落在 remove 与 rename 之间时，**正式文件被删了、只剩 X.tmp**——
+ * 而 X.tmp 是写完的完整内容（先写完才改名），所以它是用户**丢掉的那份清单**，
+ * 不是垃圾文件。FatFs 的 f_rename() 不覆盖已存在的目标（返回 FR_EXIST），
+ * 这个 remove 是当时不得不加的，代价就是上面这个掉电窗口。
+ *
+ * v1.5.0 改用双槽协议（X.new → X.bak → X），窗口被消掉了；但**已经被旧协议
+ * 弄丢的清单还在卡上**，这里把它们认领回来。
+ *
+ * 认领条件（缺一不可）：
+ *   - 文件是合法 JSON（用带深度上限的解析器，坏文件不能把开机路径搞崩）；
+ *   - 顶层是对象且带 items 数组（真的是清单，而不是别的什么文件）。
+ *
+ * @return true 表示认领成功（内容已装入内存并落盘）。
+ */
+static bool todo_adopt_leftover(void)
+{
+    static const char *const suffixes[] = { ".tmp", ".new", ".bak" };
+
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char name[64];
+        const int n = snprintf(name, sizeof(name), "%s%s",
+                               CONFIG_TODOHELPER_TODO_CACHE_FILE, suffixes[i]);
+        if (n < 0 || (size_t)n >= sizeof(name)) {
+            continue;
+        }
+
+        char *json = NULL;
+        size_t len = 0;
+        if (storage_read_cache(name, &json, &len) != ESP_OK || json == NULL) {
+            continue;
+        }
+
+        /* 校验：必须是合法 JSON 且带 items 数组。 */
+        cJSON *root = sys_json_parse(json, 32);
+        if (root == NULL) {
+            free(json);
+            SYS_LOGW(TAG, "leftover '%s' is not valid JSON; ignored", name);
+            continue;
+        }
+        const cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "items");
+        const bool usable = cJSON_IsArray(items);
+        cJSON_Delete(root);
+        if (!usable) {
+            free(json);
+            SYS_LOGW(TAG, "leftover '%s' has no items array; ignored", name);
+            continue;
+        }
+
+        SYS_LOGW(TAG, "adopting the leftover '%s' as the todo list", name);
+        const esp_err_t imported = todo_import_json(json);
+        free(json);
+        if (imported != ESP_OK) {
+            SYS_LOGW(TAG, "adopting '%s' failed (%s)", name, esp_err_to_name(imported));
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 esp_err_t todo_manager_init(void)
 {
     if (s_initialized) {
@@ -754,26 +880,63 @@ esp_err_t todo_manager_init(void)
     s_initialized = true;
 
     if (storage_available()) {
-        char *json = NULL;
-        size_t len = 0;
         /*
          * The list lives in the internal LittleFS, not on the SD card: the
          * storage root follows whatever is mounted, and pulling the card out
-         * would make the whole list look like it had vanished. The pinned
-         * reader falls back to the storage root when the internal copy is
-         * missing, so an upgrade never starts with an empty list.
+         * would make the whole list look like it had vanished.
+         *
+         * But two copies can exist: the internal one (where v1.5.0 writes) and
+         * the one on the card (where v1.4.0 and older kept it). They are
+         * compared by the list's own metadata - NOT by file timestamps, which
+         * are unreliable on both backends and did pick the wrong copy on real
+         * hardware: the card held 4 fresh items (next id 48) while the
+         * internal copy held 2 stale ones (next id 3), and the mtime rule
+         * kept the stale one.
          */
-        err = storage_read_cache_pinned(CONFIG_TODOHELPER_TODO_CACHE_FILE, &json, &len);
-        if (err == ESP_OK && json != NULL) {
-            esp_err_t parse = todo_import_json(json);
+        char *pinned_json = NULL;
+        size_t pinned_len = 0;
+        char *root_json = NULL;
+        size_t root_len = 0;
+
+        const bool have_pinned =
+            storage_read_cache_pinned(CONFIG_TODOHELPER_TODO_CACHE_FILE,
+                                      &pinned_json, &pinned_len) == ESP_OK &&
+            pinned_json != NULL;
+        const bool have_root =
+            storage_read_cache(CONFIG_TODOHELPER_TODO_CACHE_FILE,
+                               &root_json, &root_len) == ESP_OK && root_json != NULL;
+
+        if (have_pinned || have_root) {
+            todo_meta_t pinned_meta;
+            todo_meta_t root_meta;
+            todo_meta_of(pinned_json, &pinned_meta);
+            todo_meta_of(root_json, &root_meta);
+
+            const bool take_root =
+                have_root && (!have_pinned || todo_meta_newer(&root_meta, &pinned_meta));
+            const char *chosen = take_root ? root_json : pinned_json;
+
+            if (have_pinned && have_root) {
+                SYS_LOGI(TAG, "two copies of the list: internal %u item(s)/id %u, "
+                              "card %u item(s)/id %u -> taking the %s one",
+                         (unsigned)pinned_meta.count, (unsigned)pinned_meta.next_id,
+                         (unsigned)root_meta.count, (unsigned)root_meta.next_id,
+                         take_root ? "card" : "internal");
+            }
+
+            const esp_err_t parse = todo_import_json(chosen);
             if (parse != ESP_OK) {
                 SYS_LOGW(TAG, "cache file unreadable (%s), starting empty",
                          esp_err_to_name(parse));
             }
-            free(json);
+        } else if (todo_adopt_leftover()) {
+            /* 认领成功，todo_import_json() 已经把内容装进内存并落盘。 */
         } else {
             SYS_LOGI(TAG, "no todo cache yet, starting empty");
         }
+
+        free(pinned_json);
+        free(root_json);
     } else {
         SYS_LOGW(TAG, "storage unavailable: todos will not survive a reboot");
     }

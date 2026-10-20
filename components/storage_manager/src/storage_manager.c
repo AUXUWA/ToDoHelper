@@ -98,6 +98,9 @@ esp_err_t storage_abspath(const char *rel, char *buf, size_t len)
     return storage_path(buf, len, rel);
 }
 
+/** 读整个文本文件到堆缓冲（调用者负责 free）。定义见文件下方。 */
+static esp_err_t file_read_text(const char *abs, char **out, size_t *len);
+
 /**
  * @brief 拼 "<dir>/<rel>"，不经过存储根解析（pinned / 迁移 / 恢复扫描用）。
  */
@@ -126,19 +129,6 @@ static bool file_exists(const char *abs, size_t *size)
     if (size != NULL) {
         *size = (size_t)st.st_size;
     }
-    return true;
-}
-
-/**
- * @brief 文件的最后修改时间（用于判断两份同名文件哪份更新）。
- */
-static bool file_mtime(const char *abs, time_t *out)
-{
-    struct stat st;
-    if (stat(abs, &st) != 0) {
-        return false;
-    }
-    *out = st.st_mtime;
     return true;
 }
 
@@ -705,6 +695,19 @@ static void storage_migrate_cache_to_pinned(void)
 
     size_t moved = 0;
     for (size_t i = 0; i < count; i++) {
+        /*
+         * 协议临时件不是数据：.tmp 是旧协议（写 tmp → remove → rename）留下的，
+         * .new / .bak 是双槽协议的工作文件。迁移它们只会让片内多一份没人读的
+         * 垃圾，还会每次开机重写一次（时间戳比较在 LittleFS 上不可靠）。
+         * 真正有价值的那一份——旧协议掉电时用户「丢失」的清单——由 todo_manager
+         * 认领（它知道哪个文件是清单、也知道怎么校验它是不是合法 JSON）。
+         */
+        if (has_suffix(names[i], STORAGE_SUFFIX_NEW) ||
+            has_suffix(names[i], STORAGE_SUFFIX_BAK) ||
+            has_suffix(names[i], ".tmp")) {
+            continue;
+        }
+
         char src[STORAGE_PATH_MAX];
         char dst[STORAGE_PATH_MAX];
         if (join_path(src, sizeof(src), src_dir, names[i]) != ESP_OK ||
@@ -717,17 +720,16 @@ static void storage_migrate_cache_to_pinned(void)
             continue;
         }
 
-        /* 片内已经有同名文件时，只有 SD 那份明显更新才覆盖它：
-         * 老版本可能在「没插卡」和「插着卡」两种状态下各留过一份，
-         * 谁新谁说了算；时间戳读不出来就以片内为准（片内是升级后的官方位置）。 */
+        /*
+         * 片内已经有同名文件时**不覆盖**：「两份哪一份更新」不是存储层能回答的
+         * 问题——两个后端的文件时间戳都不可靠（LittleFS 不保留源文件时间戳），
+         * 拿 mtime 猜会猜错（实测：卡上是 4 条、内部是 2 条，却因为内部时间戳
+         * “更新”而留了旧的那份）。
+         * 合并两份的判断交给有领域知识的 todo_manager：清单自己带 updated_at
+         * 与 next_id，它知道哪一份更「新」。它选中的那一份会被写回片内。
+         */
         if (file_exists(dst, NULL)) {
-            time_t src_m = 0;
-            time_t dst_m = 0;
-            if (!file_mtime(src, &src_m) || !file_mtime(dst, &dst_m) || src_m <= dst_m) {
-                continue;
-            }
-            SYS_LOGW(TAG, "the SD copy of '%s' is newer; replacing the internal one",
-                     names[i]);
+            continue;
         }
 
         if (size > STORAGE_MIGRATE_MAX_FILE) {
@@ -1358,8 +1360,11 @@ esp_err_t storage_write_cache_pinned(const char *name, const void *buf, size_t l
 /**
  * @brief 读片内 LittleFS 的缓存文件（pinned）。
  *
- * 片内还没有这份文件时（老版本升级、迁移没跑成）会退回读存储根上的同名
- * 文件，免得升级后清单变空；写仍然一律写片内。
+ * **只读片内那一份**：读不到就是读不到，不回退到存储根。
+ * 「两份都在时哪一份更新」不是存储层能回答的问题——两个后端的文件时间戳都不可靠
+ * （LittleFS 不保留源文件时间戳），而这层数据有它自己的领域判据
+ * （待办清单自己带 updated_at / next_id）。
+ * 合并两份的判断在 `todo_manager` 里做（见 todo_manager_init 的双份比较）。
  */
 esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len)
 {
@@ -1385,24 +1390,7 @@ esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len)
     if (!io_lock()) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    esp_err_t err = file_read_text(abs, out, len);
-    if (err == ESP_ERR_NOT_FOUND) {
-        char root_abs[STORAGE_PATH_MAX];
-        if (storage_path(root_abs, sizeof(root_abs), rel) == ESP_OK &&
-            strcmp(root_abs, abs) != 0) {
-            char *fallback = NULL;
-            size_t fallback_len = 0;
-            if (file_read_text(root_abs, &fallback, &fallback_len) == ESP_OK) {
-                SYS_LOGW(TAG, "pinned cache '%s' missing; served the storage-root copy", rel);
-                *out = fallback;
-                if (len != NULL) {
-                    *len = fallback_len;
-                }
-                err = ESP_OK;
-            }
-        }
-    }
+    const esp_err_t err = file_read_text(abs, out, len);
     io_unlock();
     return err;
 }

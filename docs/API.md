@@ -289,7 +289,7 @@ curl.exe -i http://todohelper.local/ws/events                 # 501 + data.hint
 | 缓存 | `esp_err_t storage_read_cache(const char *name, char **out, size_t *len);` | 读 `cache/<name>`；不存在 → `ESP_ERR_NOT_FOUND` |
 | 缓存 | `esp_err_t storage_write_cache(const char *name, const void *buf, size_t len);` | 写 `cache/<name>`；失败只 `SYS_LOGW`，不影响主流程 |
 | 缓存 | `esp_err_t storage_write_cache_pinned(const char *name, const void *buf, size_t len);` | **v1.5.0 新增**。写**片内 LittleFS** 的 `cache/<name>`，**不随存储根切换**（插拔 SD 卡不影响待办） |
-| 缓存 | `esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len);` | **v1.5.0 新增**。读片内 LittleFS 的同名文件 |
+| 缓存 | `esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len);` | **v1.5.0 新增**。读片内 LittleFS 的同名文件。**不回退到存储根**：两份都在时哪份更新由 `todo_manager` 按清单自己的 `updated_at`/`next_id` 判断（文件时间戳在 LittleFS 上不可靠，实测判错过） |
 
 常量：`STORAGE_APP_DIR`=`"todohelper"`、`STORAGE_SD_ROOT`=`"/sdcard"`、`STORAGE_INT_ROOT`=`"/littlefs"`、
 `STORAGE_INT_PARTITION`=`"storage"`。

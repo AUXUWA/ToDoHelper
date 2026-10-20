@@ -77,15 +77,27 @@
 
 ## 关键约定
 
-1. **原子写**。落盘走 `storage_write_cache()` → `storage_write_file()`：先写 `<path>.tmp` 再 `rename()`，
-   掉电不会把上一份有效清单写坏；`s_io_lock` 串行化两次写入，避免两个 writer 交错。
-   写缓存失败只 `SYS_LOGW`，不影响主流程（`storage_manager` 的约定）。
-2. **离线 = 内存模式**。`storage_available()` 为假时 `todo_save()` 直接返回 `ESP_OK` 并
+1. **落盘：双槽协议 + 去抖后台**（v1.5.0 起）。
+   落盘走 `storage_write_cache_pinned()` → `storage_write_file()`：写 `<path>.new` →
+   正式文件改名成 `<path>.bak` → `.new` 改名成正式文件，掉电时启动恢复会收敛
+   （`storage_manager` 的双槽协议，**别再退回「先 remove 再 rename」**——
+   FatFs 的 `f_rename()` 目标存在时返回 `FR_EXIST`，那个 remove 是不得不加的，
+   代价是掉电会把上一份有效清单一起丢掉；本轮实测板子上就是这样丢的）。
+   `s_io_lock` 串行化写入；写缓存失败只 `SYS_LOGW`，不影响主流程。
+2. **清单存哪、怎么恢复**。
+   - 清单固定存**片内 LittleFS**（`storage_*_cache_pinned()`），插拔 SD 卡不再让它「消失」。
+   - 片内与卡上可能**同时**有两份（老版本把清单放在卡上）。启动时两份都读，
+     按**清单自己的信息**比较哪份更新：最新一条的 `updated_at` → `next_id` → 条数。
+     **不要用文件时间戳**——LittleFS 不保留源文件时间戳，实测判错过
+     （卡上 4 条、片内 2 条，结果留了旧的 2 条）。
+   - 两份都没有时，去卡上找旧协议留下的 `.tmp` / `.new` / `.bak`：
+     那是旧版掉电时「写完但没改名」的**完整内容**，校验是合法 JSON 且含 `items` 数组才认领。
+3. **离线 = 内存模式**。`storage_available()` 为假时 `todo_save()` 直接返回 `ESP_OK` 并
    打印 `storage unavailable: todos will not survive a reboot`；UI 照常工作（FR2 离线路径）。
    缓存文件读坏（解析失败）时告警并从空清单启动，不崩溃。
-3. **id / updated_at / sync_state 由组件管理**。`todo_add()` 忽略调用方传的这三个字段；
+4. **id / updated_at / sync_state 由组件管理**。`todo_add()` 忽略调用方传的这三个字段；
    `todo_update()` 只替换 title/desc/due_ts/done/priority。
-4. **同步状态模型**（header 与 docs/API.md）：
+5. **同步状态模型**（header 与 docs/API.md）：
    - **设备侧修改**（`todo_add` / `todo_update` / `todo_set_done`）→ `TODO_SYNC_PENDING`；
    - **客户端推来的修改** → HTTP handler 在调用 `todo_*` 之后立刻 `todo_mark_synced(id)`
      （见 `todos_post_handler` / `todos_item_put_handler` / `todos_item_done_handler`），因为客户端本来就有这个版本；
@@ -94,19 +106,21 @@
    - **客户端声明整表已同步** → `POST /api/v1/sync` → `todo_mark_all_synced()`，把所有非 `OK` 的项改判为 `OK`。
    `todo_stats_t.pending` 统计的是 `sync_state != TODO_SYNC_OK`，状态栏/首页据此显示"待同步"。
    `TODO_SYNC_FAILED` 目前**没有任何代码路径会置位**（死状态），看到它只可能是旧文件里带过来的。
-5. **排序**由 `compare_items()` 固定为四段：
+6. **排序**由 `compare_items()` 固定为四段：
    `done` 升序（未完成在前）→ `priority` 降序（0 普通 / 1 重要 / 2 紧急）→ `due_ts` 升序（`0` 排在同级最后）→ `id` 升序。
    `todo_list()` 返回的是**快照**（`malloc` 的副本），调用方必须 `todo_free_list()`。
-6. **容量与文本上限**：内存中最多 `TODO_MAX_ITEMS`（256）条，超出时 `todo_add()` 返回 `ESP_ERR_NO_MEM` 并告警；
-   `TODO_TITLE_MAX` 128、`TODO_DESC_MAX` 256，超长由 `strlcpy` 截断。导入超过 256 条会截断并告警。
-7. **时间戳**：`now_stamp()` 在时钟已同步时用 `sys_time_ts()`，否则用 `sys_time_ms() / 1000`（开机秒数）。
+7. **容量与文本上限**：内存中最多 `TODO_MAX_ITEMS`（256）条，超出时 `todo_add()` 返回 `ESP_ERR_NO_MEM` 并告警；
+   `TODO_TITLE_MAX` 128、`TODO_DESC_MAX` 256，超长由**UTF-8 安全截断**处理（不会把多字节字符切成半截）。
+   导入超过 256 条会截断并告警。
+8. **时间戳**：`now_stamp()` 在时钟已同步时用 `sys_time_ts()`，否则用 `sys_time_ms() / 1000`（开机秒数）。
    后者远小于真实 Unix 时间，所以 NTP 之前客户端做 `?updated_since=` 增量同步会**收到全量**——这是安全方向。
-8. **两把锁**：`s_lock`（静态互斥量）保护 item 数组，`s_io_lock` 串行化文件写。
+9. **三把锁**：`s_lock`（静态互斥量）保护 item 数组，`s_io_lock` 串行化文件写，
+   `s_save_lock` 保护去抖线程的变更序号。
    `publish_status()` 必须在**不持锁**时调用（它内部再调 `todo_stats()`）。
-9. **事件与通知**：每次变更发 `TODO_EVENT_<具体事件>`（payload 为 `uint32_t id`）+ 无 payload 的
-   `TODO_EVENT_LIST_CHANGED`，并调 `sys_notify("todo_changed")`；
-   `sync_server` 把 L0 通知转成 SSE 推送，`todo_manager` 不需要知道它存在。
-   同时用 `sys_status_update()` 刷新 `todo_total` / `todo_pending` 供状态栏读取。
+10. **事件与通知**：每次变更发 `TODO_EVENT_<具体事件>`（payload 为 `uint32_t id`）+ 无 payload 的
+    `TODO_EVENT_LIST_CHANGED`，并调 `sys_notify("todo_changed")`；
+    `sync_server` 把 L0 通知转成 SSE 推送，`todo_manager` 不需要知道它存在。
+    同时用 `sys_status_update()` 刷新 `todo_total` / `todo_pending` 供状态栏读取。
 
 ## HTTP 路由表（需求 §8.2）
 
