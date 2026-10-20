@@ -1131,6 +1131,36 @@ static void notify_handler(void *arg, esp_event_base_t base, int32_t id, void *d
 /* Timer                                                                     */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Start or stop the animator.
+ *
+ * The animator is the only thing that keeps the face alive, and it is also the
+ * most expensive thing on the standby screen: 30 ticks a second, each of them
+ * writing about 26 LVGL properties. It therefore only runs while the standby
+ * screen is actually on display.
+ *
+ * ui_core creates the page lazily and then only *hides* it, so a timer that is
+ * never stopped would keep waking the LVGL task 30 times a second for the rest
+ * of the machine's life, painting objects nobody can see - exactly the shape
+ * AGENT.md 9.0.1.1 rule 4 ("timers need an owner") forbids, and the same
+ * mistake the page tick timers in ui_core avoid with pause/resume.
+ *
+ * Stopping the animator does not disturb the animation itself: every layer is
+ * driven by absolute time or by its own schedule, and standby_enter() re-seeds
+ * that schedule when the screen comes back.
+ */
+static void face_animator_set_running(bool running)
+{
+    if (s_face.timer == NULL) {
+        return;
+    }
+    if (running) {
+        lv_timer_resume(s_face.timer);
+    } else {
+        lv_timer_pause(s_face.timer);
+    }
+}
+
 static void face_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -1691,6 +1721,12 @@ esp_err_t idle_face_attach(lv_obj_t *parent)
     schedule_next_dilate(now);
     apply_params(now);
 
+    /*
+     * The animator starts running right away: the page that owns the face
+     * pauses it again as soon as the face leaves the screen (see
+     * face_animator_set_running()), and a face attached directly into another
+     * page has no such hook and must keep breathing.
+     */
     s_face.timer = lv_timer_create(face_timer_cb, IDLE_FACE_TICK_MS, NULL);
     if (s_face.timer == NULL) {
         SYS_LOGW(TAG, "animator timer unavailable");
@@ -1713,6 +1749,15 @@ static esp_err_t idle_page_create(lv_obj_t *parent)
 /** Entering the standby screen: the face falls asleep. */
 static esp_err_t idle_page_on_show(void)
 {
+    /*
+     * The standby screen is on display now, so the animator may run again.
+     *
+     * It is resumed *before* standby_enter() on purpose: a live notification
+     * expression makes standby_enter() refuse, and that expression still has
+     * to be animated - the face is on screen either way.
+     */
+    face_animator_set_running(true);
+
     /* Not a neutral face (an expression is live): keep it displayed as is. */
     (void)idle_face_standby_enter();
     return ESP_OK;
@@ -1721,7 +1766,22 @@ static esp_err_t idle_page_on_show(void)
 /** Leaving the standby screen: the face wakes up. */
 static esp_err_t idle_page_on_hide(void)
 {
-    return idle_face_standby_exit();
+    const esp_err_t err = idle_face_standby_exit();
+
+    /*
+     * The page is on its way out (ui_core swaps pages in a single frame), so
+     * the animator has nothing left to draw. Stopping it here is what keeps
+     * the LVGL task from being woken 30 times a second for a face nobody can
+     * see.
+     *
+     * The wake envelope set up by standby_exit() therefore never gets a frame.
+     * That is not a regression: the page switch is an atomic same-frame swap
+     * (see the note in idle_face.h), so the envelope was never rendered
+     * anyway. It is cleared by the next standby_enter(), so nothing is left
+     * half applied.
+     */
+    face_animator_set_running(false);
+    return err;
 }
 
 static const ui_page_t s_idle_page = {

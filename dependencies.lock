@@ -12,7 +12,7 @@ dependencies:
       type: local
     version: 2.4.0
   espressif/button:
-    component_hash: a1f34e8ed2e61ffef1a230fd9477005c2db335c7e1f6a239f43e5f119dcbe1b0
+    component_hash: 7cb7e2944b5828f409af0c92f7fcc0e2d405de09c3325b7ee4a0eba5fb28dfdc
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -24,7 +24,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 4.2.1
+    version: 4.2.2
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:

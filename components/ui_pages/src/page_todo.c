@@ -6,20 +6,27 @@
 
 /**
  * @file page_todo.c
- * @brief FR2: the device side of the todo list — a read-only viewer.
+ * @brief FR2: the device side of the todo list — a viewer with two write actions.
  *
- * All todo creation/editing/completion/deletion happens on the PC web page.
- * The touch panel has no keyboard worth typing Chinese on, and letting two
- * writers race on the same record made the sync state hard to reason about, so
- * this page deliberately exposes **no** control that can change a todo. It
- * stays useful as a viewer: the list shows title, done state and sync state,
+ * All todo creation/editing happens on the PC web page. The touch panel has no
+ * keyboard worth typing Chinese on, and letting two writers race on the same
+ * record made the sync state hard to reason about, so this page deliberately
+ * exposes **no** control that can create or edit a todo. It stays useful as a
+ * viewer: the list shows title, done state, priority, due date and sync state,
  * the detail page shows the remaining fields, and both point the user at the
  * web page.
  *
+ * Two write actions remain, because they are single taps and a tap is the one
+ * input this panel is good at:
+ *   - the row checkbox toggles "done" (row_toggle_cb);
+ *   - the row delete button asks for confirmation first (row_delete_cb ->
+ *     ui_dialog_confirm), because a single mis-tap used to destroy a todo for
+ *     good.
+ *
  * Binds TODO_EVENT_LIST_CHANGED so a change made from the PC browser (which
  * arrives through sync_server -> todo_manager) redraws this page immediately.
- * The rows are rebuilt from a snapshot each time; with <= 256 items that is
- * cheaper and far less error-prone than delta-updating widgets.
+ * The rows are rebuilt from a snapshot each time the *shape* of the list
+ * changes; otherwise the widgets are updated in place.
  *
  * Every LVGL call below runs in the LVGL task: create()/on_show()/on_event()
  * are invoked by ui_core, and ui_event_bind() marshals into that task — see
@@ -28,6 +35,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_heap_caps.h"
 
@@ -40,8 +48,42 @@ static const char *TAG = "page_todo";
 /** Shown in place of the removed editing controls. */
 #define TODO_READONLY_HINT "此页可勾选完成 / 删除 | 新增请到电脑网页端"
 
+/**
+ * How many rows are built at most.
+ *
+ * Every row is ~8 LVGL objects, and small objects land in the internal heap
+ * first (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096). 256 rows would be ~2000
+ * widget objects while the internal RAM headroom after boot is only 66 KB
+ * (AGENT.md 9.0) — that is a reboot waiting to happen. 30 rows is also all
+ * that fits on the 480 px panel (56 px per row); the rest stays reachable
+ * from the PC web page.
+ */
+#define TODO_RENDER_MAX_ROWS 30
+
+/** 筛选档位数量，与 s_filter_tabs[] 一致。 */
+#define TODO_FILTER_COUNT 4
+
+/* ------------------------------------------------------------------------ */
+/* State                                                                     */
+/* ------------------------------------------------------------------------ */
+
 static lv_obj_t *s_list;
 static lv_obj_t *s_stats;
+static lv_obj_t *s_more;      /**< 「还有 N 条未显示」提示 */
+static lv_obj_t *s_empty;     /**< 空状态标签 */
+static lv_obj_t *s_filter_btn[TODO_FILTER_COUNT];
+static int s_filter_index;    /**< 当前选中的筛选档 */
+static bool s_stats_warn = true;  /**< 统计行是否已写成「待同步」色 */
+
+static const struct {
+    todo_filter_t filter;
+    const char *label;
+} s_filter_tabs[TODO_FILTER_COUNT] = {
+    { TODO_FILTER_ALL, "全部" },
+    { TODO_FILTER_OPEN, "未完成" },
+    { TODO_FILTER_DUE_TODAY, "今天到期" },
+    { TODO_FILTER_DONE, "已完成" },
+};
 
 /*
  * Incremental list state.
@@ -59,22 +101,34 @@ static lv_obj_t *s_stats;
  * The bookkeeping array is allocated from PSRAM on first use rather than being
  * static: 256 entries live in internal RAM otherwise, and internal RAM is this
  * board's scarcest resource (measured: static version cost 9 KB of the
- * `boot complete` headroom, AGENT.md 9.0). Only the three widget pointers that
- * `row_apply()` actually touches are kept.
+ * `boot complete` headroom, AGENT.md 9.0).
  */
 typedef struct {
     uint32_t id;
     lv_obj_t *row;
+    lv_obj_t *prio;      /**< 优先级色条 */
     lv_obj_t *checkbox;
     lv_obj_t *title;
-    lv_obj_t *badge;   /**< NULL when the item is in sync */
+    lv_obj_t *due;       /**< 到期徽标 */
+    lv_obj_t *badge;     /**< 同步徽标 */
+    uint8_t done_state;  /**< 上次写入的完成态 */
+    uint8_t prio_state;  /**< 上次写入的优先级档（0 普通 / 1 重要 / 2 紧急） */
+    uint8_t due_state;   /**< 上次写入的到期档（0 = 无到期日） */
+    uint8_t sync_state;  /**< 上次写入的同步徽标状态（0 = 无徽标） */
+    char due_text[16];   /**< 上次写入的到期文案 */
 } todo_row_t;
 
 static todo_row_t *s_rows;
 static size_t s_rows_cap;
 static size_t s_row_count;
 
-/** Make sure the row table can hold @p need entries. Returns false on OOM. */
+/**
+ * Make sure the row table can hold @p need entries. Returns false on OOM.
+ *
+ * The table is only grown from render_list(), which knows the final row count
+ * up front. Reserving per row (the old code did) copied the whole table again
+ * for every row — O(n^2) memcpy for a 256 item list.
+ */
 static bool rows_reserve(size_t need)
 {
     if (s_rows_cap >= need) {
@@ -101,6 +155,67 @@ static bool rows_reserve(size_t need)
     return true;
 }
 
+/**
+ * 到期徽标的文案与颜色。
+ *
+ * 分档一律走 todo_due_bucket()：设备没校过时它对任何到期时间都返回
+ * TODO_DUE_NONE（不编造日期），所以这里不必自己判断时钟状态。
+ *
+ * @param[out] out    文案缓冲（至少 16 字节：「12月31日」是 10 字节）。
+ * @param[out] color  文案颜色。
+ * @return 到期分档。
+ */
+static todo_due_bucket_t due_badge_text(int64_t due_ts, char *out, size_t out_len,
+                                        lv_color_t *color)
+{
+    switch (todo_due_bucket(due_ts)) {
+    case TODO_DUE_OVERDUE:
+        strlcpy(out, "逾期", out_len);
+        *color = UI_COLOR_DANGER;
+        return TODO_DUE_OVERDUE;
+    case TODO_DUE_TODAY:
+        strlcpy(out, "今天", out_len);
+        *color = UI_COLOR_WARNING;
+        return TODO_DUE_TODAY;
+    case TODO_DUE_TOMORROW:
+        strlcpy(out, "明天", out_len);
+        *color = UI_COLOR_PRIMARY;
+        return TODO_DUE_TOMORROW;
+    case TODO_DUE_LATER: {
+        const time_t due = (time_t)due_ts;
+        struct tm tm_due;
+        if (localtime_r(&due, &tm_due) == NULL) {
+            strlcpy(out, "稍后", out_len);
+        } else {
+            /* 夹到日历可能的范围，再格式化到定长临时缓冲后才拷贝。
+             * out_len 是运行期参数，直接格式化会让编译器无法证明
+             * 「12月31日」放得下，于是触发 -Werror=format-truncation。 */
+            int mon = tm_due.tm_mon + 1;
+            int day = tm_due.tm_mday;
+            if (mon < 1) {
+                mon = 1;
+            } else if (mon > 12) {
+                mon = 12;
+            }
+            if (day < 1) {
+                day = 1;
+            } else if (day > 31) {
+                day = 31;
+            }
+            char tmp[16];
+            snprintf(tmp, sizeof(tmp), "%d月%d日", mon, day);
+            strlcpy(out, tmp, out_len);
+        }
+        *color = UI_COLOR_TEXT_MUTED;
+        return TODO_DUE_LATER;
+    }
+    case TODO_DUE_NONE:
+    default:
+        out[0] = '\0';
+        return TODO_DUE_NONE;
+    }
+}
+
 /** Tapping a row is navigation only: it opens the read-only detail page. */
 static void row_open_cb(lv_event_t *e)
 {
@@ -123,12 +238,15 @@ static void row_apply(todo_row_t *r, const todo_item_t *item)
 {
     const bool done = item->done;
 
-    if (lv_obj_has_state(r->checkbox, LV_STATE_CHECKED) != done) {
+    /* 完成态：勾选框、标题颜色与「✓ 」前缀一起变，值没变就一个字节都不写。 */
+    if (r->done_state != (done ? 1u : 0u)) {
         if (done) {
             lv_obj_add_state(r->checkbox, LV_STATE_CHECKED);
         } else {
             lv_obj_remove_state(r->checkbox, LV_STATE_CHECKED);
         }
+        lv_obj_set_style_text_color(r->title, done ? UI_COLOR_TEXT_MUTED : UI_COLOR_TEXT, 0);
+        r->done_state = done ? 1u : 0u;
     }
 
     /* Title text: "✓ " prefix when done, so a value change is visible. */
@@ -141,33 +259,81 @@ static void row_apply(todo_row_t *r, const todo_item_t *item)
     if (strcmp(want, lv_label_get_text(r->title)) != 0) {
         lv_label_set_text(r->title, want);
     }
-    lv_obj_set_style_text_color(r->title, done ? UI_COLOR_TEXT_MUTED : UI_COLOR_TEXT, 0);
 
-    /* Sync badge: created on demand, removed when the item caught up. */
+    /*
+     * 优先级色条：紧急=危险色、重要=警告色、普通=不着色。
+     * 「普通」保留一个等宽的透明占位，标题才不会在两档之间左右跳。
+     */
+    const uint8_t prio = (item->priority >= 2) ? 2u : ((item->priority == 1) ? 1u : 0u);
+    if (r->prio_state != prio) {
+        switch (prio) {
+        case 2:
+            lv_obj_set_style_bg_color(r->prio, UI_COLOR_DANGER, 0);
+            lv_obj_set_style_bg_opa(r->prio, LV_OPA_COVER, 0);
+            break;
+        case 1:
+            lv_obj_set_style_bg_color(r->prio, UI_COLOR_WARNING, 0);
+            lv_obj_set_style_bg_opa(r->prio, LV_OPA_COVER, 0);
+            break;
+        default:
+            lv_obj_set_style_bg_opa(r->prio, LV_OPA_TRANSP, 0);
+            break;
+        }
+        r->prio_state = prio;
+    }
+
+    /* 到期徽标：没有到期日就藏起来（对象一直存在，行的子控件顺序才稳定）。 */
+    char due_text[16];
+    lv_color_t due_color;
+    const todo_due_bucket_t bucket =
+        due_badge_text(item->due_ts, due_text, sizeof(due_text), &due_color);
+    if (bucket == TODO_DUE_NONE) {
+        if (r->due_state != 0) {
+            lv_obj_add_flag(r->due, LV_OBJ_FLAG_HIDDEN);
+            r->due_state = 0;
+            r->due_text[0] = '\0';
+        }
+    } else {
+        if (strcmp(due_text, r->due_text) != 0) {
+            lv_label_set_text(r->due, due_text);
+            strlcpy(r->due_text, due_text, sizeof(r->due_text));
+        }
+        if (r->due_state != (uint8_t)bucket) {
+            lv_obj_set_style_text_color(r->due, due_color, 0);
+            if (r->due_state == 0) {
+                lv_obj_remove_flag(r->due, LV_OBJ_FLAG_HIDDEN);
+            }
+            r->due_state = (uint8_t)bucket;
+        }
+    }
+
+    /* 同步徽标：颜色与文案分开写，只有真的变了才动。 */
     if (item->sync_state != TODO_SYNC_OK) {
         const char *text = (item->sync_state == TODO_SYNC_FAILED) ? "失败" : "待同步";
-        const lv_color_t color = (item->sync_state == TODO_SYNC_FAILED) ? UI_COLOR_DANGER
-                                                                       : UI_COLOR_WARNING;
-        if (r->badge == NULL) {
-            r->badge = lv_label_create(r->row);
-            /* Keep it just before the delete button so the layout stays stable. */
-            lv_obj_move_to_index(r->badge, (int32_t)lv_obj_get_child_count(r->row) - 2);
-            lv_obj_set_style_text_font(r->badge, ui_font(UI_FONT_SMALL), 0);
-            lv_label_set_text(r->badge, text);
-        } else if (strcmp(text, lv_label_get_text(r->badge)) != 0) {
+        const uint8_t state = (item->sync_state == TODO_SYNC_FAILED) ? 2u : 1u;
+        if (strcmp(text, lv_label_get_text(r->badge)) != 0) {
             lv_label_set_text(r->badge, text);
         }
-        lv_obj_set_style_text_color(r->badge, color, 0);
-    } else if (r->badge != NULL) {
-        lv_obj_delete(r->badge);
-        r->badge = NULL;
+        if (r->sync_state != state) {
+            lv_obj_set_style_text_color(r->badge,
+                                        (state == 2u) ? UI_COLOR_DANGER : UI_COLOR_WARNING, 0);
+            if (r->sync_state == 0) {
+                lv_obj_remove_flag(r->badge, LV_OBJ_FLAG_HIDDEN);
+            }
+            r->sync_state = state;
+        }
+    } else if (r->sync_state != 0) {
+        lv_obj_add_flag(r->badge, LV_OBJ_FLAG_HIDDEN);
+        r->sync_state = 0;
     }
 }
 
 /** Build one row from scratch and remember its widgets. */
 static void row_create(const todo_item_t *item)
 {
-    if (!rows_reserve(s_row_count + 1)) {
+    if (s_row_count >= s_rows_cap) {
+        /* render_list() reserved the table up front; this can only happen if
+         * that reservation failed. */
         return;
     }
     todo_row_t *r = &s_rows[s_row_count];
@@ -191,11 +357,22 @@ static void row_create(const todo_item_t *item)
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* The checkbox *is* a control: marking a todo done is one tap. */
+    /* 优先级色条：纯色小方块，零位图。普通优先级是不着色的透明占位。 */
+    lv_obj_t *prio = lv_obj_create(row);
+    r->prio = prio;
+    lv_obj_remove_style_all(prio);
+    lv_obj_set_size(prio, 8, 24);
+    lv_obj_set_style_radius(prio, 2, 0);
+    lv_obj_set_style_bg_opa(prio, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(prio, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* The checkbox *is* a control: marking a todo done is one tap.
+     * 44x44 (UI_TOUCH_MIN)：34x34 时手指落在下缘会滑到标题上，变成
+     * 「打开详情页」而不是勾选。 */
     lv_obj_t *checkbox = lv_checkbox_create(row);
     r->checkbox = checkbox;
     lv_checkbox_set_text(checkbox, "");
-    lv_obj_set_size(checkbox, 34, 34);
+    lv_obj_set_size(checkbox, UI_TOUCH_MIN, UI_TOUCH_MIN);
     lv_obj_add_flag(checkbox, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(checkbox, row_toggle_cb, LV_EVENT_VALUE_CHANGED,
                         (void *)(uintptr_t)item->id);
@@ -206,14 +383,29 @@ static void row_create(const todo_item_t *item)
     lv_label_set_long_mode(title, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_font(title, ui_font(UI_FONT_BODY), 0);
 
-    /* One-tap delete. Kept small and last so it is never hit while reaching
-     * for the row. */
+    /* 到期徽标：无到期日时隐藏。 */
+    lv_obj_t *due = lv_label_create(row);
+    r->due = due;
+    lv_obj_set_style_text_font(due, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(due, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_add_flag(due, LV_OBJ_FLAG_HIDDEN);
+
+    /* 同步徽标：已同步时不显示。 */
+    lv_obj_t *badge = lv_label_create(row);
+    r->badge = badge;
+    lv_obj_set_style_text_font(badge, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+
+    /* 删除按钮：同样要 >= 44px（原来是 52x34）。 */
     lv_obj_t *del = lv_button_create(row);
-    lv_obj_set_size(del, 52, 34);
+    lv_obj_set_size(del, 52, UI_TOUCH_MIN);
     lv_obj_set_style_bg_color(del, UI_COLOR_DANGER, 0);
+    lv_obj_set_style_radius(del, UI_CARD_RADIUS - 4, 0);
+    lv_obj_set_style_shadow_width(del, 0, 0);
     lv_obj_t *del_label = lv_label_create(del);
     lv_label_set_text(del_label, "删除");
     lv_obj_set_style_text_font(del_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(del_label, UI_COLOR_ON_PRIMARY, 0);
     lv_obj_center(del_label);
     lv_obj_add_event_cb(del, row_delete_cb, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)item->id);
@@ -237,38 +429,66 @@ static void rows_clear(void)
         memset(s_rows, 0, s_row_count * sizeof(todo_row_t));
     }
     s_row_count = 0;
+    s_empty = NULL;   /* the empty label lived in the list, it is gone now */
 }
 
-static void render_list(void)
+/** Create the "nothing here yet" label (once). */
+static void list_empty_show(void)
+{
+    if (s_list == NULL || s_empty != NULL) {
+        return;
+    }
+    s_empty = lv_label_create(s_list);
+    lv_label_set_text(s_empty, "还没有待办。\n请在电脑网页端新增（浏览器打开设备地址）。");
+    lv_obj_set_style_text_font(s_empty, ui_font(UI_FONT_BODY), 0);
+    lv_obj_set_style_text_color(s_empty, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_set_style_pad_all(s_empty, 24, 0);
+}
+
+/**
+ * Build (or update) the row list from a snapshot.
+ *
+ * The snapshot is already sorted by todo_manager (未完成 → 优先级 → 截止日 →
+ * id), so cutting the tail off is exactly "drop the least urgent ones".
+ */
+static void render_list(const todo_item_t *items, size_t count)
 {
     if (s_list == NULL) {
         return;
     }
 
-    todo_item_t *items = NULL;
-    size_t count = 0;
-    if (todo_list(&items, &count) != ESP_OK) {
-        return;
+    const size_t visible = (count > TODO_RENDER_MAX_ROWS) ? TODO_RENDER_MAX_ROWS : count;
+
+    /* 底部提示：被截断的条数。只在文案真的变了时才写。 */
+    if (s_more != NULL) {
+        if (count > visible) {
+            /* 中文按 UTF-8 每字 3 字节，整句加上数字最多约 70 字节；
+             * 缓冲区给足，否则编译器会报 format-truncation。 */
+            char buf[96];
+            snprintf(buf, sizeof(buf), "还有 %u 条未显示（在电脑网页端查看全部）",
+                     (unsigned)(count - visible));
+            if (strcmp(buf, lv_label_get_text(s_more)) != 0) {
+                lv_label_set_text(s_more, buf);
+            }
+            if (lv_obj_has_flag(s_more, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_remove_flag(s_more, LV_OBJ_FLAG_HIDDEN);
+            }
+        } else {
+            if (lv_label_get_text(s_more)[0] != '\0') {
+                lv_label_set_text(s_more, "");
+            }
+            if (!lv_obj_has_flag(s_more, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_add_flag(s_more, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
     }
 
-    if (count == 0) {
+    if (visible == 0) {
         if (s_row_count != 0) {
             rows_clear();
         }
-        /* The empty-state label lives in the list too, so only add it once. */
-        if (lv_obj_get_child_count(s_list) == 0) {
-            lv_obj_t *empty = lv_label_create(s_list);
-            lv_label_set_text(empty, "还没有待办。\n请在电脑网页端新增（浏览器打开设备地址）。");
-            lv_obj_set_style_text_font(empty, ui_font(UI_FONT_BODY), 0);
-            lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
-            lv_obj_set_style_pad_all(empty, 24, 0);
-        }
-        todo_free_list(items);
+        list_empty_show();
         return;
-    }
-
-    if (count > TODO_MAX_ITEMS) {
-        count = TODO_MAX_ITEMS;
     }
 
     /*
@@ -277,9 +497,9 @@ static void render_list(void)
      * over SSE - and it now costs a handful of style writes instead of destroying
      * and re-creating the whole list.
      */
-    bool same_shape = (s_row_count == count);
+    bool same_shape = (s_row_count == visible);
     if (same_shape) {
-        for (size_t i = 0; i < count; i++) {
+        for (size_t i = 0; i < visible; i++) {
             if (s_rows[i].id != items[i].id) {
                 same_shape = false;
                 break;
@@ -288,26 +508,154 @@ static void render_list(void)
     }
 
     if (same_shape) {
-        for (size_t i = 0; i < count; i++) {
+        for (size_t i = 0; i < visible; i++) {
             row_apply(&s_rows[i], &items[i]);
         }
-        todo_free_list(items);
         return;
     }
 
-    /* Structural change (add / delete / reorder): rebuild the rows. */
+    /* Structural change (add / delete / reorder / filter switch): rebuild. */
     rows_clear();
-    for (size_t i = 0; i < count; i++) {
+
+    /* One reservation for the whole list: the old per-row reserve() copied the
+     * table again for every row. */
+    if (!rows_reserve(visible)) {
+        return;
+    }
+    for (size_t i = 0; i < visible; i++) {
         row_create(&items[i]);
     }
-    todo_free_list(items);
 }
 
 /* ------------------------------------------------------------------------ */
 /* Render                                                                    */
 /* ------------------------------------------------------------------------ */
 
-/** One muted line telling the user where a todo can actually be changed. */
+/**
+ * 统计行：跟着当前筛选走。
+ *
+ * 「全部」保留原来的三项统计；其它档位显示「<档位> N / 共 M」，让用户看得见
+ * 筛选之后还剩多少（需求 F2）。
+ */
+static void render_stats(size_t shown)
+{
+    if (s_stats == NULL) {
+        return;
+    }
+
+    todo_stats_t stats;
+    if (todo_stats(&stats) != ESP_OK) {
+        return;
+    }
+
+    char buf[96];
+    if (s_filter_index == 0) {
+        snprintf(buf, sizeof(buf), "共 %u 项 · 已完成 %u · 待同步 %u",
+                 (unsigned)stats.total, (unsigned)stats.done, (unsigned)stats.pending);
+    } else {
+        snprintf(buf, sizeof(buf), "%s %u / 共 %u", s_filter_tabs[s_filter_index].label,
+                 (unsigned)shown, (unsigned)stats.total);
+    }
+
+    if (strcmp(buf, lv_label_get_text(s_stats)) != 0) {
+        lv_label_set_text(s_stats, buf);
+    }
+
+    const bool warn = stats.pending > 0;
+    if (warn != s_stats_warn) {
+        lv_obj_set_style_text_color(s_stats,
+                                    warn ? UI_COLOR_WARNING : UI_COLOR_TEXT_MUTED, 0);
+        s_stats_warn = warn;
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Filter bar                                                                */
+/* ------------------------------------------------------------------------ */
+
+/** refresh() 在下面定义，但筛选按钮要调用它。 */
+static void refresh(void);
+
+/** 选中态用主色，未选中用次要面色 —— 一眼能看出当前在看哪一档。 */
+static void filter_chip_style(lv_obj_t *btn, bool selected)
+{
+    if (btn == NULL) {
+        return;
+    }
+    lv_obj_set_style_bg_color(btn, selected ? UI_COLOR_PRIMARY : UI_COLOR_SURFACE_ALT, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    if (label != NULL) {
+        lv_obj_set_style_text_color(label,
+                                    selected ? UI_COLOR_ON_PRIMARY : UI_COLOR_TEXT_MUTED, 0);
+    }
+}
+
+static void filter_tab_cb(lv_event_t *e)
+{
+    const int index = (int)(intptr_t)lv_event_get_user_data(e);
+    if (index < 0 || index >= TODO_FILTER_COUNT) {
+        return;
+    }
+    if (index == s_filter_index) {
+        return;
+    }
+
+    /* 只改两个 chip 的样式，不整页重建。 */
+    filter_chip_style(s_filter_btn[s_filter_index], false);
+    s_filter_index = index;
+    filter_chip_style(s_filter_btn[s_filter_index], true);
+
+    /* 切换筛选只影响显示：不改数据，也不碰持久化。 */
+    refresh();
+}
+
+static void filter_bar_create(lv_obj_t *parent)
+{
+    lv_obj_t *bar = lv_obj_create(parent);
+    if (bar == NULL) {
+        return;
+    }
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_width(bar, LV_PCT(100));
+    lv_obj_set_height(bar, UI_TOUCH_MIN);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(bar, 8, 0);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < TODO_FILTER_COUNT; i++) {
+        lv_obj_t *btn = lv_button_create(bar);
+        if (btn == NULL) {
+            continue;
+        }
+        s_filter_btn[i] = btn;
+        lv_obj_set_height(btn, UI_TOUCH_MIN);
+        lv_obj_set_flex_grow(btn, 1);
+        lv_obj_set_style_radius(btn, UI_CARD_RADIUS, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_pad_hor(btn, 6, 0);
+
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, s_filter_tabs[i].label);
+        lv_obj_set_style_text_font(label, ui_font(UI_FONT_SMALL), 0);
+        lv_obj_center(label);
+
+        lv_obj_add_event_cb(btn, filter_tab_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    /* 初始态：第 0 档选中。 */
+    for (int i = 0; i < TODO_FILTER_COUNT; i++) {
+        filter_chip_style(s_filter_btn[i], i == s_filter_index);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Row callbacks                                                             */
+/* ------------------------------------------------------------------------ */
+
 /*
  * Marking done and deleting stay on the device: both are single taps, and a tap is
  * the one input this panel is good at. *Creating and editing* stay on the web page
@@ -338,14 +686,52 @@ static void row_toggle_cb(lv_event_t *e)
     }
 }
 
-static void row_delete_cb(lv_event_t *e)
+/**
+ * 删除确认框里点「删除」之后才真正删。
+ *
+ * 回调拿到的是弹窗对象本身（ui_dialog_confirm 的约定）：先把业务做完，
+ * 再关弹窗——同一次点击里「先关再做事」会把后面的动作一起吞掉。
+ */
+static void delete_confirm_cb(lv_event_t *e)
 {
-    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    lv_obj_t *mbox = (lv_obj_t *)lv_event_get_user_data(e);
+    if (mbox == NULL) {
+        return;
+    }
+    const uint32_t id = (uint32_t)(uintptr_t)lv_obj_get_user_data(mbox);
+
     esp_err_t err = todo_delete(id);
     if (err == ESP_OK) {
         ui_toast("已删除");
     } else {
         ui_toast("删除失败：%s", esp_err_to_name(err));
+    }
+
+    lv_msgbox_close(mbox);
+}
+
+/** 删除按钮：一按先问一句，误触不再等于永久丢失（需求 B11）。 */
+static void row_delete_cb(lv_event_t *e)
+{
+    const uint32_t id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+
+    /* 把标题带进确认文案，用户才看得出要删的是哪一条。 */
+    char text[256];
+    todo_item_t item;
+    if (todo_get(id, &item) == ESP_OK) {
+        const int n = snprintf(text, sizeof(text), "确认删除「%s」？删除后无法恢复。", item.title);
+        if (n < 0 || (size_t)n >= sizeof(text)) {
+            /* 标题太长装不下：宁可少写标题，也不要从多字节字符中间截断。 */
+            strlcpy(text, "确认删除这条待办？删除后无法恢复。", sizeof(text));
+        }
+    } else {
+        strlcpy(text, "确认删除这条待办？删除后无法恢复。", sizeof(text));
+    }
+
+    lv_obj_t *mbox = ui_dialog_confirm("删除待办", text, "删除", "取消",
+                                       delete_confirm_cb, (void *)(uintptr_t)id);
+    if (mbox == NULL) {
+        ui_toast("无法打开确认框");
     }
 }
 
@@ -360,27 +746,29 @@ static void readonly_hint_create(lv_obj_t *parent)
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
 }
 
-static void render_stats(void)
-{
-    if (s_stats == NULL) {
-        return;
-    }
+/* ------------------------------------------------------------------------ */
+/* Refresh                                                                   */
+/* ------------------------------------------------------------------------ */
 
-    todo_stats_t stats;
-    if (todo_stats(&stats) != ESP_OK) {
-        return;
-    }
-    lv_label_set_text_fmt(s_stats, "共 %u 项 · 已完成 %u · 待同步 %u",
-                          (unsigned)stats.total, (unsigned)stats.done,
-                          (unsigned)stats.pending);
-    lv_obj_set_style_text_color(s_stats,
-                                stats.pending > 0 ? UI_COLOR_WARNING : UI_COLOR_TEXT_MUTED, 0);
-}
-
+/**
+ * 取一次快照，统计行与列表共用。
+ *
+ * 取数统一走 todo_list_filtered()：排序口径与 todo_list() 一致
+ * （未完成 → 优先级 → 截止日 → id），所以「只渲染前 30 行」截掉的正是
+ * 最不紧急的那几条。
+ */
 static void refresh(void)
 {
-    render_stats();
-    render_list();
+    todo_item_t *items = NULL;
+    size_t count = 0;
+    if (todo_list_filtered(s_filter_tabs[s_filter_index].filter, &items, &count) != ESP_OK) {
+        return;
+    }
+
+    render_stats(count);
+    render_list(items, count);
+
+    todo_free_list(items);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -390,6 +778,8 @@ static void refresh(void)
 static esp_err_t todo_create(lv_obj_t *parent)
 {
     (void)page_header_create(parent, "待办清单");
+
+    filter_bar_create(parent);
 
     s_stats = lv_label_create(parent);
     lv_obj_set_style_text_font(s_stats, ui_font(UI_FONT_SMALL), 0);
@@ -408,6 +798,16 @@ static esp_err_t todo_create(lv_obj_t *parent)
     lv_obj_set_style_pad_right(s_list, 6, 0);
     lv_obj_add_flag(s_list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
+
+    /* 渲染上限的提示：被截断的条数在这里说明白。 */
+    s_more = lv_label_create(parent);
+    lv_obj_set_width(s_more, LV_PCT(100));
+    lv_label_set_long_mode(s_more, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(s_more, "");
+    lv_obj_set_style_text_font(s_more, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_more, UI_COLOR_TEXT_MUTED, 0);
+    lv_obj_set_style_text_align(s_more, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_more, LV_OBJ_FLAG_HIDDEN);
 
     /* The "新增 / 标记已同步 / 清除已完成" toolbar used to live here; editing is
      * done on the PC web page, so its slot now carries that hint instead. */
@@ -457,6 +857,96 @@ void page_todo_detail_set_id(uint32_t id)
     s_detail_id = id;
 }
 
+/**
+ * 写标签前先比较。
+ *
+ * lv_label_set_text() 即使内容一样也会 invalidate 整个对象，详情页每次事件都
+ * 无脑重写三个标签等于每次都让整页重排（铁律二）。
+ */
+static void detail_set_text(lv_obj_t *label, const char *text)
+{
+    if (label == NULL) {
+        return;
+    }
+    if (strcmp(lv_label_get_text(label), text) == 0) {
+        return;
+    }
+    lv_label_set_text(label, text);
+}
+
+/** 优先级：0 普通 / 1 重要 / 2 紧急。 */
+static const char *priority_name(uint8_t priority)
+{
+    if (priority >= 2) {
+        return "紧急";
+    }
+    if (priority == 1) {
+        return "重要";
+    }
+    return "普通";
+}
+
+/**
+ * 到期时间：本地时区的「2026-10-21 09:00」。
+ *
+ * 没校过时（sys_time_synced() 为假）只显示「未校时」，不编一个日期出来
+ * （FR4 / 需求 F3）。
+ */
+static void due_text_format(int64_t due_ts, char *out, size_t out_len)
+{
+    if (due_ts <= 0) {
+        strlcpy(out, "无到期时间", out_len);
+        return;
+    }
+    if (!sys_time_synced()) {
+        strlcpy(out, "未校时", out_len);
+        return;
+    }
+
+    const time_t due = (time_t)due_ts;
+    struct tm tm_due;
+    if (localtime_r(&due, &tm_due) == NULL) {
+        strlcpy(out, "未校时", out_len);
+        return;
+    }
+    /* 夹到日历可能的范围，再格式化到定长临时缓冲后拷贝：
+     * out_len 是运行期参数，直接格式化编译器无法证明放得下，
+     * 会触发 -Werror=format-truncation。 */
+    int year = tm_due.tm_year + 1900;
+    int mon = tm_due.tm_mon + 1;
+    int day = tm_due.tm_mday;
+    int hour = tm_due.tm_hour;
+    int min = tm_due.tm_min;
+    if (year < 1970) {
+        year = 1970;
+    } else if (year > 9999) {
+        year = 9999;
+    }
+    if (mon < 1) {
+        mon = 1;
+    } else if (mon > 12) {
+        mon = 12;
+    }
+    if (day < 1) {
+        day = 1;
+    } else if (day > 31) {
+        day = 31;
+    }
+    if (hour < 0) {
+        hour = 0;
+    } else if (hour > 23) {
+        hour = 23;
+    }
+    if (min < 0) {
+        min = 0;
+    } else if (min > 59) {
+        min = 59;
+    }
+    char tmp[24];
+    snprintf(tmp, sizeof(tmp), "%04d-%02d-%02d %02d:%02d", year, mon, day, hour, min);
+    strlcpy(out, tmp, out_len);
+}
+
 static void detail_refresh(void)
 {
     if (s_detail_title == NULL) {
@@ -465,27 +955,26 @@ static void detail_refresh(void)
 
     todo_item_t item;
     if (todo_get(s_detail_id, &item) != ESP_OK) {
-        lv_label_set_text(s_detail_title, "该待办已不存在");
-        lv_label_set_text(s_detail_meta, "");
-        lv_label_set_text(s_detail_desc, "");
+        detail_set_text(s_detail_title, "该待办已不存在");
+        detail_set_text(s_detail_meta, "");
+        detail_set_text(s_detail_desc, "");
         return;
     }
 
-    lv_label_set_text(s_detail_title, item.title);
-    lv_label_set_text(s_detail_desc, item.desc[0] != '\0' ? item.desc : "（无备注）");
+    detail_set_text(s_detail_title, item.title);
+    detail_set_text(s_detail_desc, item.desc[0] != '\0' ? item.desc : "（无备注）");
 
     static const char *const sync_names[] = { "未同步", "待同步", "已同步", "同步失败" };
     const char *sync = (item.sync_state < 4) ? sync_names[item.sync_state] : "?";
 
-    if (item.due_ts > 0) {
-        lv_label_set_text_fmt(s_detail_meta, "#%lu · %s · 优先级 %u · %s · 到期 %lld",
-                              (unsigned long)item.id, item.done ? "已完成" : "未完成",
-                              item.priority, sync, (long long)item.due_ts);
-    } else {
-        lv_label_set_text_fmt(s_detail_meta, "#%lu · %s · 优先级 %u · %s · 无到期时间",
-                              (unsigned long)item.id, item.done ? "已完成" : "未完成",
-                              item.priority, sync);
-    }
+    char due[32];
+    due_text_format(item.due_ts, due, sizeof(due));
+
+    char meta[160];
+    snprintf(meta, sizeof(meta), "#%lu · %s · 优先级%s · %s · 到期 %s",
+             (unsigned long)item.id, item.done ? "已完成" : "未完成",
+             priority_name(item.priority), sync, due);
+    detail_set_text(s_detail_meta, meta);
 }
 
 static esp_err_t todo_detail_create(lv_obj_t *parent)
@@ -504,6 +993,8 @@ static esp_err_t todo_detail_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_detail_title, UI_COLOR_TEXT, 0);
 
     s_detail_meta = lv_label_create(body);
+    lv_obj_set_width(s_detail_meta, LV_PCT(100));
+    lv_label_set_long_mode(s_detail_meta, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_detail_meta, ui_font(UI_FONT_SMALL), 0);
     lv_obj_set_style_text_color(s_detail_meta, UI_COLOR_TEXT_MUTED, 0);
 

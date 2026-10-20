@@ -100,6 +100,23 @@ static size_t s_cloud_count;
 static uint16_t *s_cloud_map;
 static bool s_cloud_active;
 
+/*
+ * ## The card currently on screen (v1.5.0 fix for the wrong spelling in the log)
+ *
+ * Every cloud-only card carries the **same** id, WORD_ID_CLOUD, so the id
+ * cannot say which word the user just graded. `word_review()` used to answer
+ * that question by scanning the queue for "the first entry whose id is
+ * WORD_ID_CLOUD" - which is always the *first* cloud word of the day, never
+ * the card that was on screen. Every line of `review_log.jsonl` therefore
+ * carried the wrong spelling (roadmap B5).
+ *
+ * So the spelling of the card handed out by word_next() is remembered here and
+ * handed to the history writer explicitly. The copy is taken while the lock is
+ * held, because a sync replaces the whole cloud queue.
+ */
+static char s_current_spelling[WORD_SPELLING_MAX];
+static uint32_t s_current_id;
+
 static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;
 
@@ -260,8 +277,17 @@ static void free_buffers(void)
 /** Parse a book document into freshly allocated arrays. */
 static esp_err_t parse_book(const char *json)
 {
-    cJSON *root = cJSON_Parse(json);
+    /*
+     * sys_json_parse(), not cJSON_Parse(): the book is a file the user can
+     * edit on the card, and cJSON recurses once per nesting level (~96 bytes
+     * of stack per level, up to 1000 levels). A malformed book would therefore
+     * blow the stack of whoever parses it - on the boot path that means the
+     * device reboots in a loop (roadmap B3). The depth limit turns that into a
+     * clean "cannot read the book".
+     */
+    cJSON *root = sys_json_parse(json, 32);
     if (root == NULL) {
+        SYS_LOGW(TAG, "the wordbook is not valid JSON (or nests too deeply)");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -518,9 +544,10 @@ static esp_err_t load_progress(void)
         return err;
     }
 
-    cJSON *root = cJSON_Parse(json);
+    cJSON *root = sys_json_parse(json, 32);
     free(json);
     if (root == NULL) {
+        SYS_LOGW(TAG, "the saved progress is not valid JSON; starting fresh");
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1223,6 +1250,10 @@ esp_err_t word_next(word_item_t *out)
         }
         const size_t cloud_index = s_queue_pos++;
         *out = s_cloud_words[cloud_index];
+        /* Remember which card is on screen: the cloud ids are all the same,
+         * so word_review() cannot recover the spelling from the id. */
+        strlcpy(s_current_spelling, out->spelling, sizeof(s_current_spelling));
+        s_current_id = out->id;
         xSemaphoreGive(s_lock);
         return ESP_OK;
     }
@@ -1247,6 +1278,9 @@ esp_err_t word_next(word_item_t *out)
     *out = s_words[index];
     out->level = s_progress[index].level;
     out->next_review_ts = s_progress[index].next_review_ts;
+    /* Remember which card is on screen (see s_current_spelling). */
+    strlcpy(s_current_spelling, out->spelling, sizeof(s_current_spelling));
+    s_current_id = out->id;
     xSemaphoreGive(s_lock);
 
     return ESP_OK;
@@ -1330,27 +1364,33 @@ esp_err_t word_review(uint32_t id, word_review_result_t result)
      * puts it back into the cloud plan. The old code only logged, which is why a
      * graded cloud card left no trace anywhere.
      *
-     * The spelling is copied out while the lock is held (s_cloud_words is
-     * replaced wholesale by a sync, so a pointer taken here could dangle).
+     * The spelling is the one of the card that is **on screen** (s_current_*),
+     * copied out while the lock is held (s_cloud_words is replaced wholesale by
+     * a sync, so a pointer taken here could dangle). It used to be taken from
+     * "the first cloud word in the queue", which is never the card the user
+     * graded - all cloud ids are WORD_ID_CLOUD, so the log recorded the wrong
+     * word every single time (roadmap B5).
      */
     if (index == (size_t)-1) {
         char cloud_spelling[WORD_SPELLING_MAX] = { 0 };
         const bool was_cloud_only = (s_cloud_active && id == WORD_ID_CLOUD);
-        if (was_cloud_only) {
-            for (size_t i = 0; i < s_cloud_count; i++) {
-                if (s_cloud_words[i].id == WORD_ID_CLOUD) {
-                    strlcpy(cloud_spelling, s_cloud_words[i].spelling,
-                            sizeof(cloud_spelling));
-                    break;
-                }
-            }
+        if (was_cloud_only && s_current_id == id) {
+            strlcpy(cloud_spelling, s_current_spelling, sizeof(cloud_spelling));
         }
         xSemaphoreGive(s_lock);
 
         if (was_cloud_only) {
-            SYS_LOGD(TAG, "graded a cloud-only card '%s' (%s): history only, no local record",
-                     cloud_spelling, word_review_name(result));
-            (void)word_history_append(WORD_ID_CLOUD, cloud_spelling, result, true);
+            if (cloud_spelling[0] == '\0') {
+                /* No card on screen to take the spelling from: writing a
+                 * guessed one would poison the log, so nothing is written. */
+                SYS_LOGW(TAG, "graded a cloud-only card whose spelling is unknown; "
+                              "no history line written");
+            } else {
+                SYS_LOGD(TAG, "graded a cloud-only card '%s' (%s): history only, "
+                              "no local record",
+                         cloud_spelling, word_review_name(result));
+                (void)word_history_append(WORD_ID_CLOUD, cloud_spelling, result, true);
+            }
             (void)sys_event_post_to(WORD_EVENT, WORD_EVENT_REVIEWED, &id, sizeof(id));
         }
         return ESP_ERR_NOT_FOUND;
@@ -1513,6 +1553,20 @@ static size_t s_history_len;    /**< entries currently queued */
 static StaticSemaphore_t s_history_lock_buf;
 static SemaphoreHandle_t s_history_lock;
 
+/*
+ * Serialises the flushers.
+ *
+ * Both the save worker and the HTTP reader drain the queue, and the flush
+ * touches the file in several steps (check the tail, terminate a torn line,
+ * append). Those steps must not interleave with another flusher, or a torn
+ * line can still be glued to a line written in between.
+ *
+ * It is deliberately **not** the queue lock: that one is taken by the LVGL
+ * callback on every grade, and it must never be held across a FAT write.
+ */
+static StaticSemaphore_t s_flush_lock_buf;
+static SemaphoreHandle_t s_flush_lock;
+
 /** Format one JSONL line into @p out. Returns the length, or 0 on failure. */
 static size_t history_format_line(char *out, size_t len, uint32_t id,
                                   const char *spelling, word_review_result_t result,
@@ -1578,11 +1632,90 @@ esp_err_t word_history_append(uint32_t id, const char *spelling,
     return word_save_progress_async();
 }
 
-/** Drain queued history lines onto the card. Worker context. */
-void word_history_flush_pending(void)
+/**
+ * Put a line back at the head of the queue after a failed write.
+ *
+ * The flush pops the head before writing (so two flushers cannot write the
+ * same line twice), which meant a failed write silently dropped the record.
+ * Restoring it at the head keeps the chronological order.
+ */
+static void history_requeue(const char *line)
 {
-    if (s_history_lock == NULL || !storage_available()) {
-        return;
+    xSemaphoreTake(s_history_lock, portMAX_DELAY);
+    if (s_history_len < WORD_HISTORY_QUEUE) {
+        s_history_head = (s_history_head + WORD_HISTORY_QUEUE - 1) % WORD_HISTORY_QUEUE;
+        strlcpy(s_history_queue[s_history_head], line, WORD_HISTORY_LINE_MAX);
+        s_history_len++;
+    } else {
+        /* 16 other lines are already waiting: they are newer, so they win. */
+        SYS_LOGW(TAG, "study history queue is full; the failed line is dropped");
+    }
+    xSemaphoreGive(s_history_lock);
+}
+
+/*
+ * ## Is the last line of the log complete?
+ *
+ * A power loss in the middle of an append leaves a half line at the end of the
+ * file (no trailing newline). The next append is then glued onto it, and the
+ * reader - which splits on '\n' - sees one broken line and skips **both**
+ * records. So the tail is checked before appending, and a newline is written
+ * first when the previous line is incomplete.
+ *
+ * The answer is remembered: every line this module appends ends with a
+ * newline, so the tail stays complete for the rest of the session. It only
+ * becomes unknown again when an append itself fails halfway.
+ */
+static bool s_history_tail_known;
+static bool s_history_tail_complete;
+
+static bool history_tail_is_complete(void)
+{
+    if (s_history_tail_known) {
+        return s_history_tail_complete;
+    }
+
+    size_t size = 0;
+    if (storage_exists(WORD_HISTORY_FILE, &size) != ESP_OK || size == 0) {
+        s_history_tail_known = true;
+        s_history_tail_complete = true;
+        return true;
+    }
+
+    /* The storage abstraction has no seek, so the last byte can only be seen by
+     * reading the file. Beyond the reader's own limit we do not bother: the
+     * cheap fix (writing a newline first) is correct either way. */
+    bool complete = false;
+    if (size <= (size_t)WORD_HISTORY_MAX_READ) {
+        char *text = NULL;
+        size_t len = 0;
+        if (storage_read_text(WORD_HISTORY_FILE, &text, &len) == ESP_OK && text != NULL) {
+            complete = (len > 0 && text[len - 1] == '\n');
+        }
+        free(text);
+    }
+
+    s_history_tail_known = true;
+    s_history_tail_complete = complete;
+    return complete;
+}
+
+/** Drain queued history lines onto the card. Worker context. */
+static void history_flush_locked(void)
+{
+    /*
+     * Make sure the first line of this batch starts on a fresh line. Doing it
+     * once per batch is enough: every line we append ends with a newline.
+     */
+    if (!history_tail_is_complete()) {
+        const esp_err_t err = storage_append_file(WORD_HISTORY_FILE, "\n", 1);
+        if (err != ESP_OK) {
+            SYS_LOGW(TAG, "cannot terminate the torn history line: %s",
+                     esp_err_to_name(err));
+            return;
+        }
+        s_history_tail_known = true;
+        s_history_tail_complete = true;
     }
 
     for (;;) {
@@ -1605,8 +1738,15 @@ void word_history_flush_pending(void)
         const esp_err_t err = storage_append_file(WORD_HISTORY_FILE, line, len);
         if (err != ESP_OK) {
             SYS_LOGW(TAG, "cannot append to the study history: %s", esp_err_to_name(err));
+            /* The line was already taken out of the queue: put it back, or the
+             * record is lost for good. */
+            history_requeue(line);
+            /* The file may now end in the middle of a line: re-check next time. */
+            s_history_tail_known = false;
             return;   /* keep the rest queued for the next wake */
         }
+        s_history_tail_known = true;
+        s_history_tail_complete = true;
 
         /*
          * Size check, memory-only and at most once per session.
@@ -1626,6 +1766,24 @@ void word_history_flush_pending(void)
                               "to reclaim space", (unsigned)size);
             }
         }
+    }
+}
+
+/** Drain queued history lines onto the card. Worker context. */
+void word_history_flush_pending(void)
+{
+    if (s_history_lock == NULL || !storage_available()) {
+        return;
+    }
+
+    /* One flusher at a time: the tail check and the appends that follow it
+     * must not interleave with another flusher (see s_flush_lock). */
+    if (s_flush_lock != NULL) {
+        xSemaphoreTake(s_flush_lock, portMAX_DELAY);
+    }
+    history_flush_locked();
+    if (s_flush_lock != NULL) {
+        xSemaphoreGive(s_flush_lock);
     }
 }
 
@@ -1676,8 +1834,10 @@ esp_err_t word_history_read(word_review_log_entry_t *out, size_t max,
             *newline = '\0';
         }
 
-        cJSON *entry = cJSON_Parse(cursor);
-        if (entry != NULL) {   /* a torn tail simply fails to parse and is skipped */
+        /* A torn tail simply fails to parse and is skipped. The depth limit
+         * keeps a hand-edited line from blowing the stack (roadmap B3). */
+        cJSON *entry = sys_json_parse(cursor, 32);
+        if (entry != NULL) {
             word_review_log_entry_t parsed = { 0 };
             const cJSON *id = cJSON_GetObjectItemCaseSensitive(entry, "id");
             const cJSON *w = cJSON_GetObjectItemCaseSensitive(entry, "w");
@@ -1725,6 +1885,13 @@ esp_err_t word_history_clear(void)
 {
     s_history_full = false;
 
+    /* Wait for a running flush to finish: deleting the file while a line is
+     * being appended would put that line back into a file that no longer
+     * exists. */
+    if (s_flush_lock != NULL) {
+        xSemaphoreTake(s_flush_lock, portMAX_DELAY);
+    }
+
     /* Drop anything still queued, or the save worker would write it back into
      * the file this call is about to delete. */
     if (s_history_lock != NULL) {
@@ -1733,7 +1900,15 @@ esp_err_t word_history_clear(void)
         s_history_len = 0;
         xSemaphoreGive(s_history_lock);
     }
-    return storage_delete_file(WORD_HISTORY_FILE);
+    /* The file is gone, so there is no torn tail to terminate any more. */
+    s_history_tail_known = true;
+    s_history_tail_complete = true;
+
+    const esp_err_t err = storage_delete_file(WORD_HISTORY_FILE);
+    if (s_flush_lock != NULL) {
+        xSemaphoreGive(s_flush_lock);
+    }
+    return err;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1755,6 +1930,12 @@ esp_err_t word_service_init(void)
      * called from LVGL callbacks while the save worker drains it. */
     s_history_lock = xSemaphoreCreateMutexStatic(&s_history_lock_buf);
     if (s_history_lock == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Serialises the flushers (save worker vs. HTTP reader). */
+    s_flush_lock = xSemaphoreCreateMutexStatic(&s_flush_lock_buf);
+    if (s_flush_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
 

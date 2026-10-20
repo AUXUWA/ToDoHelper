@@ -12,6 +12,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -35,6 +36,11 @@ ESP_EVENT_DEFINE_BASE(AI_EVENT);
 
 #define AI_ENDPOINT "https://api.deepseek.com/chat/completions"
 #define AI_HISTORY_FILE "ai/chat_history.json"
+/*
+ * 任务栈尺寸的依据：esp_http_client **没有自己的任务**，mbedTLS 的握手直接
+ * 消耗调用者的栈。8192 B 是本工程跑 DeepSeek 请求已经验证过的尺寸
+ * （同一条 TLS 路径），不要再往下砍。
+ */
 #define AI_TASK_STACK 8192
 #define AI_TASK_PRIO 4
 #define AI_MAX_RESPONSE (12 * 1024)
@@ -50,7 +56,18 @@ static char s_system_prompt[512] = AI_DEFAULT_SYSTEM_PROMPT;
 static uint32_t s_history_rounds = 10;
 static bool s_save_history;
 
-static ai_message_t s_messages[AI_HISTORY_MAX_MESSAGES];
+/*
+ * 对话历史：24 × 1040 B ≈ 24 KB。
+ *
+ * 以前是常驻 .bss（内部 DRAM），开机就吃掉 66 KB 内部 RAM 余量的 37%，
+ * 而 AI 只是可选的 P2 功能。现在改成**按需分配**、并且优先放 PSRAM，
+ * 内部 DRAM 一字节都不占（见 history_ensure_locked()）。
+ *
+ * 指针一旦分配就不再改变、进程生命周期内不释放，所以
+ * ai_service_get_last_reply() / ai_service_history_get() 拿到的指针
+ * 生命周期仍然是「到进程结束为止」。
+ */
+static ai_message_t *s_messages;
 static size_t s_message_count;
 static char s_last_reply[AI_MESSAGE_MAX];
 
@@ -59,7 +76,6 @@ static SemaphoreHandle_t s_lock;
 
 static TaskHandle_t s_task;
 static QueueHandle_t s_requests;
-static SemaphoreHandle_t s_done;
 static volatile bool s_abort;
 
 /** Payload handed to the worker task. */
@@ -148,19 +164,64 @@ bool ai_service_has_api_key(void)
 /* History                                                                   */
 /* ------------------------------------------------------------------------ */
 
-esp_err_t ai_service_clear_history(void)
+/**
+ * 分配对话历史缓冲区。**必须在持有 s_lock 时调用。**
+ *
+ * 优先放 PSRAM：这 24 KB 放在内部 DRAM 里会挤掉 WiFi/LVGL 需要的连续块，
+ * 而本机内部 RAM 只剩 66 KB（开机后）。分配失败时保持 s_messages == NULL，
+ * 调用方按「没有上下文」降级，不崩。
+ */
+static esp_err_t history_ensure_locked(void)
 {
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_message_count = 0;
-    s_last_reply[0] = '\0';
+    if (s_messages != NULL) {
+        return ESP_OK;
+    }
 
-    /* Keep the system prompt as message 0. */
-    const bool has_prompt = (s_system_prompt[0] != '\0');
-    if (has_prompt) {
+    /* heap_caps_malloc_prefer() 是可变参的：第二个参数是「后面还有几个能力集」。
+     * 先试 PSRAM，失败再退回默认堆（与 sys_json.c / word_service.c 同一写法）。 */
+    ai_message_t *buf = heap_caps_malloc_prefer(
+        (size_t)AI_HISTORY_MAX_MESSAGES * sizeof(ai_message_t), 2,
+        MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (buf == NULL) {
+        SYS_LOGE(TAG, "history buffer allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+    memset(buf, 0, (size_t)AI_HISTORY_MAX_MESSAGES * sizeof(ai_message_t));
+    s_messages = buf;
+    s_message_count = 0;
+
+    /* 系统提示固定占 messages[0]：缓冲区是「懒」出来的，但内容语义要和
+     * 「一开始就分配好」时完全一致。 */
+    if (s_system_prompt[0] != '\0') {
         strlcpy(s_messages[0].role, "system", sizeof(s_messages[0].role));
         strlcpy(s_messages[0].content, s_system_prompt, sizeof(s_messages[0].content));
         s_message_count = 1;
     }
+    return ESP_OK;
+}
+
+esp_err_t ai_service_clear_history(void)
+{
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_last_reply[0] = '\0';
+
+    if (s_messages != NULL) {
+        s_message_count = 0;
+
+        /* Keep the system prompt as message 0. */
+        const bool has_prompt = (s_system_prompt[0] != '\0');
+        if (has_prompt) {
+            strlcpy(s_messages[0].role, "system", sizeof(s_messages[0].role));
+            strlcpy(s_messages[0].content, s_system_prompt, sizeof(s_messages[0].content));
+            s_message_count = 1;
+        }
+    }
+    /* 缓冲区还没分配时什么都不用做：等它被分配出来时天然就是「只有系统提示」。 */
+
     xSemaphoreGive(s_lock);
 
     SYS_LOGI(TAG, "conversation cleared");
@@ -169,7 +230,12 @@ esp_err_t ai_service_clear_history(void)
 
 size_t ai_service_history_count(void)
 {
+    if (s_lock == NULL) {
+        return 0;
+    }
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    (void)history_ensure_locked();
     const size_t count = s_message_count;
     xSemaphoreGive(s_lock);
     return count;
@@ -180,8 +246,15 @@ esp_err_t ai_service_history_get(size_t index, ai_message_t *out)
     if (out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (history_ensure_locked() != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NO_MEM;
+    }
     if (index >= s_message_count) {
         xSemaphoreGive(s_lock);
         return ESP_ERR_NOT_FOUND;
@@ -194,7 +267,16 @@ esp_err_t ai_service_history_get(size_t index, ai_message_t *out)
 /** Append a message, honouring the retained-round limit. */
 static void history_append(const char *role, const char *content)
 {
+    if (s_lock == NULL) {
+        return;
+    }
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    if (history_ensure_locked() != ESP_OK) {
+        xSemaphoreGive(s_lock);
+        return;
+    }
 
     const bool has_prompt = (s_message_count > 0) &&
                             (strcmp(s_messages[0].role, "system") == 0);
@@ -243,7 +325,8 @@ static char *build_request_json(bool stream)
     cJSON_AddNumberToObject(root, "temperature", 0.7);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (size_t i = 0; i < s_message_count; i++) {
+    const esp_err_t hist = history_ensure_locked();
+    for (size_t i = 0; hist == ESP_OK && i < s_message_count; i++) {
         cJSON *msg = cJSON_CreateObject();
         if (msg == NULL) {
             continue;
@@ -253,6 +336,11 @@ static char *build_request_json(bool stream)
         cJSON_AddItemToArray(messages, msg);
     }
     xSemaphoreGive(s_lock);
+
+    if (hist != ESP_OK) {
+        cJSON_Delete(root);
+        return NULL;
+    }
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -319,7 +407,9 @@ static void handle_sse_line(ai_stream_ctx_t *ctx, const char *line)
         return;
     }
 
-    cJSON *root = cJSON_Parse(payload);
+    /* 外部输入（远端返回的 SSE 记录）：用带深度上限的解析，
+     * 别让畸形报文把任务栈吃穿。 */
+    cJSON *root = sys_json_parse(payload, 32);
     if (root == NULL) {
         return;
     }
@@ -470,7 +560,7 @@ static esp_err_t ai_perform(const char *body_json, bool stream, ai_chunk_cb_t on
     }
 
     /* Non-streaming response: choices[0].message.content */
-    cJSON *root = cJSON_Parse(ctx.body.buf);
+    cJSON *root = sys_json_parse(ctx.body.buf, 32);
     free(ctx.body.buf);
     if (root == NULL) {
         return ESP_ERR_INVALID_RESPONSE;
@@ -623,14 +713,53 @@ static void ai_task(void *arg)
             (void)sys_event_post_to(AI_EVENT, AI_EVENT_REPLY_CHUNK, reply,
                                     strlen(reply) + 1);
         }
-        xSemaphoreGive(s_done);
     }
     vTaskDelete(NULL);
 }
 
+/**
+ * 按需创建 worker 任务。
+ *
+ * th_ai 的 8 KB 栈只能从内部 RAM 出，AI 又是可选的 P2 功能，开机就建一个
+ * 常驻任务等于开机白占 8 KB 内部 RAM。所以第一次 ai_service_chat_async()
+ * 时才建，建完保留（对话是一次一轮的，频繁重建反而更折腾）。
+ */
+static esp_err_t ai_worker_ensure(void)
+{
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+
+    esp_err_t err = ESP_OK;
+    if (s_task == NULL) {
+        if (s_requests == NULL) {
+            s_requests = xQueueCreate(1, sizeof(ai_request_t));
+            if (s_requests == NULL) {
+                SYS_LOGE(TAG, "request queue creation failed");
+                err = ESP_ERR_NO_MEM;
+            }
+        }
+        if (err == ESP_OK) {
+            if (xTaskCreate(ai_task, "th_ai", AI_TASK_STACK, NULL, AI_TASK_PRIO,
+                            &s_task) != pdPASS) {
+                SYS_LOGE(TAG, "worker task creation failed");
+                s_task = NULL;
+                err = ESP_ERR_NO_MEM;
+            } else {
+                SYS_LOGI(TAG, "worker task started");
+            }
+        }
+    }
+
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
 esp_err_t ai_service_chat_async(const char *text)
 {
-    if (!s_initialized || s_requests == NULL) {
+    if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
     if (text == NULL || text[0] == '\0') {
@@ -638,6 +767,11 @@ esp_err_t ai_service_chat_async(const char *text)
     }
     if (strlen(text) >= AI_MESSAGE_MAX) {
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    const esp_err_t err = ai_worker_ensure();
+    if (err != ESP_OK) {
+        return err;
     }
 
     ai_request_t request;
@@ -688,7 +822,8 @@ esp_err_t ai_service_save_history(void)
     cJSON_AddItemToObject(root, "messages", array);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (size_t i = 0; i < s_message_count; i++) {
+    const esp_err_t hist = history_ensure_locked();
+    for (size_t i = 0; hist == ESP_OK && i < s_message_count; i++) {
         cJSON *msg = cJSON_CreateObject();
         if (msg == NULL) {
             continue;
@@ -698,6 +833,12 @@ esp_err_t ai_service_save_history(void)
         cJSON_AddItemToArray(array, msg);
     }
     xSemaphoreGive(s_lock);
+
+    if (hist != ESP_OK) {
+        /* array 已经挂到 root 上了，删 root 就够了（再删一次 array 是双重释放）。 */
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -723,7 +864,9 @@ esp_err_t ai_service_load_history(void)
         return err;
     }
 
-    cJSON *root = cJSON_Parse(json);
+    /* 存档文件在 SD 卡上，用户可以自己改：用带深度上限的解析，
+     * 坏文件只会让这次载入失败，不会把开机路径带崩。 */
+    cJSON *root = sys_json_parse(json, 32);
     free(json);
     if (root == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -783,7 +926,15 @@ esp_err_t ai_service_set_system_prompt(const char *prompt)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    /* 提示词会被历史缓冲区读，写的时候要跟读互斥，否则读到半截。 */
+    if (s_lock != NULL) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+    }
     strlcpy(s_system_prompt, prompt, sizeof(s_system_prompt));
+    if (s_lock != NULL) {
+        xSemaphoreGive(s_lock);
+    }
+
     esp_err_t err = sys_config_set_str(SYS_KEY_AI_PROMPT, s_system_prompt);
     (void)ai_service_clear_history();
     return err;
@@ -834,9 +985,7 @@ esp_err_t ai_service_init(void)
     }
 
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
-    s_done = xSemaphoreCreateBinary();
-    s_requests = xQueueCreate(1, sizeof(ai_request_t));
-    if (s_lock == NULL || s_done == NULL || s_requests == NULL) {
+    if (s_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -846,6 +995,7 @@ esp_err_t ai_service_init(void)
     s_history_rounds = (uint32_t)sys_config_get_i32_or(SYS_KEY_AI_ROUNDS, 10);
     s_save_history = sys_config_get_bool_or(SYS_KEY_AI_SAVE_HIST, CONFIG_TODOHELPER_AI_SAVE_HISTORY);
     s_message_count = 0;
+    s_messages = NULL;   /* 历史缓冲区按需分配，不在开机时占内存 */
 
     s_initialized = true;
     (void)ai_service_clear_history();
@@ -854,11 +1004,8 @@ esp_err_t ai_service_init(void)
         (void)ai_service_load_history();
     }
 
-    if (xTaskCreate(ai_task, "th_ai", AI_TASK_STACK, NULL, AI_TASK_PRIO, &s_task) != pdPASS) {
-        SYS_LOGE(TAG, "worker task creation failed");
-        s_initialized = false;
-        return ESP_ERR_NO_MEM;
-    }
+    /* worker 任务不在这儿建：第一次 ai_service_chat_async() 时才按需创建，
+     * 开机不白占 8 KB 内部 RAM 栈。 */
 
     esp_err_t http_err = ai_service_register_http();
     if (http_err != ESP_OK) {

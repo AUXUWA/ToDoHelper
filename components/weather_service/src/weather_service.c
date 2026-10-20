@@ -12,6 +12,7 @@
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -34,7 +35,14 @@ ESP_EVENT_DEFINE_BASE(WEATHER_EVENT);
 #endif
 
 #define WEATHER_CACHE_FILE "weather.json"
-#define WEATHER_TASK_STACK 6144
+/**
+ * 天气 worker 的栈。
+ *
+ * esp_http_client 没有自己的任务，mbedTLS 握手直接吃调用者的栈
+ * （IDF v6.1 的 esp_http_client.c 里没有 xTaskCreate）。刷新和 IP 定位
+ * 都在这个任务上跑 HTTPS，所以栈要按"跑得下 TLS 握手"来给（规格 P6）。
+ */
+#define WEATHER_TASK_STACK 8192
 #define WEATHER_TASK_PRIO  4
 #define WEATHER_REFRESH_WAIT_MS 20000
 
@@ -48,9 +56,8 @@ ESP_EVENT_DEFINE_BASE(WEATHER_EVENT);
  */
 #define WEATHER_GEO_ENDPOINT_DEFAULT "https://ipapi.co/json/"
 
-/** Worker request opcodes. */
+/** Worker request tokens: 队列里的令牌只表示"跑一轮 worker"。 */
 #define WEATHER_REQ_REFRESH 0
-#define WEATHER_REQ_DETECT  1
 
 /* ------------------------------------------------------------------------ */
 /* State                                                                     */
@@ -69,6 +76,14 @@ static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
 static QueueHandle_t s_requests;
 static SemaphoreHandle_t s_done;
+
+/**
+ * 置位表示"有一次 IP 定位请求待处理"。
+ *
+ * 不用队列来记这件事：队列深度只有 1，忙的时候塞不进去，直接丢会让用户
+ * 点的「重新定位」莫名其妙没反应。标志位不会丢 —— worker 每一轮都会来取。
+ */
+static bool s_detect_requested;
 
 static esp_timer_handle_t s_timer;
 
@@ -177,6 +192,32 @@ esp_err_t weather_read_api_key(char *out, size_t len)
     return sys_config_get_str(SYS_KEY_WEATHER_KEY, out, len);
 }
 
+/* ------------------------------------------------------------------------ */
+/* NVS persistence                                                           */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * 写 NVS 字符串，但值一个字节没变就不写。
+ *
+ * nvs_set_str + nvs_commit 是一次 flash 写。天气每 15 分钟刷新一次，
+ * 每次都把同样的城市名/坐标写回去，flash 寿命就被白白吃掉，而 NVS 里的
+ * 值根本没变。先读回来比一比，相同就什么都不做（规格 P3）。
+ *
+ * @return 值没变时返回 ESP_OK（视为成功），否则是 NVS 写的返回值。
+ */
+static esp_err_t config_set_str_if_changed(const char *key, const char *value)
+{
+    if (key == NULL || value == NULL || value[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char current[64];
+    if (sys_config_get_str(key, current, sizeof(current)) == ESP_OK &&
+        strcmp(current, value) == 0) {
+        return ESP_OK;
+    }
+    return sys_config_set_str(key, value);
+}
+
 /** Accumulates the response body across HTTP_EVENT_ON_DATA callbacks. */
 typedef struct {
     char *buf;
@@ -203,7 +244,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
     if (ctx->buf == NULL) {
         ctx->cap = 2048;
-        ctx->buf = malloc(ctx->cap);
+        /* PSRAM 优先：内部 RAM 只剩几十 KB，而 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+         * 会让普通 malloc 优先落在内部堆上。16 KB 的响应缓冲放在内部堆里，
+         * 等于在内存最紧的时候临时吃掉 16 KB（AGENT.md §9.0）。 */
+        ctx->buf = heap_caps_malloc_prefer(ctx->cap, 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
         if (ctx->buf == NULL) {
             ctx->overflow = true;
             return ESP_OK;
@@ -214,7 +258,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         while (new_cap < ctx->len + (size_t)evt->data_len + 1) {
             new_cap *= 2;
         }
-        char *grown = realloc(ctx->buf, new_cap);
+        /* 扩容也要走 PSRAM：普通 realloc 会把块留在原来那块所属的堆上，
+         * 不会因为变大就搬到 PSRAM 去。 */
+        char *grown = heap_caps_realloc_prefer(ctx->buf, new_cap, 2,
+                                               MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
         if (grown == NULL) {
             ctx->overflow = true;
             return ESP_OK;
@@ -259,16 +306,16 @@ esp_err_t weather_http_get_json(const char *url, char **out)
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        free(ctx.buf);
+        heap_caps_free(ctx.buf);
         return err;
     }
     if (ctx.overflow) {
-        free(ctx.buf);
+        heap_caps_free(ctx.buf);
         return ESP_ERR_INVALID_SIZE;
     }
     if (status != 200) {
         SYS_LOGW(TAG, "HTTP %d for %s", status, url);
-        free(ctx.buf);
+        heap_caps_free(ctx.buf);
         return ESP_ERR_INVALID_RESPONSE;
     }
     if (ctx.buf == NULL) {
@@ -541,13 +588,13 @@ esp_err_t weather_set_location(double lat, double lon, const char *label)
     xSemaphoreGive(s_lock);
 
     if (label != NULL && label[0] != '\0') {
-        (void)sys_config_set_str(SYS_KEY_CITY, s_city);
+        (void)config_set_str_if_changed(SYS_KEY_CITY, s_city);
     }
     char coord[24];
     snprintf(coord, sizeof(coord), "%.4f", lat);
-    (void)sys_config_set_str(SYS_KEY_CITY_LAT, coord);
+    (void)config_set_str_if_changed(SYS_KEY_CITY_LAT, coord);
     snprintf(coord, sizeof(coord), "%.4f", lon);
-    (void)sys_config_set_str(SYS_KEY_CITY_LON, coord);
+    (void)config_set_str_if_changed(SYS_KEY_CITY_LON, coord);
 
     SYS_LOGI(TAG, "location set to %.4f, %.4f ('%s')", lat, lon, s_city);
     return ESP_OK;
@@ -582,7 +629,7 @@ esp_err_t weather_detect_location(void)
     }
 
     cJSON *root = cJSON_Parse(body);
-    free(body);
+    heap_caps_free(body);
     if (root == NULL) {
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -652,6 +699,7 @@ static esp_err_t weather_do_refresh(void)
     }
 
     char city[64];
+    char resolved[64] = { 0 };
     double lat = 0;
     double lon = 0;
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -687,16 +735,20 @@ static esp_err_t weather_do_refresh(void)
     if (fresh.city[0] != '\0') {
         strlcpy(s_city, fresh.city, sizeof(s_city));
     }
+    /* 锁内取一份快照，锁外再写 NVS：s_city 是别的任务也会动的全局缓冲。 */
+    strlcpy(resolved, s_city, sizeof(resolved));
     xSemaphoreGive(s_lock);
 
     /* Remember the resolved place so a later boot can show the right label, and
-     * keep the coordinates in NVS for diagnostics/inspection. */
-    (void)sys_config_set_str(SYS_KEY_CITY, s_city);
+     * keep the coordinates in NVS for diagnostics/inspection.
+     * 值没变就不写：定时刷新每 15 分钟一次，一次无条件的三键重写就是三次
+     * flash 写，而城市名和坐标通常一个字节都没变（规格 P3）。 */
+    (void)config_set_str_if_changed(SYS_KEY_CITY, resolved);
     char coord[24];
     snprintf(coord, sizeof(coord), "%.4f", lat);
-    (void)sys_config_set_str(SYS_KEY_CITY_LAT, coord);
+    (void)config_set_str_if_changed(SYS_KEY_CITY_LAT, coord);
     snprintf(coord, sizeof(coord), "%.4f", lon);
-    (void)sys_config_set_str(SYS_KEY_CITY_LON, coord);
+    (void)config_set_str_if_changed(SYS_KEY_CITY_LON, coord);
 
     (void)weather_save_cache();
 
@@ -705,13 +757,34 @@ static esp_err_t weather_do_refresh(void)
     return ESP_OK;
 }
 
+/** 记下一次 IP 定位请求。标志位不会因为队列满而丢。 */
+static void weather_request_detect(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_detect_requested = true;
+    xSemaphoreGive(s_lock);
+}
+
+/** 取走一次待处理的 IP 定位请求（没有就返回 false）。 */
+static bool weather_take_detect_request(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const bool requested = s_detect_requested;
+    s_detect_requested = false;
+    xSemaphoreGive(s_lock);
+    return requested;
+}
+
 static void weather_task(void *arg)
 {
     (void)arg;
-    uint8_t opcode;
+    uint8_t token;
 
-    while (xQueueReceive(s_requests, &opcode, portMAX_DELAY) == pdTRUE) {
-        if (opcode == WEATHER_REQ_DETECT) {
+    while (xQueueReceive(s_requests, &token, portMAX_DELAY) == pdTRUE) {
+        /* 令牌只负责把 worker 叫醒；这一轮要不要做 IP 定位看标志位。 */
+        (void)token;
+
+        if (weather_take_detect_request()) {
             /*
              * Wait for a valid clock, don't just skip.
              *
@@ -761,15 +834,33 @@ static void weather_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/** Queue an IP geolocation attempt followed by a refresh. */
-static esp_err_t weather_detect_async(void)
+/**
+ * @brief 异步做一次 IP 定位（等价于 weather_detect_location()，但不阻塞调用者）。
+ *
+ * weather_detect_location() 是阻塞的：一次完整的 HTTPS 请求，超时 12 s。
+ * 设备端「重新定位」按钮在 LVGL 回调里调用它会把整个 UI 冻住 12 s
+ * （AGENT.md §9.0.1.1 铁律一），所以 UI 必须走这个异步入口。
+ *
+ * 请求丢给天气 worker 任务（栈 8192，跑的是和刷新一样的 HTTPS 路径），
+ * 定位完顺带刷一次读数。结果通过 WEATHER_EVENT_UPDATED 事件回来，
+ * 页面收到事件后自己刷新即可。
+ *
+ * 注意：声明还需要补到 components/weather_service/include/weather_service.h
+ * （本轮该头文件不在天气分区的改动白名单内，见 not_done）。
+ */
+esp_err_t weather_detect_location_async(void)
 {
     if (!s_initialized || s_requests == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint8_t opcode = WEATHER_REQ_DETECT;
-    if (xQueueSend(s_requests, &opcode, 0) != pdTRUE) {
-        return ESP_ERR_INVALID_STATE;   /* a request is already queued */
+    /*
+     * 先置标志位再叫醒 worker：队列满的时候（worker 正在跑一轮）标志位
+     * 依然留着，请求不会丢。worker 下一轮会把它取走。
+     */
+    weather_request_detect();
+    const uint8_t token = WEATHER_REQ_REFRESH;
+    if (xQueueSend(s_requests, &token, 0) != pdTRUE) {
+        SYS_LOGD(TAG, "detect queued behind a pending refresh");
     }
     return ESP_OK;
 }
@@ -779,8 +870,8 @@ esp_err_t weather_refresh_async(void)
     if (!s_initialized || s_requests == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    const uint8_t opcode = WEATHER_REQ_REFRESH;
-    if (xQueueSend(s_requests, &opcode, 0) != pdTRUE) {
+    const uint8_t token = WEATHER_REQ_REFRESH;
+    if (xQueueSend(s_requests, &token, 0) != pdTRUE) {
         /* A refresh is already queued: coalescing is the desired behaviour. */
         return ESP_OK;
     }
@@ -794,8 +885,8 @@ esp_err_t weather_refresh(void)
     }
 
     (void)xSemaphoreTake(s_done, 0);   /* drop a stale completion */
-    const uint8_t opcode = WEATHER_REQ_REFRESH;
-    if (xQueueSend(s_requests, &opcode, 0) != pdTRUE) {
+    const uint8_t token = WEATHER_REQ_REFRESH;
+    if (xQueueSend(s_requests, &token, 0) != pdTRUE) {
         /* Someone else is refreshing: wait for that result instead of piling on. */
     }
 
@@ -846,7 +937,7 @@ esp_err_t weather_set_city(const char *city)
     s_data.lon = 0;
     xSemaphoreGive(s_lock);
 
-    esp_err_t err = sys_config_set_str(SYS_KEY_CITY, city);
+    esp_err_t err = config_set_str_if_changed(SYS_KEY_CITY, city);
     SYS_LOGI(TAG, "city set to '%s'", city);
 
     (void)weather_refresh_async();
@@ -923,6 +1014,11 @@ esp_err_t weather_service_init(void)
      * default with real coordinates means weather is correct on the very first
      * boot with no network lookup at all, and "重新定位" is still there when the
      * user actually moves.
+     *
+     * The price of the fixed default: the "no city -> locate by IP" branch
+     * below is never taken at boot. The IP geolocation path itself is not
+     * dead code any more - weather_detect_location_async() (the device side
+     * "重新定位" button) goes through the same worker path.
      */
     (void)sys_config_get_str_or(SYS_KEY_CITY, s_city, sizeof(s_city), "南昌");
     /*
@@ -991,7 +1087,7 @@ esp_err_t weather_service_init(void)
         /* FR3 location priority 2: with nothing configured, try the public IP so
          * the page is useful on the very first boot without any setup. */
         SYS_LOGI(TAG, "no city configured, trying IP geolocation");
-        (void)weather_detect_async();
+        (void)weather_detect_location_async();
     }
     return ESP_OK;
 }

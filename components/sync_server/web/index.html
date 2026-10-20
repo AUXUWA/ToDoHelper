@@ -18,6 +18,9 @@
     PATCH  /api/v1/todos/{id}/done    勾选/取消 {"done":bool} → 该项
     DELETE /api/v1/todos/{id}         删除
     POST   /api/v1/sync               整表标记已同步
+    POST   /api/v1/todos/ack          回执 body {"ids":[1,2]}：设备据此把这些条目标记为已同步
+    GET    /api/v1/todos/export       导出整份清单 JSON（老固件没有这条路由时会明确提示）
+    POST   /api/v1/todos/import       导入整份清单 JSON（整体替换设备上的清单）
     GET    /api/v1/events             SSE 推送（todo_changed / todo_done / sync_* / net_* / wifi_*）
     GET    /api/v1/wifi/status        WiFi 状态 {state,connected,ssid,ip,rssi,mac,hostname}
     POST   /api/v1/wifi/scan          发起异步扫描（立即返回 {"scanning":true}）
@@ -29,10 +32,12 @@
     路由定义见 components/wifi_manager/src/wifi_manager_http.c（7 条，均已注册）
     GET    /api/v1/device/info        芯片、固件、IP、主机名、MAC、WiFi、存储、鉴权开关
     GET    /api/v1/device/status      运行时长、堆、PSRAM、RSSI、SSE 客户端数、时钟是否已同步
-    Header X-Auth-Token               设备开启鉴权后所有请求（含 GET）都需要它
+    Header X-Auth-Token               设备开启鉴权后所有请求（含 GET）都需要它，推送连接也带
 
-  设备端只有 5 个 socket，SSE 长期占用 1 个，所以这里所有普通请求都串行排队（见 api()）。
-  设备屏幕只读：新增 / 编辑 / 勾选 / 删除只在本页进行。
+  设备端只有 5 个 socket，SSE 长期占用 1 个，所以这里所有普通请求都串行排队（见 api()）；
+  墨墨那种要几十秒的请求走单独的一条链（见 apiSlow），不然整页的其它请求都会被堵住。
+
+  设备屏幕也可以直接勾选 / 删除；本页的价值在于看完整清单、搜索筛选和批量整理。
 -->
 <style>
   :root{
@@ -115,6 +120,7 @@
   .btn.primary{background:var(--primary);color:var(--on-primary)}
   .btn.small{min-height:36px;padding:0 12px;font-size:13px;font-weight:500}
   .btn.danger{border-color:var(--danger);color:var(--danger);background:transparent}
+  .btn.armed{background:var(--primary);color:var(--on-primary)}
   .btn.danger.armed{background:var(--danger);color:#fff}
   .btn:disabled{opacity:.55;cursor:default}
   .row-actions{display:flex;gap:8px;flex-wrap:wrap}
@@ -143,6 +149,19 @@
   .search{flex:1;min-width:150px}
   .counts{font-size:12px;color:var(--muted);margin-bottom:8px}
 
+  /* ---------- 排序 / 批量操作 ---------- */
+  /* width:auto 是必须的：通用 select 规则写的是 width:100%，
+     不改掉的话这个下拉会占满一整行，把工具条挤散。 */
+  .toolbar select{flex:0 1 auto;width:auto;min-width:112px;min-height:36px;padding:0 8px;font-size:13px}
+  .bulk{margin-bottom:10px;padding:10px 12px;border-radius:10px;font-size:13px;
+        background:var(--surface-alt);border-left:3px solid var(--primary)}
+  .bulk.ok{border-left-color:var(--success)}
+  .bulk.err{border-left-color:var(--danger)}
+  .bulk .bulk-title{font-weight:600}
+  .bulk .bulk-list{margin:6px 0 0;padding-left:18px;font-size:12px;color:var(--danger);
+                    word-break:break-word}
+  .bulk .bulk-list li{margin-bottom:2px}
+
   /* ---------- 待办列表 ---------- */
   ul.list{list-style:none;margin:0;padding:0}
   .row{display:flex;gap:12px;align-items:flex-start;padding:12px;margin-bottom:8px;
@@ -150,7 +169,7 @@
   .row.done{opacity:.72}
   .row .check{width:22px;height:22px;flex:0 0 auto;margin:2px 0 0;accent-color:var(--success);cursor:pointer}
   .row .body{flex:1;min-width:0}
-  .row .title{font-size:15px;word-break:break-word}
+  .row .title{font-size:15px;word-break:break-word;overflow-wrap:anywhere}
   .row.done .title{text-decoration:line-through;color:var(--muted)}
   .row .desc{font-size:13px;color:var(--muted);white-space:pre-wrap;word-break:break-word;margin-top:4px}
   .row .actions{display:flex;gap:6px;flex:0 0 auto}
@@ -240,6 +259,22 @@
     .row{flex-wrap:wrap}
     .row .actions{width:100%;justify-content:flex-end}
     .grid2{grid-template-columns:1fr}
+    /* 窄屏：工具条里的按钮改成按行均分，绝不横向溢出；
+       筛选条改成一屏宽并允许横向滚动，避免最后一个按钮被挤出屏幕。 */
+    .toolbar{gap:6px}
+    .toolbar .btn{flex:1 1 30%;min-width:0;padding:0 8px}
+    .toolbar select{flex:1 1 40%;min-width:0;width:auto}
+    .search{flex:1 1 100%;min-width:0}
+    .seg{max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+    .seg button{flex:0 0 auto}
+    .card-head .btn{flex:0 0 auto}
+  }
+
+  /* 更窄的机器（手机竖屏）：行内操作按钮换行但仍各自够宽，长标题也不再顶破容器。 */
+  @media (max-width:420px){
+    .row .actions{justify-content:stretch}
+    .row .actions .btn{flex:1 1 0;min-width:0}
+    .toolbar .btn{flex:1 1 45%}
   }
 </style>
 </head>
@@ -317,10 +352,26 @@
           <button type="button" data-filter="done">已完成</button>
         </div>
         <input class="search" type="text" id="search" placeholder="搜索标题或备注…" aria-label="搜索待办">
+        <select id="sort" aria-label="排序方式" title="只影响本页显示顺序，不改设备上的数据">
+          <option value="device">设备顺序</option>
+          <option value="due">按到期</option>
+          <option value="priority">按优先级</option>
+          <option value="updated">按更新时间</option>
+          <option value="added">按添加顺序</option>
+        </select>
+        <button class="btn small" type="button" id="bulk-done" title="把当前未完成的待办逐条标记为已完成">全部标记完成</button>
+        <button class="btn small danger" type="button" id="bulk-clear" title="把当前已完成的待办逐条删除">清除已完成</button>
         <button class="btn small" type="button" id="sync-all" title="POST /api/v1/sync：把设备上全部待办标记为已同步">标记已同步</button>
+        <button class="btn small" type="button" id="export" title="GET /api/v1/todos/export：把整份清单下载到电脑">导出</button>
+        <button class="btn small" type="button" id="import" title="POST /api/v1/todos/import：用备份文件整份替换设备上的清单">导入</button>
+        <input type="file" id="import-file" accept="application/json,.json" hidden>
         <button class="btn small" type="button" id="reload">刷新</button>
       </div>
       <div class="counts" id="counts"></div>
+      <div class="bulk" id="bulk" role="status" aria-live="polite" hidden>
+        <div class="bulk-title" id="bulk-title"></div>
+        <ul class="bulk-list" id="bulk-list"></ul>
+      </div>
       <ul class="list" id="list"></ul>
       <div class="empty" id="empty" hidden>
         <div class="big" id="empty-title">正在读取设备上的待办…</div>
@@ -338,8 +389,9 @@
       </summary>
       <div class="fields" style="padding-top:10px">
         <p class="small muted">
-          设备开启鉴权后，所有请求（含读取）都要带请求头 <code>X-Auth-Token</code>。令牌只保存在本机浏览器的
-          localStorage 里，不会发往设备以外的任何地方。<br>
+          设备开启鉴权后，所有请求（包括读取列表这类 GET）都要带请求头 <code>X-Auth-Token</code>；
+          实时推送那条长连接也会带上同一个令牌。令牌只保存在本机浏览器的 localStorage 里，
+          不会发往设备以外的任何地方。<br>
           注意：开启/关闭鉴权由 <code>POST /api/v1/device/auth</code> 完成，而该接口本身要求携带<strong>当前已生效的</strong>令牌，
           所以本页只能填写令牌、无法代替设备开启或关闭鉴权。
         </p>
@@ -426,7 +478,7 @@
 </div>
 
 <footer>
-  本页由设备内嵌提供（<code>GET /</code>），不依赖任何外部网络资源。待办数据保存在设备上，设备屏幕只读 —— 新增、编辑、勾选、删除都在本页完成。
+  本页由设备内嵌提供（<code>GET /</code>），不依赖任何外部网络资源。待办数据保存在设备上；设备屏幕同样可以勾选和删除，本页适合查看完整清单、搜索筛选与批量整理。
   <noscript>当前浏览器禁用了 JavaScript，页面无法工作。</noscript>
 </footer>
 
@@ -482,6 +534,13 @@ var PUSH_NET = { net_online: 1, net_offline: 1, wifi_connected: 1, wifi_failed: 
 var PUSH_ALL = ["todo_changed", "todo_done", "sync_started", "sync_done",
                 "net_online", "net_offline", "wifi_connected", "wifi_failed",
                 "weather_changed", "word_reviewed"];
+/* 推送看门狗：设备每 15 s 发一次 ": keepalive" 注释（见 sync_server.c），
+   所以超过 30 s 一个字节都没收到，就说明连接已经半开或断了 —— 必须重连并恢复轮询兜底，
+   否则页面会一直以为「推送中」，列表永远停在旧数据上。 */
+var SSE_STALE_MS = 30000;
+var SSE_WATCHDOG_MS = 5000;
+/* 批量操作的失败清单最多列出多少条（再多只报数量，免得刷屏）。 */
+var BULK_FAIL_SHOWN = 6;
 
 function $(id) { return document.getElementById(id); }
 function el(tag, cls, text) {
@@ -502,11 +561,26 @@ var items = [];            /* 设备返回的原始待办数组 */
 var loaded = false;        /* 是否成功读到过一次列表 */
 var filter = "all";
 var keyword = "";
+var sortMode = "device";   /* 显示顺序，只影响本页，不改设备上的数据 */
 var deviceInfo = null;
 var deviceStatus = null;
 var editingId = 0;
 var lastListAt = 0;
 var lastDevAt = 0;
+/* 删除二次确认的「上膛」状态记在这里，而不是 DOM 节点的 dataset 上：
+   列表一旦重绘（推送到来了、搜索词变了……）节点就被换掉，
+   挂在节点上的标记会丢，用户就会陷入「反复点删不掉」。 */
+var armedDeleteId = 0;
+var armedDeleteTimer = 0;
+var deletingId = 0;        /* 正在删除的 id，按钮显示「删除中…」 */
+/* 批量操作的进度与失败清单。 */
+var bulk = { running: false, done: 0, total: 0, failures: [], kind: "", shown: false };
+/* 待回执的待办 id：收到设备推送并把数据吃进本地列表后，合并成一批 POST /api/v1/todos/ack。 */
+var ackIds = [];
+var ackTimer = 0;
+var ackUnsupported = false;   /* 旧固件没有这条路由，试一次就够了，别反复骚扰设备 */
+/* 推送连接最近一次收到任何字节的时间（看门狗用）。 */
+var lastFrameAt = 0;
 
 function readToken() {
   try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
@@ -556,6 +630,9 @@ function setPill(id, state, text) {
    ======================================================================== */
 
 var queue = Promise.resolve();
+/* 墨墨的「保存并校验」「探测能力」「拉取今日词表」会真的绕到外网，最长 60 秒。
+   它们如果挤在公共队列里，整页其它请求会被一起堵死，所以单独给一条链。 */
+var slowQueue = Promise.resolve();
 
 /* 设备只开 5 个 socket（SSE 常占 1 个），普通请求一律排队，避免把自己挤掉。 */
 function api(path, options) {
@@ -563,6 +640,70 @@ function api(path, options) {
   var result = queue.then(run, run);
   queue = result.then(function () {}, function () {});
   return result;
+}
+
+/* 长耗时请求（墨墨）：走独立的队列，不阻塞列表/勾选这些常规操作。 */
+function apiSlow(path, options) {
+  var run = function () { return request(path, options || {}); };
+  var result = slowQueue.then(run, run);
+  slowQueue = result.then(function () {}, function () {});
+  return result;
+}
+
+/* 设备把真正的原因放在 data.detail（英文上下文）和 data.esp_err（esp_err_t 名字）里，
+   body.msg 往往只有一句 "internal error"。这里把三者都翻成中文再给人看。 */
+var MSG_TEXT = {
+  "internal error": "设备内部错误",
+  "invalid json": "请求内容不是合法 JSON",
+  "not found": "设备上找不到这一项",
+  "unauthorized": "未通过身份令牌校验",
+  "bad request": "请求不合法",
+  "not implemented": "设备尚未实现该功能",
+  "unavailable": "设备暂时不可用",
+  "method not allowed": "设备不接受这个请求方法",
+  "missing body": "请求缺少正文",
+  "missing or oversized body": "请求正文缺失或过大",
+  "invalid id": "待办编号不合法",
+  "field 'title' is required": "缺少标题",
+  "field 'done' must be a boolean": "done 字段必须是布尔值"
+};
+var DETAIL_TEXT = {
+  "add todo": "新增待办",
+  "update todo": "更新待办",
+  "set done": "设置完成状态",
+  "delete todo": "删除待办",
+  "get todo": "读取待办",
+  "device info": "读取设备信息",
+  "device status": "读取设备状态",
+  "set token": "设置身份令牌"
+};
+var ESP_ERR_TEXT = {
+  "ESP_ERR_NO_MEM": "内存不足",
+  "ESP_ERR_INVALID_ARG": "参数不合法",
+  "ESP_ERR_INVALID_STATE": "当前状态不允许",
+  "ESP_ERR_INVALID_SIZE": "长度不合法",
+  "ESP_ERR_NOT_FOUND": "目标不存在",
+  "ESP_ERR_NOT_SUPPORTED": "不支持该操作",
+  "ESP_ERR_TIMEOUT": "设备处理超时",
+  "ESP_ERR_INVALID_RESPONSE": "设备返回了非法响应",
+  "ESP_FAIL": "操作失败"
+};
+
+/* data.detail / data.esp_err 拼成一段人话。 */
+function errorDetailParts(body) {
+  var parts = [];
+  var data = (body && body.data) ? body.data : {};
+  if (data.detail) { parts.push(DETAIL_TEXT[String(data.detail)] || String(data.detail)); }
+  if (data.esp_err) { parts.push(ESP_ERR_TEXT[String(data.esp_err)] || String(data.esp_err)); }
+  return parts;
+}
+
+/* 把整个响应信封变成一句中文错误说明。 */
+function deviceErrorText(body, fallback) {
+  var msg = (body && body.msg) ? String(body.msg) : "";
+  var head = MSG_TEXT[msg] || msg || fallback || "请求失败";
+  var parts = errorDetailParts(body);
+  return parts.length ? (head + "（" + parts.join(" · ") + "）") : head;
 }
 
 function apiError(message, kind, status) {
@@ -606,24 +747,39 @@ async function request(path, options) {
 
     var body = null;
     if (text) { try { body = JSON.parse(text); } catch (e) { body = null; } }
-    var msg = (body && body.msg) ? body.msg : "";
+    /* 真正的原因在 data.detail / data.esp_err，这里一次性翻好，后面各处直接用。 */
+    var reason = deviceErrorText(body, "");
 
     if (response.status === 401) {
-      throw apiError(msg || "设备已开启鉴权：请求缺少有效的 X-Auth-Token", "auth", 401);
+      var authParts = errorDetailParts(body);
+      throw apiError("设备已开启鉴权：请求缺少有效的 X-Auth-Token" +
+                     (authParts.length ? "（" + authParts.join(" · ") + "）" : ""), "auth", 401);
     }
     if (response.status === 501) {
       var hint = (body && body.data && body.data.hint) ? body.data.hint : "";
       throw apiError("设备尚未实现该功能" + (hint ? "（" + hint + "）" : ""), "notimpl", 501);
     }
     if (!response.ok) {
-      throw apiError(msg || ("HTTP " + response.status), "http", response.status);
+      var errText = reason;
+      /* 404 有两种：待办被删了，和这台设备根本没有这个路由（固件太旧）。
+         不分清楚的话，用户会以为待办丢了，其实只是接口不存在。 */
+      if (response.status === 404) {
+        errText = /^\/api\/v1\/todos\/\d+/.test(path)
+          ? "设备上找不到这一项（可能已经被删除）"
+          : "设备没有这个接口（固件版本还没有它）";
+        var parts = errorDetailParts(body);
+        if (parts.length) { errText += "（" + parts.join(" · ") + "）"; }
+      }
+      throw apiError(errText, "http", response.status);
     }
     if (body === null) {
       throw apiError("设备返回的内容不是合法 JSON 信封", "parse", response.status);
     }
     if (typeof body.code === "number" && body.code !== 0) {
-      throw apiError(msg || ("code " + body.code), "http", response.status);
+      throw apiError(reason || ("code " + body.code), "http", response.status);
     }
+    /* 标准信封一定带 data；不带的话（例如导出接口直接回一整份 JSON）就原样返回。 */
+    if (body && typeof body === "object" && !("data" in body)) { return body; }
     return body.data;
   } catch (e) {
     if (e && e.kind) { throw e; }                     /* 已分类的错误直接上报 */
@@ -821,7 +977,7 @@ function renderDevice(err) {
     add("运行时长", fmtDuration(status.uptime_s));
     add("设备时间", status.time_synced ? "已同步（NTP）" : "未同步（到期提醒可能不准）",
         status.time_synced ? "ok" : "warn");
-    add("推送客户端", (status.sse_clients || 0) + " / 4");
+    add("推送客户端", (status.sse_clients || 0) + " / 3");
     if (status.url) { add("访问地址", status.url); }
   } else {
     add("运行时长", "未取到（/api/v1/device/status）", "warn");
@@ -863,6 +1019,8 @@ function loadAll() {
     loaded = true;
     lastListAt = Date.now();
     goOnline();
+    /* 数据已经吃进本地列表了，告诉设备这些条目的回执（见规格 B9）。 */
+    ackCollect(items);
     renderList();
   }).catch(function (err) {
     renderList();
@@ -882,7 +1040,7 @@ function loadAll() {
 
 function visibleItems() {
   var key = keyword.trim().toLowerCase();
-  return items.filter(function (item) {
+  var list = items.filter(function (item) {
     if (filter === "open" && item.done) { return false; }
     if (filter === "done" && !item.done) { return false; }
     if (key) {
@@ -891,15 +1049,49 @@ function visibleItems() {
     }
     return true;
   });
+  return sortItems(list);
+}
+
+/* 没有截止时间的排到最后（键值给一个很大的数，不去碰 0 与真实时间戳的大小关系）。 */
+var DUE_NONE_KEY = 9007199254740991;
+function dueSortKey(item) {
+  var due = Number(item.due_ts) || 0;
+  return due > 0 ? due : DUE_NONE_KEY;
+}
+
+/* 排序只影响本页的显示顺序，不改设备上的数据。
+   口径与设备端 todo_list() 一致：未完成在前 → 优先级高在前 → 截止早在前 → id 升序。
+   每个模式只换掉第一排序键，次级键始终回落到上面那条链。 */
+function sortItems(list) {
+  var mode = sortMode;
+  return list.slice().sort(function (a, b) {
+    if (!!a.done !== !!b.done) { return a.done ? 1 : -1; }
+    var diff = 0;
+    if (mode === "due") { diff = dueSortKey(a) - dueSortKey(b); }
+    else if (mode === "priority") { diff = (Number(b.priority) || 0) - (Number(a.priority) || 0); }
+    else if (mode === "updated") { diff = (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0); }
+    else if (mode === "added") { diff = (Number(a.id) || 0) - (Number(b.id) || 0); }
+    if (diff !== 0) { return diff; }
+    diff = (Number(b.priority) || 0) - (Number(a.priority) || 0);
+    if (diff !== 0) { return diff; }
+    diff = dueSortKey(a) - dueSortKey(b);
+    if (diff !== 0) { return diff; }
+    return (Number(a.id) || 0) - (Number(b.id) || 0);
+  });
+}
+
+/* 写进本地列表但不立刻重绘：批量操作要重绘几百次会把页面拖死。 */
+function upsertInto(item) {
+  if (!item || !item.id) { return false; }
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].id === item.id) { items[i] = item; return true; }
+  }
+  items.push(item);
+  return true;
 }
 
 function upsertItem(item) {
-  if (!item || !item.id) { return; }
-  var found = false;
-  for (var i = 0; i < items.length; i++) {
-    if (items[i].id === item.id) { items[i] = item; found = true; break; }
-  }
-  if (!found) { items.push(item); }
+  if (!upsertInto(item)) { return; }
   loaded = true;
   renderList();
 }
@@ -962,7 +1154,16 @@ function renderRow(item) {
   edit.addEventListener("click", function () { openEditor(item); });
   var del = el("button", "btn small danger", "删除");
   del.type = "button";
-  del.addEventListener("click", function () { armDelete(item, del); });
+  /* 「已上膛 / 删除中」都从全局状态读，不从 DOM 节点上读：
+     节点随时会被 renderList() 换掉，状态必须活在数据里。 */
+  if (deletingId === item.id) {
+    del.textContent = "删除中…";
+    del.disabled = true;
+  } else if (armedDeleteId === item.id) {
+    del.textContent = "确认删除";
+    del.classList.add("armed");
+  }
+  del.addEventListener("click", function () { armDelete(item); });
   actions.append(edit, del);
 
   row.append(box, body, actions);
@@ -1000,7 +1201,7 @@ function renderList() {
     action.hidden = true;
   } else if (!items.length) {
     setText($("empty-title"), "还没有待办事项");
-    setText($("empty-detail"), "在上面的输入框里写下第一条吧。设备屏幕是只读的，新增 / 编辑 / 勾选 / 删除都在本页完成。");
+    setText($("empty-detail"), "在上面的输入框里写下第一条吧。设备屏幕也能勾选和删除，新增 / 编辑 / 批量整理都在本页完成。");
     action.hidden = false;
     action.textContent = "添加第一条待办";
     action.dataset.act = "add";
@@ -1035,37 +1236,312 @@ function toggleDone(item, box) {
   });
 }
 
-/* 两步删除：第一次点变“确认删除”，4 秒内再点才真的删。 */
-function armDelete(item, btn) {
-  if (btn.dataset.armed === "1") { doDelete(item, btn); return; }
-  btn.dataset.armed = "1";
-  btn.classList.add("armed");
-  btn.textContent = "确认删除";
-  setTimeout(function () {
-    if (!btn.isConnected) { return; }
-    btn.dataset.armed = "";
-    btn.classList.remove("armed");
-    btn.textContent = "删除";
+/* 两步删除：第一次点变“确认删除”，4 秒内再点才真的删。
+   “上膛”状态记在 armedDeleteId（按 id），不挂在 DOM 节点的 dataset 上 ——
+   renderList() 重建节点时节点上的标记会丢，用户就会陷入「反复点删不掉」。 */
+function armDelete(item) {
+  if (deletingId === item.id) { return; }
+  if (armedDeleteId === item.id) {
+    armedDeleteId = 0;
+    clearTimeout(armedDeleteTimer);
+    armedDeleteTimer = 0;
+    doDelete(item);
+    return;
+  }
+  armedDeleteId = item.id;
+  clearTimeout(armedDeleteTimer);
+  armedDeleteTimer = setTimeout(function () {
+    armedDeleteTimer = 0;
+    if (armedDeleteId === item.id) {
+      armedDeleteId = 0;
+      renderList();
+    }
   }, 4000);
+  renderList();
 }
 
-function doDelete(item, btn) {
-  btn.disabled = true;
-  btn.textContent = "删除中…";
+function doDelete(item) {
+  deletingId = item.id;
+  renderList();
   return api("/api/v1/todos/" + item.id, { method: "DELETE" }).then(function () {
     var kept = [];
     for (var i = 0; i < items.length; i++) { if (items[i].id !== item.id) { kept.push(items[i]); } }
     items = kept;
+    deletingId = 0;
     renderList();
     toast("已删除 #" + item.id, "ok");
   }).catch(function (err) {
-    btn.disabled = false;
-    btn.dataset.armed = "";
-    btn.classList.remove("armed");
-    btn.textContent = "删除";
+    deletingId = 0;
+    renderList();
     reportError(err, "删除");
   });
 }
+
+/* ========================================================================
+   8b. 回执（ack）与批量操作
+   ======================================================================== */
+
+/* 设备把变更推给我们之后，必须回一个 ack，否则设备上的「待同步」永远清不掉
+   （规格 B9：todo_mark_synced() 只有 POST /api/v1/sync 才会被调用）。
+   攒 300 ms 再一次性发，避免每来一条推送就打一个请求。 */
+function ackCollect(list) {
+  if (ackUnsupported) { return; }
+  var added = false;
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i];
+    if (!item || !item.id) { continue; }
+    if (item.sync_state !== "pending") { continue; }
+    if (ackIds.indexOf(item.id) >= 0) { continue; }
+    ackIds.push(item.id);
+    added = true;
+  }
+  if (!added) { return; }
+  clearTimeout(ackTimer);
+  ackTimer = setTimeout(ackFlush, 300);
+}
+
+function ackFlush() {
+  clearTimeout(ackTimer);
+  ackTimer = 0;
+  if (!ackIds.length || ackUnsupported) { return; }
+  var ids = ackIds.slice();
+  ackIds = [];
+  api("/api/v1/todos/ack", {
+    method: "POST",
+    body: JSON.stringify({ ids: ids })
+  }).catch(function (err) {
+    /* 旧固件没有这条路由（501 / 404）：安静跳过，只提醒一次，
+       不然每次推送都会弹一次错误横幅。 */
+    if (err.kind === "notimpl" || err.status === 404) {
+      ackUnsupported = true;
+      toast("设备固件还没有回执接口，设备上的「待同步」要手动清除", "warn");
+      return;
+    }
+    if (err.kind === "offline" || err.kind === "timeout") { goOffline(err.message); return; }
+    reportError(err, "回执");
+  });
+}
+
+/* 批量操作：设备端没有批量路由，所以逐条调单条接口。
+   必须串行 —— 设备只有一个 httpd 任务，同时打过去几十个请求会把它打爆，
+   反而一条都做不成（规格 F8-1）。 */
+function bulkRender() {
+  var box = $("bulk");
+  if (!box) { return; }
+  /* 做完也要留着结果（成功多少、失败哪几条），不能一做完就藏起来。 */
+  if (!bulk.shown) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.className = "bulk " + (bulk.failures.length ? "err" : (bulk.running ? "" : "ok"));
+  var okCount = bulk.total - bulk.failures.length;
+  var title = bulk.running
+    ? ("批量处理中：已处理 " + bulk.done + " / " + bulk.total)
+    : ("批量处理完成：成功 " + okCount + " / " + bulk.total +
+       (bulk.failures.length ? ("，失败 " + bulk.failures.length + " 条") : ""));
+  setText($("bulk-title"), title);
+
+  var list = $("bulk-list");
+  list.textContent = "";
+  var shown = Math.min(bulk.failures.length, BULK_FAIL_SHOWN);
+  for (var i = 0; i < shown; i++) {
+    var f = bulk.failures[i];
+    list.append(el("li", null, "#" + f.id + " " + (f.title || "(无标题)") + " —— " + f.msg));
+  }
+  if (bulk.failures.length > shown) {
+    list.append(el("li", null, "另有 " + (bulk.failures.length - shown) + " 条失败未列出"));
+  }
+}
+
+function startBulk(kind) {
+  var targets = [];
+  for (var i = 0; i < items.length; i++) {
+    var want = (kind === "done") ? !items[i].done : !!items[i].done;
+    if (want) { targets.push(items[i]); }
+  }
+  if (!targets.length) {
+    toast(kind === "done" ? "没有未完成的待办" : "没有已完成的待办", "warn");
+    return;
+  }
+
+  bulk = { running: true, done: 0, total: targets.length, failures: [], kind: kind, shown: true };
+  bulkRender();
+  var busy = [$("bulk-done"), $("bulk-clear")];
+  for (var b = 0; b < busy.length; b++) { busy[b].disabled = true; }
+
+  /* 串行链：每处理完一条才发下一条，进度实时更新。 */
+  var chain = Promise.resolve();
+  targets.forEach(function (item) {
+    chain = chain.then(function () {
+      if (kind === "done") {
+        return api("/api/v1/todos/" + item.id + "/done", {
+          method: "PATCH",
+          body: JSON.stringify({ done: true })
+        }).then(function (updated) {
+          upsertInto(updated);          /* 批量过程中不重绘，最后统一画一次 */
+        }).catch(function (err) {
+          bulk.failures.push({ id: item.id, title: item.title, msg: err.message });
+        });
+      }
+      return api("/api/v1/todos/" + item.id, { method: "DELETE" }).then(function () {
+        var kept = [];
+        for (var i = 0; i < items.length; i++) { if (items[i].id !== item.id) { kept.push(items[i]); } }
+        items = kept;
+      }).catch(function (err) {
+        bulk.failures.push({ id: item.id, title: item.title, msg: err.message });
+      });
+    }).then(function () {
+      bulk.done += 1;
+      bulkRender();
+    });
+  });
+
+  return chain.then(function () {
+    bulk.running = false;
+    for (var b = 0; b < busy.length; b++) { busy[b].disabled = false; }
+    bulkRender();
+    if (bulk.failures.length) {
+      toast("批量处理完成，" + bulk.failures.length + " 条失败（见上方清单）", "err");
+    } else {
+      toast("批量处理完成：" + bulk.total + " 条", "ok");
+    }
+    return loadAll();
+  });
+}
+
+/* 批量操作前的二次确认：第一次点只「上膛」，4 秒内再点才真的执行。 */
+var armedBulk = "";
+var armedBulkTimer = 0;
+function bulkButtonReset() {
+  var done = $("bulk-done");
+  var clear = $("bulk-clear");
+  done.textContent = "全部标记完成";
+  done.classList.remove("armed");
+  clear.textContent = "清除已完成";
+  clear.classList.remove("armed");
+}
+function armBulk(kind) {
+  var btn = $(kind === "done" ? "bulk-done" : "bulk-clear");
+  var idle = kind === "done" ? "全部标记完成" : "清除已完成";
+  if (armedBulk === kind) {
+    armedBulk = "";
+    clearTimeout(armedBulkTimer);
+    armedBulkTimer = 0;
+    btn.textContent = idle;
+    btn.classList.remove("armed");
+    startBulk(kind);
+    return;
+  }
+  armedBulk = kind;
+  clearTimeout(armedBulkTimer);
+  /* 两个批量按钮互斥：上膛一个就把另一个恢复原样。 */
+  bulkButtonReset();
+  armedBulkTimer = setTimeout(function () {
+    armedBulkTimer = 0;
+    armedBulk = "";
+    bulkButtonReset();
+  }, 4000);
+  btn.textContent = kind === "done" ? "再点一次确认" : "再点一次确认删除";
+  btn.classList.add("armed");
+}
+
+$("bulk-done").addEventListener("click", function () { armBulk("done"); });
+$("bulk-clear").addEventListener("click", function () { armBulk("clear"); });
+
+$("sort").addEventListener("change", function (event) {
+  sortMode = event.target.value || "device";
+  renderList();
+});
+
+/* 导出：设备端有 GET /api/v1/todos/export 就下载，没有就明说「设备尚未实现」。 */
+$("export").addEventListener("click", function (event) {
+  var btn = event.currentTarget;
+  btn.disabled = true;
+  api("/api/v1/todos/export", { timeoutMs: 20000 }).then(function (data) {
+    var text = (typeof data === "string") ? data : JSON.stringify(data, null, 2);
+    var blob = new Blob([text], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = "todos.json";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+    toast("已导出 todos.json", "ok");
+  }).catch(function (err) {
+    reportError(err, "导出");
+  }).then(function () {
+    btn.disabled = false;
+  });
+});
+
+/* 导入：把备份文件整份推回设备。
+   导入是「整体替换」，设备上现有的清单会被覆盖掉——所以沿用本页删除的「上膛」手法：
+   第一次点击只上膛并改文案，第二次点击才真的导入。 */
+var importArmed = false;
+var importArmedTimer = 0;
+
+function disarmImport() {
+  importArmed = false;
+  clearTimeout(importArmedTimer);
+  importArmedTimer = 0;
+  var btn = $("import");
+  if (btn) { btn.textContent = "导入"; }
+}
+
+$("import").addEventListener("click", function () {
+  if (!importArmed) {
+    importArmed = true;
+    var btn = $("import");
+    btn.textContent = "再点一次确认导入";
+    importArmedTimer = setTimeout(disarmImport, 4000);
+    return;
+  }
+  disarmImport();
+  $("import-file").click();
+});
+
+$("import-file").addEventListener("change", function (event) {
+  var file = event.target.files && event.target.files[0];
+  event.target.value = "";           /* 允许连续选同一个文件 */
+  if (!file) { return; }
+
+  var reader = new FileReader();
+  reader.onload = function () {
+    var text = String(reader.result || "");
+    var payload;
+    try {
+      payload = JSON.parse(text);
+    } catch (e) {
+      toast("这个文件不是合法的 JSON", "err");
+      return;
+    }
+    if (!payload || !payload.items || !Array.isArray(payload.items)) {
+      toast("这个文件里没有 items 数组，不是待办清单", "err");
+      return;
+    }
+    var count = payload.items.length;
+    var btn = $("import");
+    btn.disabled = true;
+    api("/api/v1/todos/import", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      timeoutMs: 30000
+    }).then(function (data) {
+      var imported = (data && data.imported != null) ? data.imported : count;
+      toast("已导入 " + imported + " 条待办", "ok");
+      return loadAll();
+    }).catch(function (err) {
+      reportError(err, "导入");
+    }).then(function () {
+      btn.disabled = false;
+    });
+  };
+  reader.onerror = function () { toast("读取文件失败", "err"); };
+  reader.readAsText(file);
+});
 
 $("add-form").addEventListener("submit", function (event) {
   event.preventDefault();
@@ -1370,7 +1846,7 @@ $("mm-save").addEventListener("click", function () {
   if (value) { body.token = value; }
 
   mmSetBusy("mm-save", true, "校验中…（5–15 秒）", "保存并校验");
-  api("/api/v1/maimemo/config", {
+  apiSlow("/api/v1/maimemo/config", {
     method: "POST",
     body: JSON.stringify(body),
     timeoutMs: mmWaitMs          /* 校验会真的访问墨墨，10s 默认超时不够 */
@@ -1517,7 +1993,7 @@ $("mm-today").addEventListener("click", function () {
     return;
   }
   mmSetBusy("mm-today", true, "拉取中…", "拉取今日词表");
-  api("/api/v1/maimemo/today", { timeoutMs: mmWaitMs }).then(function (data) {
+  apiSlow("/api/v1/maimemo/today", { timeoutMs: mmWaitMs }).then(function (data) {
     mmRenderToday(data || {});
     toast("已拉取 " + (((data && data.count) || 0)) + " 个词", "ok");
   }).catch(function (err) {
@@ -1625,7 +2101,7 @@ $("mm-probe").addEventListener("click", function () {
   }
   /* 逐条试六个端点，最坏情况是六次串行 HTTPS，所以给足超时。 */
   mmSetBusy("mm-probe", true, "探测中…（最多 30 秒）", "探测令牌能力");
-  api("/api/v1/maimemo/probe", { method: "POST", timeoutMs: 60000 })
+  apiSlow("/api/v1/maimemo/probe", { method: "POST", timeoutMs: 60000 })
     .then(function (data) {
       mmRenderProbe(data || {});
       toast("探测完成：可用 " + (((data && data.usable) || 0)) + " 个端点", "ok");
@@ -1645,10 +2121,20 @@ function mmResultLabel(result) {
   return result || "?";
 }
 
-function mmRenderHistory(data) {
+function mmRenderHistory(data, err) {
   var list = $("mm-hist-list");
   if (!list) { return; }
   list.textContent = "";
+
+  /* 读不到和「真的没有记录」是两回事，必须分开说：
+     一律显示成「还没有记录」会让人以为设备上从没背过单词。 */
+  if (err) {
+    var reason = (err.kind === "offline" || err.kind === "timeout")
+      ? ("设备不可达，暂时读不到学习记录（不是「没有记录」）：" + err.message)
+      : ("读取设备端学习记录失败：" + err.message);
+    setText($("mm-hist-note"), reason);
+    return;
+  }
 
   var items = (data && data.items) || [];
   /* 设备按追加顺序返回（旧→新），倒过来显示更符合"最近发生了什么"。 */
@@ -1685,10 +2171,10 @@ function mmRenderHistory(data) {
 
 function loadWordHistory() {
   return api("/api/v1/words/history?limit=100", { timeoutMs: 8000 })
-    .then(function (data) { mmRenderHistory(data || {}); return data; })
+    .then(function (data) { mmRenderHistory(data || {}, null); return data; })
     .catch(function (err) {
-      /* 没插卡 / 还没背过时返回的是"没有数据"，不该弹错误横幅。 */
-      mmRenderHistory({ items: [], count: 0 });
+      /* 读失败要如实说「读不到」，不能谎报「没有记录」（规格 F8-10）。 */
+      mmRenderHistory(null, err);
       return null;
     });
 }
@@ -1733,12 +2219,15 @@ $("mm-hist-clear").addEventListener("click", function () {
    13. SSE：实时推送（EventSource 或带 token 的 fetch 流）+ 轮询兜底
    ======================================================================== */
 
-var sse = { live: false, fails: 0, backoff: 3000, timer: 0, source: null, controller: null, poll: 0 };
+var sse = { live: false, fails: 0, backoff: 3000, timer: 0, source: null, controller: null, poll: 0, mode: "" };
 var refreshTimer = 0;
 var deviceTimer = 0;
 
 function sseLive() { return sse.live; }
 function ssePill(state, text) { setPill("pill-sse", state, "推送：" + text); }
+/* 收到任何一个字节都算「连接还活着」：设备的 keepalive 是 ": keepalive" 注释，
+   在 fetch 流里是能读到的。 */
+function sseTouch() { lastFrameAt = Date.now(); }
 
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
@@ -1755,6 +2244,7 @@ function sseStop() {
   if (sse.source) { try { sse.source.close(); } catch (e) {} sse.source = null; }
   if (sse.controller) { try { sse.controller.abort(); } catch (e) {} sse.controller = null; }
   sse.live = false;
+  sse.mode = "";
 }
 
 function ssePollStart() {
@@ -1768,7 +2258,12 @@ function ssePollStop() {
 
 /* 推送断开：降级到轮询，并按退避重连（设备端 SSE 上限 3 个客户端）。 */
 function sseDown(reason) {
+  /* 半开连接必须真的掐掉，否则那条 fetch 流会一直挂着，白占设备的一个 socket，
+     而且它后面读到的数据还会被当成「实时推送」。 */
+  if (sse.controller) { try { sse.controller.abort(); } catch (e) {} sse.controller = null; }
+  if (sse.source) { try { sse.source.close(); } catch (e) {} sse.source = null; }
   sse.live = false;
+  lastFrameAt = 0;
   sse.fails += 1;
   var wait = sse.backoff;
   sse.backoff = Math.min(sse.backoff * 2, MAX_BACKOFF);
@@ -1784,6 +2279,7 @@ function sseUp() {
   sse.live = true;
   sse.fails = 0;
   sse.backoff = 3000;
+  sseTouch();
   clearTimeout(sse.timer);
   sse.timer = 0;
   ssePollStop();
@@ -1793,12 +2289,21 @@ function sseUp() {
   if (wasDown) { toast("实时推送已恢复", "ok"); }
 }
 
+/* 看门狗：连接半开时设备既不报错也不发数据，页面会一直以为「推送中」，
+   轮询兜底也被关掉，列表就无限期停在旧数据上。
+   超过 SSE_STALE_MS 没收到任何字节就判定断开 → 重连 + 恢复轮询。 */
+function sseWatchdog() {
+  if (!sse.live || sse.mode !== "fetch" || !lastFrameAt) { return; }
+  if (Date.now() - lastFrameAt <= SSE_STALE_MS) { return; }
+  sseDown("超过 " + Math.round(SSE_STALE_MS / 1000) + " 秒没收到任何数据，推送连接多半已经断了");
+}
+
 function sseStart() {
   sseStop();
   ssePill("warn", "连接中…");
-  /* EventSource 不能自定义请求头，所以一旦填了 token（设备可能开了鉴权）就走 fetch 流。
-     这里判断全局绑定而不是 window.xxx，两者都可能缺失时的行为才一致。 */
-  if (!token && typeof EventSource === "function") { sseViaEventSource(); return; }
+  /* 优先用 fetch 流：它能带 X-Auth-Token，而且设备的 ": keepalive" 注释能被读到，
+     拿得到「多久没收到数据」的证据，半开连接才发现得了。
+     EventSource 既不能带请求头，也看不到注释，只能当退路。 */
   if (typeof TextDecoder === "function" && typeof fetch === "function" &&
       typeof ReadableStream === "function") { sseViaFetch(); return; }
   if (typeof EventSource === "function") { sseViaEventSource(); return; }
@@ -1809,6 +2314,7 @@ function sseViaEventSource() {
   var source;
   try { source = new EventSource("/api/v1/events"); }
   catch (e) { sseDown("无法建立推送连接"); return; }
+  sse.mode = "es";
   sse.source = source;
   source.onopen = function () { if (sse.source === source) { sseUp(); } };
   source.onerror = function () {
@@ -1818,13 +2324,14 @@ function sseViaEventSource() {
   };
   for (var i = 0; i < PUSH_ALL.length; i++) {
     (function (name) {
-      source.addEventListener(name, function () { sseHandle(name); });
+      source.addEventListener(name, function () { sseTouch(); sseHandle(name); });
     })(PUSH_ALL[i]);
   }
 }
 
 function sseViaFetch() {
   var controller = (typeof AbortController === "function") ? new AbortController() : null;
+  sse.mode = "fetch";
   sse.controller = controller;
   var headers = { "Accept": "text/event-stream" };
   if (token) { headers["X-Auth-Token"] = token; }
@@ -1867,6 +2374,8 @@ function sseViaFetch() {
       return reader.read().then(function (chunk) {
         if (sse.controller !== controller) { return null; }
         if (chunk.done) { return null; }
+        /* 任何字节都算「连接还活着」：keepalive 注释也算。 */
+        sseTouch();
         buffer += decoder.decode(chunk.value, { stream: true });
         var index;
         while ((index = buffer.indexOf("\n\n")) >= 0) {
@@ -1925,6 +2434,10 @@ setInterval(function () {
   if (document.hidden) { return; }
   loadDevice();
 }, 30000);
+
+/* 推送看门狗：半开连接（既不报错也不发数据）只能靠它发现，
+   否则页面会一直以为「推送中」，轮询兜底也被关着。 */
+setInterval(sseWatchdog, SSE_WATCHDOG_MS);
 
 /* 相对时间会“变旧”，每分钟重画一次（编辑弹层打开时不动列表）。 */
 setInterval(function () {

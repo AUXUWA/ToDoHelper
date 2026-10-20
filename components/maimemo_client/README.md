@@ -114,6 +114,38 @@
   GET 还是 POST"在墨墨这里**不是风格问题，而是语义问题**。
 - 拼写解析用的是 `GET /vocabulary?spelling=`（`mm_resolve_voc_id()`），也是 GET。
 
+#### 缓存命中条件（v1.5.0 修）
+
+命中条件以前是
+
+```
+have_text && (meaning_unavailable || meaning != "" || unavailable)
+```
+
+也就是"**有助记/例句、但释义为空、且释义没被标记为无权**"这一类**永远不命中**——
+而这恰恰是**学习作用域令牌**最常见的形状（助记读得到、释义读不到）。
+后果是每翻到这类卡都要重跑 4 次 HTTPS 往返，并**整文件重写 `enrich.json`**。
+
+现在的规则：
+
+| 情况 | 结果 |
+|---|---|
+| 缓存里有任何一项内容，且释义上次不是**传输失败** | **命中**（`from_cache = true`） |
+| 上一次请求"有结论"（API 回答了：给了数据 / 说没有 / 说无权 / 回答了错误） | **命中**（哪怕三项都空） |
+| 上一次 `/interpretations` 是**传输层失败**（超时、断连） | 不命中，下次重试 |
+| 助记与释义**都被拒** | `ESP_ERR_NOT_SUPPORTED`（不变） |
+
+为此缓存条目多了两个字段（写进 `words/enrich.json`，只加不改）：
+
+- `fetched`：上一次请求是否有结论（三个端点都回答了）；
+- `meaning_retryable`：上一次 `/interpretations` 是否死在传输层（值得重试）。
+
+**传输失败不许覆盖缓存**：某个字段的请求失败时，缓存里的旧值既不会被清空，
+也会继续返回给调用方 —— 一次网络抖动不该把已经拿到的助记/释义弄丢。
+
+**旧缓存文件没有这两个字段**：`fetched` 视为 false，于是这类词会被**再取一次**
+然后按新格式重写（自愈）；已有内容的条目不受影响。
+
 ### 方案 C：反向推送
 
 - `maimemo_push_unknown()`（需要知道结果时用）与 `maimemo_push_words()`（HTTP 用，
@@ -237,6 +269,17 @@ LVGL 的回调（控件事件、`lv_timer`）在**适配器锁内**运行（`AGE
   这正是 v1.3.3 修掉的那个"冻结整个 Web 服务器"的形状。
 - `page_word.c` 的做法：`lv_async_call` 起一次性任务抓助记，结果在 LVGL 任务里应用；
   v1.4.0 起只有"卡片确实缺内容"时才起这个任务。
+- **异步 worker 必须自己释放 job**（v1.5.0 修）：`mm_run_async()` 把 job 交给 worker 后
+  就不再管它，handler 返回后堆上的拼写副本只能由 worker 释放。
+  `push_worker` 一直这么做，`advance_worker` 以前**忘了**，于是每成功调用一次
+  `/api/v1/maimemo/advance` 就泄漏一份 job 和它里面的 `strdup` 拼写。
+
+## 解析外部输入一律用 `sys_json_parse(json, 32)`（v1.5.0）
+
+墨墨的响应、缓存文件 `words/enrich.json` 和三个 HTTP 请求体都是**外部输入**，
+现在统一用 `sys_json_parse()` 而不是裸 `cJSON_Parse()`：cJSON 1.7.19 的嵌套上限是 1000、
+每层约 96 字节栈帧，一个畸形响应就能打爆 worker 的栈（`AGENT.md §9.0.5` 那一类
+"开机就崩"的故障）。解析失败一律记 WARN 并走降级路径（把这次查询当成"没有数据"）。
 
 ## 事件（基址 `MAIMEMO_EVENT`）
 

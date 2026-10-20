@@ -22,6 +22,8 @@ static const char *TAG = "ui_core";
 #define UI_MAX_BINDINGS       40
 #define UI_MAX_EVENT_BASES    8
 #define UI_EVENT_PAYLOAD_MAX  256
+/** Repaint triggers remembered per page while the page is not on display. */
+#define UI_DEFERRED_MAX       4
 
 /* ------------------------------------------------------------------------- */
 /* State                                                                     */
@@ -31,6 +33,16 @@ typedef struct {
     const ui_page_t *desc;
     lv_obj_t *container;
     lv_timer_t *tick;
+    /**
+     * Repaint triggers that arrived while the page was not on display.
+     *
+     * Only the event id is kept: everything that can be deferred is a "please
+     * repaint" event *without* a payload (see ui_event_drain_cb), so there is
+     * nothing else worth carrying - and keeping the payload would mean holding
+     * heap memory for a page that may not be shown for hours.
+     */
+    int32_t deferred_ids[UI_DEFERRED_MAX];
+    uint8_t deferred_count;
 } ui_slot_t;
 
 typedef struct {
@@ -107,6 +119,52 @@ static lv_timer_t *s_event_timer;
 /** Set by the publisher to ask the drainer for an immediate pass. */
 static volatile bool s_event_pending;   /* written under s_event_lock */
 
+/**
+ * Remember a repaint request for a page that is not on display.
+ *
+ * The newest request wins: a repaint always renders the *current* state, so
+ * an older one is covered by it. The list is bounded, because a page that is
+ * never shown again must not accumulate requests.
+ */
+static void page_defer_repaint(ui_slot_t *slot, int32_t event_id)
+{
+    if (slot->deferred_count < UI_DEFERRED_MAX) {
+        slot->deferred_ids[slot->deferred_count++] = event_id;
+        return;
+    }
+
+    for (uint8_t i = 1; i < UI_DEFERRED_MAX; i++) {
+        slot->deferred_ids[i - 1] = slot->deferred_ids[i];
+    }
+    slot->deferred_ids[UI_DEFERRED_MAX - 1] = event_id;
+}
+
+/**
+ * Replay the repaint requests that arrived while the page was hidden.
+ *
+ * Called right after the page became visible. Most pages already refresh
+ * themselves in on_show(), but not all of them do the *whole* job there (the
+ * WiFi page, for instance, refreshes the status card but leaves the scan list
+ * to its event handler), so the requests are replayed instead of being
+ * dropped.
+ */
+static void page_replay_deferred(ui_slot_t *slot)
+{
+    if (slot->deferred_count == 0) {
+        return;
+    }
+
+    const ui_page_t *desc = slot->desc;
+    if (desc != NULL && desc->on_event != NULL) {
+        for (uint8_t i = 0; i < slot->deferred_count; i++) {
+            /* Deferred requests never carry a payload, so NULL is what the
+             * handler would have received anyway. */
+            (void)desc->on_event(slot->deferred_ids[i], NULL);
+        }
+    }
+    slot->deferred_count = 0;
+}
+
 /** Runs in the LVGL task. Dispatches every queued event. */
 static void ui_event_drain_cb(lv_timer_t *timer)
 {
@@ -157,9 +215,29 @@ static void ui_event_drain_cb(lv_timer_t *timer)
         if (ev->handler != NULL) {
             ev->handler(ev->event_id, ev->payload);
         } else if (ev->page < UI_PAGE_MAX) {
-            const ui_slot_t *slot = &s_slots[ev->page];
+            ui_slot_t *slot = &s_slots[ev->page];
             if (slot->desc != NULL && slot->desc->on_event != NULL) {
-                slot->desc->on_event(ev->event_id, ev->payload);
+                if (ev->page == s_current || ev->data_size > 0) {
+                    slot->desc->on_event(ev->event_id, ev->payload);
+                } else {
+                    /*
+                     * The page is not on display, so repainting it would be
+                     * work nobody can see: the todo list, for example, copies
+                     * the whole list and rebuilds every row on each change,
+                     * and the web console changes one row at a time.
+                     *
+                     * A repaint request (no payload) is therefore only
+                     * *remembered* and replayed when the page comes back -
+                     * see page_replay_deferred().
+                     *
+                     * An event that carries data is a different animal: it
+                     * delivers content the page has to keep (the AI reply
+                     * chunks, the AI state), and dropping it would lose data
+                     * rather than save work. Those are handed over even to a
+                     * hidden page.
+                     */
+                    page_defer_repaint(slot, ev->event_id);
+                }
             }
         }
         free(ev);
@@ -520,6 +598,13 @@ static esp_err_t page_switch_locked(ui_page_id_t id)
     if (slot->desc->on_show != NULL) {
         slot->desc->on_show();
     }
+
+    /*
+     * Repaint requests that arrived while this page was off screen are
+     * replayed now, so the page comes back showing the current state instead
+     * of the state it had when it was left.
+     */
+    page_replay_deferred(slot);
 
     SYS_LOGD(TAG, "page -> %s", slot->desc->name);
     return ESP_OK;

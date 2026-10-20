@@ -311,6 +311,90 @@ lv_obj_t *ui_dialog(const char *title, const char *text,
 }
 
 /**
+ * Confirmation dialog: a muted "cancel" button and a red "confirm" button.
+ *
+ * ## Why the confirm button carries the callback alone
+ *
+ * The obvious implementation - register the close handler and the caller's
+ * callback on the same button, in that order - silently drops the caller's
+ * callback. lv_msgbox_close() is a synchronous lv_obj_delete(); LVGL then
+ * marks the running event as "target deleted" (lv_event.c:
+ * lv_event_mark_deleted()), and lv_event_send() stops walking the callback
+ * list of that click (the `!e->deleted` condition in lv_event.c). The first
+ * callback therefore eats the click.
+ *
+ * So: the cancel button closes and does nothing else, the confirm button runs
+ * the caller's callback (which gets the message box as its event user data and
+ * closes the box itself *after* doing its work).
+ */
+lv_obj_t *ui_dialog_confirm(const char *title, const char *text,
+                             const char *ok_text, const char *cancel_text,
+                             lv_event_cb_t on_ok, void *user_data)
+{
+    if (!ui_lock(-1)) {
+        return NULL;
+    }
+
+    lv_obj_t *mbox = lv_msgbox_create(lv_layer_top());
+    if (mbox == NULL) {
+        ui_unlock();
+        return NULL;
+    }
+
+    /* Same clamping as ui_dialog(): the box must never grow past the panel. */
+    lv_obj_set_style_max_height(mbox, LV_PCT(UI_DIALOG_MAX_H_PCT), 0);
+    lv_obj_set_style_max_width(mbox, LV_PCT(UI_DIALOG_MAX_W_PCT), 0);
+    lv_obj_set_width(mbox, LV_PCT(UI_DIALOG_MAX_W_PCT));
+    dialog_style(mbox);
+
+    if (title != NULL && title[0] != '\0') {
+        lv_msgbox_add_title(mbox, title);
+        dialog_style(mbox);   /* the header was created after the first pass */
+    }
+    if (text != NULL && text[0] != '\0') {
+        lv_obj_t *body = lv_msgbox_add_text(mbox, text);
+        if (body != NULL) {
+            lv_obj_set_width(body, LV_PCT(100));
+            lv_label_set_long_mode(body, LV_LABEL_LONG_MODE_WRAP);
+            lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_style_text_color(body, UI_COLOR_TEXT, 0);
+        }
+    }
+
+    /* The caller's payload rides on the box: the confirm callback receives the
+     * box as its event user data and picks the payload up from here. */
+    lv_obj_set_user_data(mbox, user_data);
+
+    /* Cancel first, confirm second: the footer is a row, so this puts the
+     * escape on the left and the dangerous action on the right. */
+    lv_obj_t *cancel = lv_msgbox_add_footer_button(mbox, cancel_text ? cancel_text : "取消");
+    if (cancel != NULL) {
+        dialog_style_button(cancel, UI_COLOR_SURFACE_ALT);
+        /* The muted surface needs light text, not the on-primary dark one. */
+        lv_obj_set_style_text_color(cancel, UI_COLOR_TEXT, 0);
+        lv_obj_add_event_cb(cancel, dialog_close_cb, LV_EVENT_CLICKED, mbox);
+    }
+
+    lv_obj_t *ok = lv_msgbox_add_footer_button(mbox, ok_text ? ok_text : "确定");
+    if (ok != NULL) {
+        dialog_style_button(ok, UI_COLOR_DANGER);
+        if (on_ok != NULL) {
+            /* No close handler here: the callback closes the box itself, after
+             * it has done its work (see the note above). */
+            lv_obj_add_event_cb(ok, on_ok, LV_EVENT_CLICKED, mbox);
+        } else {
+            lv_obj_add_event_cb(ok, dialog_close_cb, LV_EVENT_CLICKED, mbox);
+        }
+    }
+
+    /* A second, always-visible way out (see dialog_add_close_button). */
+    dialog_add_close_button(mbox);
+
+    ui_unlock();
+    return mbox;
+}
+
+/**
  * Dialog whose body is a long, copyable secret (the HTTP auth token).
  *
  * The token is set in the small monospace-ish font and given its own scrollable

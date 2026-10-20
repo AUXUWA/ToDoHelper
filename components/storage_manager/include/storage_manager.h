@@ -12,6 +12,10 @@
  *   1. SD card over SDMMC 4-bit  -> root "/sdcard"
  *   2. internal LittleFS 1.x     -> root "/littlefs"
  *
+ * The internal LittleFS partition is mounted in *both* cases: besides being the
+ * fallback root it is the "pinned" backend that keeps the todo list on a fixed
+ * medium (see storage_write_cache_pinned()).
+ *
  * Upper layers must never hardcode "/sdcard": they build paths with
  * storage_path()/storage_abspath() and live with either backend
  * (docs/TODOHELPER_REQUIREMENTS.md 9.2, 12).
@@ -88,6 +92,20 @@ bool storage_available(void);
 const char *storage_app_dir(void);
 
 /**
+ * @brief Absolute path of the "pinned" application directory, i.e. the one that
+ *        does not follow the storage root, e.g. "/littlefs/todohelper".
+ *
+ * Falls back to storage_app_dir() when the internal partition could not be
+ * mounted (the pinned guarantee is then degraded, not lost).
+ */
+const char *storage_pinned_app_dir(void);
+
+/**
+ * @brief True when the pinned backend (internal LittleFS) is really mounted.
+ */
+bool storage_pinned_available(void);
+
+/**
  * @brief Build "<app_dir>/<rel>" into @p buf.
  *
  * @param rel Relative path such as "cache/todos.json". NULL or "" yields the
@@ -110,7 +128,14 @@ esp_err_t storage_mkdir_p(const char *rel);
 esp_err_t storage_read_file(const char *rel, void *buf, size_t *len);
 
 /**
- * @brief Write a whole file atomically (tmp file + rename).
+ * @brief Write a whole file with the double-slot protocol.
+ *
+ * The new content goes to "<rel>.new", the previous file is rotated to
+ * "<rel>.bak" and only then "<rel>.new" is promoted to "<rel>". A power loss
+ * in between leaves both slots on disk; storage_manager_init() recovers them
+ * on the next boot. "<rel>.bak" always holds the previous generation, so a
+ * caller that finds "<rel>" unparsable can roll back with
+ * storage_promote_backup().
  */
 esp_err_t storage_write_file(const char *rel, const void *buf, size_t len);
 
@@ -126,6 +151,19 @@ esp_err_t storage_append_file(const char *rel, const void *buf, size_t len);
 esp_err_t storage_read_text(const char *rel, char **out, size_t *len);
 
 esp_err_t storage_delete_file(const char *rel);
+
+/**
+ * @brief True when a previous generation of "<rel>" is kept as "<rel>.bak".
+ */
+bool storage_backup_exists(const char *rel);
+
+/**
+ * @brief Roll "<rel>" back to "<rel>.bak".
+ *
+ * The unparsable file is kept as "<rel>.corrupt" for inspection. The storage
+ * layer does not decide whether a file is broken - that is the caller's call.
+ */
+esp_err_t storage_promote_backup(const char *rel);
 
 /**
  * @brief Check existence and optionally report the size.
@@ -151,8 +189,32 @@ esp_err_t storage_read_cache(const char *name, char **out, size_t *len);
 
 /**
  * @brief Convenience: write a cache file, logging but not failing the caller.
+ *
+ * The file lives under "<storage root>/todohelper/cache/". Words, fonts and
+ * other bulk data stay on the SD card.
  */
 esp_err_t storage_write_cache(const char *name, const void *buf, size_t len);
+
+/**
+ * @brief Write a cache file pinned to the internal LittleFS partition.
+ *
+ * "Pinned" means the path does not follow the storage root: it is always
+ * "<internal>/todohelper/cache/<name>", so inserting or removing the SD card
+ * cannot make the todo list appear to vanish. Falls back to the storage root
+ * when the internal partition could not be mounted.
+ */
+esp_err_t storage_write_cache_pinned(const char *name, const void *buf, size_t len);
+
+/**
+ * @brief Read a cache file pinned to the internal LittleFS partition.
+ *
+ * When the pinned file does not exist yet (first boot after an upgrade) the
+ * copy on the storage root is served instead, so the list does not come up
+ * empty; writes always go to the pinned location.
+ *
+ * @param out Receives a NUL terminated heap buffer the caller must free().
+ */
+esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len);
 
 #ifdef __cplusplus
 }

@@ -4,8 +4,11 @@ menu "ToDoHelper: todo manager"
         string "Cache file name under <app_dir>/cache"
         default "todos.json"
         help
-            Written atomically on every change so the list survives power loss
-            and can be shown while offline (requirements FR2 and 9.2).
+            Written with the storage layer's two-slot protocol (X.new ->
+            X.bak -> X), so a power loss can never take both the old and the
+            new copy with it; the leftovers are reconciled at boot. The file
+            lives in the *internal* LittleFS, not on the SD card, so swapping
+            the card cannot make the list disappear (v1.5.0).
 
     config TODOHELPER_TODO_BACKUP_KEEP
         int "Number of daily backup files to keep in backup/"
@@ -14,5 +17,13 @@ menu "ToDoHelper: todo manager"
         help
             0 disables backups. Backups never contain WiFi passwords, API keys
             or the auth token (requirement 8.8).
+
+            NOTE (v1.5.0): this knob still drives no code - the dated
+            backup/todos_YYYYMMDD.json series is NOT implemented yet. What
+            protects the list today is the storage layer's generic X.bak slot
+            (one generation back) plus the export/import HTTP routes, which
+            hand the whole list to the user's computer. Implementing the dated
+            series is on the v1.6.0 list; until then, do not advertise this
+            option as a working feature.
 
 endmenu

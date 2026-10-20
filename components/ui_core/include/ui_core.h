@@ -209,6 +209,45 @@ lv_obj_t *ui_dialog(const char *title, const char *text,
                     const char *ok_text, lv_event_cb_t on_close, void *user_data);
 
 /**
+ * @brief Confirmation dialog for a destructive action: a cancel button and a
+ *        confirm button.
+ *
+ * ## Why this is not ui_dialog()
+ *
+ * ui_dialog() registers the close handler **before** the caller's callback on
+ * the *same* footer button. lv_msgbox_close() is a synchronous lv_obj_delete(),
+ * and LVGL marks the event as "the target was deleted"
+ * (lv_event.c: lv_event_mark_deleted()), which aborts the remaining callbacks
+ * of that very click - so the caller's on_close never runs. That is why
+ * ui_dialog()'s on_close must be treated as unreliable.
+ *
+ * Here the two actions live on two different buttons, and the confirm callback
+ * receives the message box itself, so it can do its business first and close
+ * the box afterwards. Never "close, then work" in the same click: the box
+ * deletion marks the event deleted and the work would be skipped as well.
+ *
+ * The confirm button is drawn in UI_COLOR_DANGER and the cancel button in the
+ * muted surface colour - this helper exists for destructive confirmations
+ * ("delete this todo?"), not for neutral questions.
+ *
+ * @param title        Title line.
+ * @param text         Body text; the box is clamped to the screen and the text
+ *                     scrolls, so a long body stays readable.
+ * @param ok_text      Label of the confirm button.
+ * @param cancel_text  Label of the cancel button.
+ * @param on_ok        Confirm callback; may be NULL, in which case the confirm
+ *                     button only closes the box.
+ * @param user_data    Caller payload. It is stored **on the message box**, so
+ *                     the callback can fetch it with lv_obj_get_user_data(mbox);
+ *                     the callback's own event user data is the message box.
+ *
+ * @return The msgbox, or NULL when the UI lock could not be taken.
+ */
+lv_obj_t *ui_dialog_confirm(const char *title, const char *text,
+                            const char *ok_text, const char *cancel_text,
+                            lv_event_cb_t on_ok, void *user_data);
+
+/**
  * @brief Message box that displays a long copyable secret (e.g. the auth token).
  *
  * Splits the content into @p lead_in, a highlighted @p secret, and a muted

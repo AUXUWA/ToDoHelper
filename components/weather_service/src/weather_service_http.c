@@ -94,7 +94,7 @@ static esp_err_t weather_get_handler(httpd_req_t *req)
  * inline serializes all HTTP for 20 s (AGENT.md 9.0.1). The socket is detached
  * with httpd_req_async_handler_begin() and a short-lived task owns the reply.
  */
-#define WEATHER_HTTP_TASK_STACK 4096
+#define WEATHER_HTTP_TASK_STACK 6144
 #define WEATHER_HTTP_TASK_PRIO  4
 
 static void weather_refresh_respond_task(void *arg)
@@ -210,26 +210,47 @@ static esp_err_t city_post_handler(httpd_req_t *req)
     return http_reply_ok(req, data_json);
 }
 
-static esp_err_t locate_post_handler(httpd_req_t *req)
+/**
+ * POST /api/v1/weather/locate - 按公网 IP 定位城市。
+ *
+ * 定位要跑一次完整的 HTTPS 请求（超时 12 s）。esp_http_server 只有唯一的
+ * httpd 任务，handler 在里面串行执行 —— 同步做的话，这 12 s 内整台设备的
+ * HTTP 都建不上连接（AGENT.md §9.0.1）。所以照 sync_server 的 SSE 范式：
+ * handler 立刻用 httpd_req_async_handler_begin() 把会话交给一个自有任务，
+ * 任务算完结果再把响应发回去。
+ *
+ * 这是「请求-响应」语义，不是流式：不能边写边关。
+ */
+#define WEATHER_LOCATE_TASK_STACK 8192
+#define WEATHER_LOCATE_TASK_PRIO  4
+
+static void weather_locate_respond_task(void *arg)
 {
-    esp_err_t err = weather_detect_location();
+    httpd_req_t *req = (httpd_req_t *)arg;
+
+    /* 阻塞在这里没关系：这个任务存在的意义就是等这次定位。
+     * 栈按跑得下 mbedTLS 握手给（esp_http_client 没有自己的任务）。 */
+    const esp_err_t err = weather_detect_location();
     switch (err) {
     case ESP_OK:
         break;
     case ESP_ERR_INVALID_STATE:
         /* Genuinely cannot serve it: no network, or the clock is not synced yet so
          * the TLS handshake to the provider would fail certificate validation. */
-        return http_reply_unavailable(req, "offline: IP geolocation needs a network");
+        (void)http_reply_unavailable(req, "offline: IP geolocation needs a network");
+        goto done;
     case ESP_ERR_INVALID_RESPONSE:
         /* 502, not 503. This service is healthy - the geolocation *provider* gave
          * an unusable answer. 503 "service unavailable" was misleading: the caller
          * would conclude ToDoHelper is down when in fact the upstream failed, and
          * the device very likely still has a perfectly good city (there is a
          * built-in default), so nothing the caller depends on has changed. */
-        return http_reply_err(req, 502, "geolocation provider returned an unusable response");
+        (void)http_reply_err(req, 502, "geolocation provider returned an unusable response");
+        goto done;
     default:
         /* Upstream unreachable, timed out, DNS failure, ... same reasoning. */
-        return http_reply_err(req, 502, "geolocation provider unreachable");
+        (void)http_reply_err(req, 502, "geolocation provider unreachable");
+        goto done;
     }
 
     /* Detection only sets the coordinates. Kick the fetch off asynchronously
@@ -242,16 +263,43 @@ static esp_err_t locate_post_handler(httpd_req_t *req)
         char partial[96];
         snprintf(partial, sizeof(partial), "{\"city\":\"%s\",\"valid\":false}",
                  weather_get_city());
-        return http_reply_ok(req, partial);
+        (void)http_reply_ok(req, partial);
+        goto done;
     }
 
     char *json = weather_to_json(&data);
     if (json == NULL) {
-        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "weather");
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "weather");
+        goto done;
     }
-    err = http_reply_ok(req, json);
+    (void)http_reply_ok(req, json);
     cJSON_free(json);
-    return err;
+
+done:
+    /* 漏掉这一句就漏掉 httpd 的会话槽，最终服务器会停止接受连接
+     * （esp_http_server 的头文件专门警告过这一点）。 */
+    (void)httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t locate_post_handler(httpd_req_t *req)
+{
+    httpd_req_t *async_req = NULL;
+    /* 之后 req 不能再用。 */
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        return http_reply_unavailable(req, "async handler unavailable");
+    }
+
+    if (xTaskCreate(weather_locate_respond_task, "th_wx_loc", WEATHER_LOCATE_TASK_STACK,
+                    async_req, WEATHER_LOCATE_TASK_PRIO, NULL) != pdPASS) {
+        (void)httpd_resp_set_status(async_req, "503 Service Unavailable");
+        (void)httpd_resp_send(async_req, "no memory for locate task", HTTPD_RESP_USE_STRLEN);
+        (void)httpd_req_async_handler_complete(async_req);
+        return ESP_OK;
+    }
+
+    /* 立刻返回：定位由自有任务去做，httpd 任务不阻塞。 */
+    return ESP_OK;
 }
 
 static esp_err_t config_post_handler(httpd_req_t *req)

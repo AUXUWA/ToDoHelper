@@ -533,8 +533,46 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
   （**必须** complete：不 complete 会永久占用会话槽，`httpd` 最终完全不再 accept，
   IDF 头文件里明确写了这一点）。参考实现：`components/sync_server/src/sync_server.c`
   的 `events_get_handler()` + `sse_client_task()`（每客户端一个 3 KB 任务、一个队列）。
-  **同类隐患仍在**：`ai_service_http.c` 的 `/api/v1/ai/chat/stream`（以及阻塞版
-  `/api/v1/ai/chat`）在一次 AI 回复期间会把整台设备的 HTTP 全部堵住 —— 修法同上。
+  **同类隐患已在 v1.5.0 修掉**：`ai_service_http.c` 的 `/api/v1/ai/chat/stream` 与阻塞版
+  `/api/v1/ai/chat`（超时上限 45 s）、`weather_service_http.c` 的 `/api/v1/weather/locate`
+  （最长 12 s）都已改成「handler 立刻 `httpd_req_async_handler_begin()` → 自有任务干活 →
+  `httpd_req_async_handler_complete()`」。**注意这是「请求-响应」语义**（不是流式）：
+  任务里算好结果，再用异步句柄把响应发回去，不要用 SSE 那种「边写边关」的做法。
+
+### 9.0.1.3 v1.5.0 补进来的五条实测结论（都踩过，别再踩）
+
+1. **FatFs 的 `f_rename()` 在目标已存在时返回 `FR_EXIST`，不是覆盖。**
+   LittleFS 的 `lfs_rename_()` 才是在同一次 commit 里带 `LFS_TYPE_DELETE` + `LFS_TYPE_CREATE`
+   的原子替换。所以「写 tmp → `remove(目标)` → `rename(tmp, 目标)`」这个常见写法
+   在 SD 卡上是**必要的**（不 remove 就会失败），代价是**掉电窗口**：
+   掉在 remove 与 rename 之间，上一份有效文件和新临时文件**一起消失**。
+   → 工程现在的做法是**双槽**：写 `X.new` → `X` 改名 `X.bak` → `X.new` 改名 `X`，
+   启动时把残留的 `.new`/`.bak` 收敛回来（`storage_recover_tree()`）。
+   **任何新写的「原子替换」都要先确认后端覆盖语义**，别照抄 POSIX 假设。
+2. **cJSON 的 1000 层嵌套上限，在本工程的栈上是致命的。**
+   用 `riscv32-esp-elf-objdump -d build/todohelper.elf` 实测：`<parse_value>` 每层递归
+   栈帧 **96 字节**（`addi sp,sp,-96`）。开机主任务栈 12288 → 约 **128 层**就爆；
+   httpd 任务栈 6144 → 约 **64 层**就爆。而 `todos.json` / 词库这类文件是用户能直接
+   在卡上编辑的，一个畸形文件就能让设备**每次开机都崩**。
+   → 解析外部输入一律走 `sys_json_parse(json, max_depth)`（解析前先扫文本量深度），
+   **不要用 `cJSON_Parse()`**。
+3. **`lv_msgbox_close()` 是同步删除，会中止同一次点击里的后续回调。**
+   `ui_dialog()` 把关闭回调注册在**按钮**上，`dialog_close_cb` 里 `lv_msgbox_close(mbox)`
+   会同步 `lv_obj_delete(mbox)`；LVGL 删除时标记按钮已删除，于是**排在它后面的
+   调用方回调永远不会执行**。所以 `ui_dialog()` 的 `on_close` 不可靠。
+   → 破坏性操作用 `ui_dialog_confirm()`：两个按钮分开，`on_ok` 收到的 `user_data`
+   就是弹窗对象本身，回调里**先做业务再关**。
+4. **`esp_http_client` 没有自己的任务，mbedTLS 握手直接吃调用者的栈。**
+   查 `esp-idf/components/esp_http_client/esp_http_client.c` 里没有 `xTaskCreate` 就能确认。
+   → 凡是跑 HTTPS 的任务（AI、天气、定位、NTP 校时），栈都要给够握手用；
+   本工程的 httpd 任务栈只有 6144，把 AI 塞进去本身就是雷。
+5. **`http_router_require_auth()` 只能在路由注册之后调用。**
+   它是 `find_route(path, method)` 找到路由再改标志位，路由还没注册时返回
+   `ESP_ERR_NOT_FOUND` —— **静默不生效**，没有任何告警。
+   → 需要鉴权的路由由各组件在自己的 `init()` 里注册，而 `sync_server` 早于它们启动，
+   所以标记要打**两次**：服务器启动时一次、`SYS_EVENT_READY`（所有模块初始化完）再一次。
+   顺带记住：**只读路由默认不鉴权**（`http_router.c` 只对写方法强制过 hook），
+   想保护 GET 必须显式 `require_auth()`，否则「开了鉴权」是假的。
 
 ### 9.0.1.1 流畅度五条铁律（v1.2.0 加入，**改 UI 前必读**）
 

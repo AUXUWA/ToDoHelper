@@ -50,3 +50,6 @@ Thumbs.db
 
 # Build helper log (tools/build.sh)
 build_last.log
+
+# Git-Bash 构建时 Windows 重定向产生的空壳文件
+nul

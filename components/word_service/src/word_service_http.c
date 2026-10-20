@@ -9,6 +9,7 @@
  * @brief Requirement 8.4: the /api/v1/words/... endpoints.
  */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -173,9 +174,10 @@ static esp_err_t review_post_handler(httpd_req_t *req)
         return http_reply_bad_request(req, "missing body");
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = sys_json_parse(body, 32);
     free(body);
     if (root == NULL) {
+        SYS_LOGW(TAG, "review body is not valid JSON");
         return http_reply_bad_request(req, "invalid json");
     }
 
@@ -219,9 +221,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return http_reply_bad_request(req, "missing body");
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = sys_json_parse(body, 32);
     free(body);
     if (root == NULL) {
+        SYS_LOGW(TAG, "config body is not valid JSON");
         return http_reply_bad_request(req, "invalid json");
     }
 
@@ -300,6 +303,21 @@ static void word_async_trampoline(void *param)
     vTaskDelete(NULL);
 }
 
+/** Start the worker task for a job that is already fully built. */
+static esp_err_t word_spawn_async(httpd_req_t *req, httpd_req_t *async,
+                                   word_async_job_t *job, uint32_t stack,
+                                   const char *name)
+{
+    /* Stack must be internal RAM and is scarce here (AGENT.md §9.0.1): 4 KB is
+     * enough for a FAT read plus the JSON build, which are heap-backed. */
+    if (xTaskCreate(word_async_trampoline, name, stack, job, 3, NULL) != pdPASS) {
+        free(job);
+        (void)httpd_req_async_handler_complete(async);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "async handler");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t word_run_async(httpd_req_t *req, word_async_work_t work, void *arg,
                                 uint32_t stack, const char *name)
 {
@@ -317,14 +335,51 @@ static esp_err_t word_run_async(httpd_req_t *req, word_async_work_t work, void *
     job->work = work;
     job->arg = arg;
 
-    /* Stack must be internal RAM and is scarce here (AGENT.md §9.0.1): 4 KB is
-     * enough for a FAT read plus the JSON build, which are heap-backed. */
-    if (xTaskCreate(word_async_trampoline, name, stack, job, 3, NULL) != pdPASS) {
-        free(job);
+    return word_spawn_async(req, async, job, stack, name);
+}
+
+/**
+ * Same as word_run_async(), but the worker's argument is **copied by value**
+ * into the job.
+ *
+ * ## Why this exists (roadmap B4)
+ *
+ * The obvious way to hand arguments to a worker is to pass the address of a
+ * local variable. That is a use-after-return: the handler's stack frame dies
+ * when the handler returns, the httpd task reuses that memory for the next
+ * request, and the worker then reads whatever happens to be there. The symptom
+ * is not a crash but a *random* answer - the history endpoint returned an
+ * empty list, a few entries, or an out-of-memory error depending on timing.
+ *
+ * So the payload is copied into the job, which the worker owns from the moment
+ * it is created. The rule for this component: **an async worker's parameters
+ * are always passed by value**, never as the address of a stack variable.
+ */
+static esp_err_t word_run_async_copy(httpd_req_t *req, word_async_work_t work,
+                                     const void *payload, size_t payload_size,
+                                     uint32_t stack, const char *name)
+{
+    httpd_req_t *async = NULL;
+    if (httpd_req_async_handler_begin(req, &async) != ESP_OK) {
+        return http_reply_esp_error(req, ESP_FAIL, "async handler");
+    }
+
+    /* The payload follows the header in the same allocation, so there is
+     * exactly one thing to free. sizeof(word_async_job_t) keeps the payload
+     * pointer-aligned (three pointers). */
+    word_async_job_t *job = calloc(1, sizeof(*job) + payload_size);
+    if (job == NULL) {
         (void)httpd_req_async_handler_complete(async);
         return http_reply_esp_error(req, ESP_ERR_NO_MEM, "async handler");
     }
-    return ESP_OK;
+    job->req = async;
+    job->work = work;
+    if (payload != NULL && payload_size > 0) {
+        job->arg = (void *)((uint8_t *)job + sizeof(*job));
+        memcpy(job->arg, payload, payload_size);
+    }
+
+    return word_spawn_async(req, async, job, stack, name);
 }
 
 /** Arguments for the history read, parsed on the httpd task. */
@@ -336,9 +391,11 @@ typedef struct {
 /** Worker: read the log and answer. */
 static void history_get_worker(httpd_req_t *req, void *arg)
 {
-    const history_args_t args = *(history_args_t *)arg;
-    const bool today_only = args.today_only;
-    const size_t limit = args.limit;
+    /* The argument is a copy that lives in the job, not a pointer into the
+     * handler's (already gone) stack frame. */
+    const history_args_t *args = (const history_args_t *)arg;
+    const bool today_only = args->today_only;
+    const size_t limit = args->limit;
 
     /* PSRAM: a history page is bulk data and internal RAM is the scarce
      * resource on this board (AGENT.md 9.0.5). */
@@ -425,7 +482,25 @@ static esp_err_t history_get_handler(httpd_req_t *req)
         }
     }
 
-    return word_run_async(req, history_get_worker, &args, 5120, "th_word_hist");
+    /* The arguments are copied into the job: `args` lives on this handler's
+     * stack, which is gone by the time the worker runs (see word_run_async_copy). */
+    return word_run_async_copy(req, history_get_worker, &args, sizeof(args),
+                               5120, "th_word_hist");
+}
+
+/** Worker: delete the study log, then answer. */
+static void history_clear_worker(httpd_req_t *req, void *arg)
+{
+    (void)arg;
+
+    const esp_err_t err = word_history_clear();
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        /* "There was no log" is not a failure: clearing twice must still
+         * answer the same way the old synchronous handler did. */
+        (void)http_reply_esp_error(req, err, "clear study history");
+        return;
+    }
+    (void)http_reply_ok(req, "{\"cleared\":true}");
 }
 
 /**
@@ -440,9 +515,10 @@ static esp_err_t history_post_handler(httpd_req_t *req)
     if (http_read_body(req, &body, NULL) != ESP_OK) {
         return http_reply_bad_request(req, "missing body");
     }
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = sys_json_parse(body, 32);
     free(body);
     if (root == NULL) {
+        SYS_LOGW(TAG, "history body is not valid JSON");
         return http_reply_bad_request(req, "invalid json");
     }
 
@@ -453,8 +529,9 @@ static esp_err_t history_post_handler(httpd_req_t *req)
     if (!do_clear) {
         return http_reply_bad_request(req, "nothing to do (expected \"clear\":true)");
     }
-    (void)word_history_clear();
-    return http_reply_ok(req, "{\"cleared\":true}");
+    /* The delete is a FAT operation on the SD card, so it goes to a worker
+     * like every other card access here (see word_run_async). */
+    return word_run_async(req, history_clear_worker, NULL, 5120, "th_word_hclr");
 }
 
 /** Worker: write the wordbook, then answer. */

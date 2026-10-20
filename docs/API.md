@@ -150,6 +150,8 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
 | `sys_status.h` | `esp_err_t sys_status_publish(void);` | 仅强制发 `SYS_EVENT_STATUS_CHANGED` |
 | `sys_notify.h` | `esp_err_t sys_notify(const char *name, const char *payload);` | 发布 L0 变更通知；`payload` 可为 `NULL`（按 `{}`） |
 | `sys_notify.h` | `esp_err_t sys_notify_subscribe(esp_event_handler_t handler, void *handler_arg, esp_event_handler_instance_t *instance);` | 订阅全部通知 |
+| `sys_utils.h` | `void sys_json_use_psram(void);` | 把 cJSON 的分配钩子装成「PSRAM 优先」（开机必须调一次，见 AGENT.md §9.0.5） |
+| `sys_utils.h` | `cJSON *sys_json_parse(const char *json, int max_depth);` | **v1.5.0 新增**。**解析外部输入一律用它，不要用 `cJSON_Parse()`**：cJSON 自带 1000 层上限，而每层递归约 96 字节栈帧（objdump 实测），开机主任务栈只有 12 KB → 约 128 层就爆栈，一个坏文件就能让设备每次开机都崩。本函数在**解析前**先扫文本统计嵌套深度（跳过字符串字面量里的括号），超限返回 `NULL`；调用方负责 `cJSON_Delete()` |
 
 #### 事件
 
@@ -286,6 +288,8 @@ curl.exe -i http://todohelper.local/ws/events                 # 501 + data.hint
 | 容量 | `uint64_t storage_total_bytes(void);` | 未知时 0 |
 | 缓存 | `esp_err_t storage_read_cache(const char *name, char **out, size_t *len);` | 读 `cache/<name>`；不存在 → `ESP_ERR_NOT_FOUND` |
 | 缓存 | `esp_err_t storage_write_cache(const char *name, const void *buf, size_t len);` | 写 `cache/<name>`；失败只 `SYS_LOGW`，不影响主流程 |
+| 缓存 | `esp_err_t storage_write_cache_pinned(const char *name, const void *buf, size_t len);` | **v1.5.0 新增**。写**片内 LittleFS** 的 `cache/<name>`，**不随存储根切换**（插拔 SD 卡不影响待办） |
+| 缓存 | `esp_err_t storage_read_cache_pinned(const char *name, char **out, size_t *len);` | **v1.5.0 新增**。读片内 LittleFS 的同名文件 |
 
 常量：`STORAGE_APP_DIR`=`"todohelper"`、`STORAGE_SD_ROOT`=`"/sdcard"`、`STORAGE_INT_ROOT`=`"/littlefs"`、
 `STORAGE_INT_PARTITION`=`"storage"`。
@@ -438,7 +442,8 @@ idf.py -p COM34 flash monitor
 | 事件 | `esp_err_t ui_event_subscribe(esp_event_base_t base, int32_t event_id, size_t data_size, ui_event_fn_t handler);` | 给非页面 UI 模块（如 `idle_face`）用 |
 | 控件 | `lv_obj_t *ui_card_create(lv_obj_t *parent, const char *title, lv_obj_t **out_body);` | 圆角卡片，`out_body` 收回内容容器（可 `NULL`） |
 | 控件 | `esp_err_t ui_toast(const char *fmt, ...);` | 底部提示，2 s 自动消失，任意任务可调 |
-| 控件 | `lv_obj_t *ui_dialog(const char *title, const char *text, const char *ok_text, lv_event_cb_t on_close, void *user_data);` | 模态框；`on_close` 可 `NULL` |
+| 控件 | `lv_obj_t *ui_dialog(const char *title, const char *text, const char *ok_text, lv_event_cb_t on_close, void *user_data);` | 模态框；`on_close` 可 `NULL`。⚠️ **v1.5.0 起它的 `on_close` 不可靠**：关闭回调是同步 `lv_obj_delete(mbox)`，LVGL 会因此中止同一次点击里的后续回调。**破坏性操作用 `ui_dialog_confirm()`** |
+| 控件 | `lv_obj_t *ui_dialog_confirm(const char *title, const char *text, const char *ok_text, const char *cancel_text, lv_event_cb_t on_ok, void *user_data);` | **v1.5.0 新增**。带「取消 + 确认」两个按钮的确认框（确认键用危险色）；`on_ok` 收到的 `user_data` 是**弹窗对象本身**（回调里可以 `lv_msgbox_close(mbox)`） |
 | 尺寸 | `int32_t ui_screen_width(void);` | 页面**不得**硬编码 800×480 |
 | 尺寸 | `int32_t ui_screen_height(void);` | |
 | 尺寸 | `int32_t ui_statusbar_height(void);` | |
@@ -597,12 +602,24 @@ I (xxx) TH:wifi: got ip 192.168.1.23 (ssid 'MyWiFi', -52 dBm)
 | 同步 | `const char *todo_sync_state_name(todo_sync_state_t state);` | → `none` / `pending` / `ok` / `failed` |
 | 同步 | `todo_sync_state_t todo_sync_state_from_name(const char *name);` | |
 | JSON | `esp_err_t todo_export_json(char **json, size_t *len);` | 输出 `{"version":1,"next_id":N,"items":[...]}`，调用方 `free()` |
-| JSON | `esp_err_t todo_import_json(const char *json);` | 忽略未知字段；`id==0` 补 `max_id+1` |
-| HTTP | `esp_err_t todo_manager_register_http(void);` | 向 L1 `http_router` 注册 §2 的 Todo 路由 |
+| JSON | `esp_err_t todo_import_json(const char *json);` | 忽略未知字段；`id==0` 或与已有 id 重复 → 分配下一个空闲 id（v1.5.0） |
+| 落盘 | `void todo_mark_dirty(void);` | **v1.5.0 新增**。标记清单已变更，交给后台去抖落盘（安静期 400 ms）。**LVGL 回调里必须用它**，不要直接写盘 |
+| 落盘 | `esp_err_t todo_save(void);` | 立即同步落盘，绕过去抖。导入后、网页端改完、关机前用 |
+| 视图 | `todo_due_bucket_t todo_due_bucket(int64_t due_ts);` | **v1.5.0 新增**。按**本地时区**给截止时间分档：`NONE`/`OVERDUE`/`TODAY`/`TOMORROW`/`LATER`；**未校时时除 `NONE` 外一律返回 `NONE`**（不编造日期） |
+| 视图 | `esp_err_t todo_list_filtered(todo_filter_t filter, todo_item_t **items, size_t *count);` | **v1.5.0 新增**。按 `ALL`/`OPEN`/`DUE_TODAY`/`DONE` 取快照，排序与 `todo_list()` 完全一致；数组用 `todo_free_list()` 释放 |
+| 视图 | `uint32_t todo_version(void);` | **v1.5.0 新增**。清单版本号，任何内容或结构变化都自增；页面拿它做脏检查 |
+| 视图 | `size_t todo_count_due_today(void);` | **v1.5.0 新增**。今天到期且未完成的条数；未校时时返回 0 |
+| HTTP | `esp_err_t todo_manager_register_http(void);` | 向 L1 `http_router` 注册 §2 的 Todo 路由（v1.5.0 起 10 条） |
 
 类型与常量：`todo_item_t {uint32_t id; char title[128]; char desc[256]; int64_t due_ts; bool done; uint8_t priority; int64_t updated_at; todo_sync_state_t sync_state;}`、
 `todo_stats_t {size_t total; size_t done; size_t pending;}`、
+`todo_due_bucket_t {NONE, OVERDUE, TODAY, TOMORROW, LATER}`、`todo_filter_t {ALL, OPEN, DUE_TODAY, DONE}`（v1.5.0）、
 `TODO_TITLE_MAX`=128、`TODO_DESC_MAX`=256、`TODO_MAX_ITEMS`=256。
+
+> **落盘语义（v1.5.0 起）**：普通增删改只改内存并置脏，由后台线程去抖写盘（400 ms 安静期），
+> 所以**设备端点一下复选框不会同步写卡**；一次变更只写一次盘。
+> 需要立刻落盘的地方（导入后、网页端改完）调 `todo_save()`。
+> `todo_save()` 等写锁的上限是 3 s，超时返回 `ESP_ERR_TIMEOUT`（不再可能无限期卡住调用方）。
 
 #### 事件
 
@@ -1318,10 +1335,13 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | PATCH | `/api/v1/todos/{id}/done` | todo_manager | body `{"done":true}`（必须是布尔，否则 400） | ✅ 200 |
 | DELETE | `/api/v1/todos/{id}` | todo_manager | 删除，成功返回 `{"id":N,"deleted":true}` | ✅ 200 |
 | POST | `/api/v1/sync` | todo_manager | 客户端声明整表已同步 → `todo_mark_all_synced()` | ✅ 200 |
+| POST | `/api/v1/todos/ack` | todo_manager | **v1.5.0 新增**。body `{"ids":[1,2]}`，设备对这些 id 调 `todo_mark_synced()`；响应 `{"acked":[1,2],"count":2,"missing":[9]}`。一次最多 64 个 id | ✅ 200 |
+| GET | `/api/v1/todos/export` | todo_manager | **v1.5.0 新增**。返回整份清单 JSON，带 `Content-Disposition: attachment`（浏览器直接下载）；`?envelope=1` 走项目统一信封 | ✅ 200 |
+| POST | `/api/v1/todos/import` | todo_manager | **v1.5.0 新增**。body 就是 export 的那份 JSON，**整体替换**现有清单；非法 JSON / 缺 `items` → 400 且**不动现有清单**。响应 `{"imported":N,"total":M,"pending":K}` | ✅ 200 |
 | GET | `/api/v1/weather` | weather_service | 当前读数；无读数时仍 **200** + `valid:false`（让页面提示选城市）。含 `stale` | ✅ 200 |
 | POST | `/api/v1/weather/refresh` | weather_service | 同步刷新；未设城市 → 400；离线/超时 → 503 | ✅ 200/400/503 |
 | POST | `/api/v1/weather/city` | weather_service | body `{"city":"Beijing"}`，持久化后立即刷新一次 | ✅ 200 |
-| POST | `/api/v1/weather/locate` | weather_service | 纯 IP 定位；`geo_url` 可经 NVS 换服务商；本机网络实测到 `ipapi.co` 不通 → 502（语义正确） | ✅ 200/502 |
+| POST | `/api/v1/weather/locate` | weather_service | 纯 IP 定位；**v1.5.0 起异步**（handler 立刻返回，定位在自有任务里跑，期间设备其它 HTTP 接口照常可用）；`geo_url` 可经 NVS 换服务商；本机网络实测到 `ipapi.co` 不通 → 502（语义正确） | ✅ 200/502 |
 | POST | `/api/v1/weather/config` | weather_service | body 可含 `provider`/`api_key`/`interval_s`；响应只回 `provider`/`has_api_key`/`interval_s`（**不回显 Key**） | ✅ 200 |
 | GET | `/api/v1/calendar/now` | calendar_service | `synced`/`ts`/`tz`/`ntp_server`；已同步时另有 `datetime`/`year`/`month`/`day`/`weekday`，未同步 `datetime` = `"时间未同步"` | ✅ 200 |
 | GET | `/api/v1/calendar/month` | calendar_service | **必须**带 `?year=&month=`（缺 → 400；`year` 1970–2200、`month` 1–12 越界 → 400）。含 `days`/`first_weekday`/`weekdays[]`，本月带 `today` | ✅ 200 |
@@ -1343,8 +1363,8 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | POST | `/api/v1/wifi/disconnect` | wifi_manager | 断开并停止自动重连 | ✅ 200 |
 | POST | `/api/v1/wifi/config` | wifi_manager | body `{"ssid","password","auto_connect"}`：只存凭据不连接 | ✅ 200 |
 | POST | `/api/v1/wifi/forget` | wifi_manager | 清除 NVS 里的 SSID/密码（不主动断开） | ✅ 200 |
-| POST | `/api/v1/ai/chat` | ai_service | 阻塞式对话（一次 AI 回复期间会占住 httpd 单任务，见上文长连接警告） | ✅ 200 |
-| POST | `/api/v1/ai/chat/stream` | ai_service | 流式对话（`text/event-stream`）；**同类长连接隐患，用户决定 1.0.0 暂不修** | ✅ 200 |
+| POST | `/api/v1/ai/chat` | ai_service | **v1.5.0 起异步**：handler 立刻把会话交给自有任务，AI 请求期间**设备其它 HTTP 接口照常可用**；对外响应格式不变 | ✅ 200 |
+| POST | `/api/v1/ai/chat/stream` | ai_service | **v1.5.0 起异步**（`text/event-stream`，异步 handler + 自有任务）；chunk/done/error 事件格式不变 | ✅ 200 |
 | GET | `/api/v1/ai/history` | ai_service | 对话历史。**强制鉴权** | ✅ 200（需 token） |
 | DELETE | `/api/v1/ai/history` | ai_service | 清空历史。**强制鉴权** | ✅ 200（需 token） |
 | POST | `/api/v1/ai/config` | ai_service | 设置 API Key / 模型。**强制鉴权**，响应不回显 Key | ✅ 200（需 token） |
@@ -1400,11 +1420,16 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | 默认状态 | 未设置 token 时 `auth_enabled=false`：局域网内大多接口可无鉴权访问（便于电脑端直接改待办） |
 | 开启方式 | `POST /api/v1/device/auth` body `{"token":"..."}`；长度 >63 → `ESP_ERR_INVALID_ARG`（500）；空串/`null` 则删除键并关闭鉴权 |
 | **写方法无条件鉴权** | `POST` / `PUT` / `PATCH` / `DELETE` **一律**过 hook（`is_write_method()`） |
-| **强制鉴权路径** | `/api/v1/device/reboot`、`/api/v1/device/auth` 被 `http_router_require_auth()` 显式标记，**即使 `auth_enabled=false` 也必须带正确 token**，否则 401 |
-| 只读接口 | `GET` 默认不鉴权（当前没有任何 `GET` 路由被标记 `require_auth`） |
+| **强制鉴权路径** | `/api/v1/device/reboot`、`/api/v1/device/auth`、`/api/v1/ai/config`、`/api/v1/ai/history`、`/api/v1/debug/exec` 被显式标记，**即使 `auth_enabled=false` 也必须带正确 token**，否则 401 |
+| **只读接口（v1.5.0 起）** | `GET` 默认不鉴权，但**下列只读路由被 `http_router_require_auth()` 标记**，开了鉴权就**必须**带 token：<br>`GET /api/v1/todos`、`GET /api/v1/todos/*`（含 `{id}`、`export`）、`GET /api/v1/ai/history` |
+| 标记时机 | 路由由各组件在 `init()` 里注册，而 `require_auth()` 只能在**注册之后**调用；因此 `sync_server` 在**服务器启动时**与 **`SYS_EVENT_READY`（所有模块初始化完毕）**各标记一次 |
+| 令牌缓存 | token 在内存里缓存（`s_auth_token`），设置/清除时刷新；**不再每个请求都读一遍 NVS**（那会让 httpd 任务排在 flash 写后面）。令牌本身**不写日志**、不通过任何接口回读 |
+| 失败关闭 | 缓存里的令牌放不下（只可能发生在有人绕过本组件直接改 NVS 时）→ **鉴权按开启处理**，宁可谁也进不来，也不把设备敞开 |
 | hook 缺失 | `http_router_check_auth()` **fail-open 返回 `true`**（只在没装 `sync_server` 的测试环境出现） |
 | 失败响应 | HTTP **401** + `{"code":401,"msg":"unauthorized","data":null}`；同时发 `SYNC_EVENT_AUTH_FAILED`（payload = 路径）并打 `TH:sync: auth failed for <path>` |
-| 副作用名单 | `sync_server.c` 的 `s_always_auth[]` 还列了 `/api/v1/ai/config`、`/api/v1/ai/history`（这两条**已注册**，强制鉴权：无 token → 401，不是 404） |
+
+> **网页上位机**始终带 `X-Auth-Token`（用户在「连接设置」里填的那个），
+> 所以开了鉴权后网页照常可用；SSE 订阅也带同一个头。
 
 `curl.exe` 两个例子：
 
@@ -1612,11 +1637,20 @@ idf.py -p COM34 erase-flash                             # 清空 NVS + 文件系
   logs/                             # 预留：app.log
 ```
 
+> **v1.5.0 的落盘协议变了**：`storage_write_file()` 不再是「tmp + rename」，
+> 而是**双槽**——写 `X.new` → 正式文件 `X` 改名成 `X.bak` → `X.new` 改名成 `X`。
+> 起因是 FatFs 的 `f_rename()` 在**目标已存在时返回 `FR_EXIST` 而不是覆盖**，
+> 原来的「先 `remove(X)` 再 `rename(tmp,X)`」在两步之间掉电，
+> **会把上一份有效清单和新的临时文件一起丢掉**（README 里宣称的「原子写」当时并不成立）。
+> 现在掉电最多损失最新一次写入，启动时 `storage_recover_tree()` 会把
+> `.new` / `.bak` 收敛回正式文件（正式文件在且 `.new` 在 → 丢 `.new`；
+> 正式文件不在且 `.new` 在 → 提 `.new`；都不在 → 用 `.bak` 顶上）。
+
 ### 4.2 文件归属
 
 | 相对路径 | 组件 | 写入方式 / 说明 |
 |---|---|---|
-| `cache/todos.json` | `todo_manager` | 文件名可配 `CONFIG_TODOHELPER_TODO_CACHE_FILE`（默认 `todos.json`），实际路径由 `storage_write_cache()` 拼成 `cache/<名字>`；`storage_write_file()` **原子写**（tmp + rename），每两把锁（`s_lock` 保护数组、`s_io_lock` 串行化写）；缓存写失败只 `SYS_LOGW` |
+| `cache/todos.json` | `todo_manager` | 文件名可配 `CONFIG_TODOHELPER_TODO_CACHE_FILE`（默认 `todos.json`），实际路径由 `storage_write_cache_pinned()` 拼成 `cache/<名字>`（**v1.5.0 起固定存片内 LittleFS**，插拔 SD 卡不再让待办「消失」）；`storage_write_file()` 走**双槽协议**（`X.new` → `X` 改名 `X.bak` → `X.new` 改名 `X`），掉电后由启动恢复收敛；两把锁（`s_lock` 保护数组、`s_io_lock` 串行化写）；缓存写失败只 `SYS_LOGW` |
 | `cache/weather.json` | `weather_service` | 字段 `city/lat/lon/temp/feels_like/humidity/condition/icon/weather_code/update_ts/provider`；**绝不写入 API Key**；断网时页面靠它显示上次读数 |
 | `words/progress.json` | `word_service` | 结构 `{"items":{"w<id>":{level,n,last,next,at}},"version":1,"book","daily_count","known_total","fuzzy_total","unknown_total"}`；`review_count == 0` 的词不写入；原子写 |
 | `words/<book>.json` | `word_service` | 当前词库（默认 `cet4.json`）。缺失时：若 `CONFIG_TODOHELPER_WORD_EXPORT_TEMPLATE`（默认 y）把内置 32 词示例写到该路径，然后无论写成功与否都用固件内置词库兜底 |

@@ -62,10 +62,10 @@
    - 断连时 `sse_unregister()` 排空并删除队列，`sync_server_sse_clients()` 反映当前订阅数。
 7. **鉴权模型（需求 §8.8）**：默认 `auth_enabled = false`（局域网内免鉴权，方便电脑端直接改待办）。
    一旦通过 `sync_server_set_auth_token()` 设过 token（NVS 键 `auth_token`，**不硬编码、不写日志**），
-   **所有写方法**（POST/PUT/PATCH/DELETE）都必须带 `X-Auth-Token`。
+   **写方法与被标记的读方法**都必须带 `X-Auth-Token`。
    `sync_server_check_auth()` **只读 `X-Auth-Token` 头，绝不接受 URL query 传 token**（query 会进日志）。
    token 长度上限 63 字符；传 `NULL`/`""` 会清除并关闭鉴权。
-   另有 4 条路径**无论鉴权开关如何都强制校验**（`s_always_auth`）：
+   另有 5 条路径**无论鉴权开关如何都强制校验**（`s_strict_auth_paths`）：
 
    | 强制鉴权路径 | 原因 |
    |---|---|
@@ -73,9 +73,26 @@
    | `/api/v1/device/auth` | 会改 token |
    | `/api/v1/ai/config` | 涉及 API Key |
    | `/api/v1/ai/history` | 对话记录 |
+   | `/api/v1/debug/exec` | 调试 shell 能重启/改 UI（仅调试固件有这条路由） |
 
    失败统一 **401** + `{"code":401,"msg":"unauthorized","data":null}`，并记 `auth failed for <path>`
    与 `SYNC_EVENT_AUTH_FAILED`。传输是明文局域网、**不提供 HTTPS**。
+
+   ### 鉴权矩阵（v1.5.0 起）
+
+   | 路由 | 鉴权关闭（没设 token） | 鉴权开启（设了 token） |
+   |---|---|---|
+   | `GET /`、`/index.html` | 放行 | 放行 |
+   | `GET /api/v1/device/info`、`/api/v1/device/status` | 放行 | 放行（不含任何密钥） |
+   | `GET /api/v1/todos`、`GET /api/v1/todos/{id}` | 放行 | **要 token** |
+   | `GET /api/v1/ai/history` | **401**（强制路径） | **要 token** |
+   | `GET /api/v1/events`（SSE） | 放行 | **要 token** |
+   | 所有 POST/PUT/PATCH/DELETE | 放行 | **要 token** |
+   | `POST /api/v1/device/reboot`、`/api/v1/device/auth`、`/api/v1/ai/config`、`DELETE /api/v1/ai/history`、`/api/v1/debug/exec` | **401**（强制路径） | **要 token** |
+
+   **网页端兼容**：网页上位机本来就带 `X-Auth-Token`（`api()` 的公共漏斗 + SSE 的 `fetch` 流），
+   所以开启鉴权后照常工作；SSE 走 `EventSource`（浏览器不支持 fetch 流式时）带不了请求头，
+   此时会拿到 401，页面自动降级为轮询并提示"需要令牌"。
 8. **信息泄露红线**：`GET /api/v1/device/info` 返回型号、核数、版本、IDF 版本、MAC、IP、主机名、
    WiFi 状态、存储信息与 `auth_enabled`，**刻意不返回任何 API Key、token**（需求 §8.8 明确禁止回读）。
 9. **/ws/events 是刻意的 501**。本 IDF 构建里没有 WebSocket 组件，所以它被
@@ -84,6 +101,38 @@
    这样客户端能区分"功能没做（501）"和"URL 写错（404）"（需求 §8.1 / §8.7 的降级要求）。
 10. **重启走定时器**：`POST /api/v1/device/reboot` 先回 `{"rebooting":true}`，再用 700 ms 一次性
     `esp_timer` 调 `esp_restart()`——在 handler 里直接重启会把响应掐断。
+11. **读方法怎么才走鉴权钩子（v1.5.0 修）**：`http_router` 的判定是
+    `need_auth = route->auth_required || is_write_method(method)` ——
+    **路由被 `http_router_require_auth()` 标记之后，GET 也会调鉴权钩子**；
+    没被标记的 GET 仍然放行。所以"读操作也强制鉴权"完全取决于**标记**，
+    而 `http_router_require_auth()` 按 (path, method) 精确查找，**必须在路由注册之后**调用。
+   本组件因此维护一张"受保护读路由"表（`s_protected_routes[]`）：
+   `GET /api/v1/todos`、`GET /api/v1/todos/*`、`GET /api/v1/ai/history`；
+   `GET /api/v1/events` 是本组件自己的路由，在 `s_own_routes[]` 里直接标记。
+   标记时机：路由归属方在各自 `init()` 里注册（`todo_manager` 在 `sync_server` 之前，
+   `ai_service` 在之后），所以**标记做两次**——服务器启动时一次，
+   所有模块 init 完毕（`SYS_EVENT_READY`）再一次。漏掉这一步的后果是
+   `GET /api/v1/ai/history` 在启动后的几秒内不校验令牌。
+12. **令牌缓存（v1.5.0 修，P4）**：令牌缓存在 `s_auth_token[]`（80 B 静态），
+   只在**启动**和**令牌/鉴权开关变化**时刷新（`auth_cache_refresh()` /
+   `sync_server_set_auth_token()`），校验时只读缓存。
+   之前每个需要鉴权的请求都要 `sys_config_get_str()`：内部两次 `nvs_get_str()` 外加全局配置锁
+   （`xSemaphoreTake(portMAX_DELAY)`），而 UI 任务写配置时也拿这把锁，
+   于是 httpd 任务可能被一次 flash 写堵住。
+   - 令牌是敏感值：**只写不读、不记日志**（与 AI Key 同规则），`device/info` 也不回读。
+   - 缓存未命中（客户端令牌不对）时**才**回读一次 NVS：调试 shell 是绕过本组件直接写 NVS 的，
+     没有这次回读，新令牌会被旧缓存挡在门外。
+   - NVS 里的令牌比缓存长（只可能被人绕过本组件写坏）时**失败关闭**：
+     鉴权算作"已开启"，谁都进不来，而不是把设备敞开。
+13. **SSE 订阅表有锁（v1.5.0 修）**：`sse_register()` 在 httpd 任务里跑，
+    `sse_unregister()` 在 SSE 任务里跑，两者原本无锁地读改写同一张表：
+    丢一次更新，计数就和真实连接数对不上，而 `notify_handler()` 用"订阅数为 0"当判据，
+    一旦漂移成 0，**所有推送事件会被直接丢掉**（网页却还显示"推送中"）。
+    现在 `s_sse_lock`（互斥量）保护整张表，订阅数直接由表算出来（不再有独立的计数器），
+    广播的整个扇出也在锁内完成——**队列可能在 SSE 任务里被删掉，向已删除的队列发送就是崩溃**。
+    临界区只有几次指针赋值，队列的创建/删除放在锁外。
+    另外 `sync_server_stop()` 现在只把队列**摘下来**而不删：SSE 任务正等在自己的队列上，
+    删掉它属于未定义行为；任务自己会在发现连接断了以后删掉它。
 
 ## 路由表
 
@@ -96,8 +145,16 @@
 | GET | `/api/v1/device/status` | 否 | 运行状态：`uptime_s`、`free_heap`、`min_free_heap`、`free_psram`、`routes`、`sse_clients`、`wifi_rssi`、`wifi_connected`、`time_synced`、`server_ts`、`url` |
 | POST | `/api/v1/device/reboot` | **强制** | 700 ms 后重启 |
 | POST | `/api/v1/device/auth` | **强制** | body `{"token":"..."}`；空串关闭鉴权 |
-| GET | `/api/v1/events` | 否 | SSE 推送通道 |
+| GET | `/api/v1/events` | 开了鉴权就要 | SSE 推送通道（同样带 `X-Auth-Token`） |
 | GET | `/ws/events` | 否 | **501 占位** |
+
+别的组件的路由（由本组件打上"读方法也要鉴权"的标记）：
+
+| 方法 | 路径 | 鉴权 | 归属 |
+|---|---|---|---|
+| GET | `/api/v1/todos` | 开了鉴权就要 | `todo_manager` |
+| GET | `/api/v1/todos/{id}` | 开了鉴权就要 | `todo_manager` |
+| GET | `/api/v1/ai/history` | **强制** | `ai_service` |
 
 ## 事件
 
@@ -153,3 +210,30 @@ curl.exe -s -o NUL -m 8 -w "%{http_code}" http://todohelper.local/api/v1/events 
 再把 3 个客户端杀掉，约 15 秒后 `sse_clients` 应回到 0。**若挂上流以后普通请求超时，
 说明 handler 又变回同步实现（整个服务器被冻住了）**。
 用 `curl.exe -X POST http://todohelper.local/api/v1/todos ...`（不带 token）验证开启鉴权后写操作返回 401。
+
+### 鉴权回归（v1.5.0 新增，别省）
+
+在设备上"开启 HTTP 鉴权"拿到 token 之后：
+
+```powershell
+$env:T = "<token>"
+
+# 没带 token：受保护的读接口必须是 401（v1.5.0 之前这里是 200，漏洞）
+curl.exe -s -o NUL -w "%{http_code}`n" http://todohelper.local/api/v1/todos              # 401
+curl.exe -s -o NUL -w "%{http_code}`n" http://todohelper.local/api/v1/todos/1            # 401
+curl.exe -s -o NUL -w "%{http_code}`n" http://todohelper.local/api/v1/ai/history         # 401
+curl.exe -s -o NUL -w "%{http_code}`n" http://todohelper.local/api/v1/events             # 401
+
+# 带上 token：必须 200
+curl.exe -s -o NUL -w "%{http_code}`n" -H "X-Auth-Token: $env:T" http://todohelper.local/api/v1/todos   # 200
+curl.exe -s -o NUL -w "%{http_code}`n" -H "X-Auth-Token: $env:T" http://todohelper.local/api/v1/events  # 200（并收到 retry: 3000）
+
+# 不受保护的接口始终放行
+curl.exe -s -o NUL -w "%{http_code}`n" http://todohelper.local/                            # 200
+curl.exe -s -o NUL -w "%{http_code}`n" http://todohelper.local/api/v1/device/info         # 200
+```
+
+关掉鉴权（设备上"关闭 HTTP 鉴权"）之后，`GET /api/v1/todos` 必须重新变成 **200**：
+默认的"局域网免鉴权"是需求 §8.8 明确要求的默认状态。
+`GET /api/v1/ai/history` 与 `POST /api/v1/device/reboot` 仍然是 **401**（强制路径）。
+

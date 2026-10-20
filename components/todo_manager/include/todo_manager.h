@@ -78,13 +78,37 @@ typedef struct {
     size_t pending;            /**< sync_state != TODO_SYNC_OK */
 } todo_stats_t;
 
+/** 待办的截止时间分档。设备端用它决定徽标文案与颜色。 */
+typedef enum {
+    TODO_DUE_NONE = 0,   /**< 没有截止时间 */
+    TODO_DUE_OVERDUE,    /**< 已逾期 */
+    TODO_DUE_TODAY,      /**< 今天到期（本地时区 00:00~23:59:59） */
+    TODO_DUE_TOMORROW,   /**< 明天到期 */
+    TODO_DUE_LATER,      /**< 更晚 */
+} todo_due_bucket_t;
+
+/** 列表筛选口径。 */
+typedef enum {
+    TODO_FILTER_ALL = 0,   /**< 全部 */
+    TODO_FILTER_OPEN,      /**< 只看未完成 */
+    TODO_FILTER_DUE_TODAY, /**< 只看今天到期且未完成 */
+    TODO_FILTER_DONE,      /**< 只看已完成 */
+} todo_filter_t;
+
 /**
  * @brief Load the persisted list. Safe to call when storage is unavailable:
  *        the component then runs in memory-only mode.
  */
 esp_err_t todo_manager_init(void);
 
-/** @brief Force a persist of the current list. */
+/**
+ * @brief Force a persist of the current list.
+ *
+ * Synchronous: it writes the file right away and bypasses the debounced
+ * writer. Use it where the data must be on the medium *now* (right after an
+ * import, after the web client changed something). Ordinary mutations call
+ * todo_mark_dirty() instead, so the LVGL task never touches the card.
+ */
 esp_err_t todo_save(void);
 
 /**
@@ -123,6 +147,42 @@ esp_err_t todo_list_changed_since(int64_t since_ts, todo_item_t **items, size_t 
 void todo_free_list(todo_item_t *items);
 
 esp_err_t todo_stats(todo_stats_t *out);
+
+/* ------------------------------------------------------------------------ */
+/* 列表视图与脏检查                                                          */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * @brief 按本地时区给 due_ts 分档。设备未校时（sys_time_synced() 为假）时，
+ *        除 TODO_DUE_NONE 外一律返回 TODO_DUE_NONE —— 不要编造日期。
+ */
+todo_due_bucket_t todo_due_bucket(int64_t due_ts);
+
+/**
+ * @brief 按筛选口径取快照，排序与 todo_list() 完全一致
+ *        （未完成在前 → 优先级高在前 → 截止早在前 → id 升序）。
+ *
+ * 返回的数组由调用方用 todo_free_list() 释放。
+ */
+esp_err_t todo_list_filtered(todo_filter_t filter, todo_item_t **items, size_t *count);
+
+/**
+ * @brief 清单版本号。任何内容或结构变化（增删改、状态变化）都会自增。
+ *        页面拿它做脏检查：版本没变就不用整表重建。
+ */
+uint32_t todo_version(void);
+
+/**
+ * @brief 标记清单已变更，交给后台线程去抖落盘。
+ *        LVGL 回调里必须调这个而不是直接写盘（AGENT.md §9.0.1.1 铁律一）。
+ *        HTTP 侧若需要立刻落盘，调 todo_save()（同步）。
+ */
+void todo_mark_dirty(void);
+
+/**
+ * @brief 今天到期且未完成的条数（首页卡片用）。未校时时返回 0。
+ */
+size_t todo_count_due_today(void);
 
 /**
  * @brief Mark one item as in sync with the clients.

@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mdns.h"
 
@@ -28,12 +29,44 @@ static const char *TAG = "sync";
 
 ESP_EVENT_DEFINE_BASE(SYNC_EVENT);
 
-/** Paths that always require a token, even for reads (requirement 8.8). */
-static const char *const s_always_auth[] = {
+/**
+ * Paths that demand a valid token no matter whether the global auth switch is
+ * on.
+ *
+ * They either change the device's own configuration (reboot, new token, AI
+ * API key), expose private data (the AI conversation log) or hand out control
+ * over the device (the debug shell), so "no token configured" must not turn
+ * them into an open door.
+ */
+static const char *const s_strict_auth_paths[] = {
     "/api/v1/device/reboot",
     "/api/v1/device/auth",
     "/api/v1/ai/config",
     "/api/v1/ai/history",
+    /* The debug shell can reboot the board and drive the UI; its own README
+     * promises that its routes require a token "even when the global auth is
+     * off". The route only exists in debug builds, the path check does not. */
+    "/api/v1/debug/exec",
+};
+
+/**
+ * Read routes that have to go through the auth hook as well.
+ *
+ * The router only forces the auth hook for write methods
+ * (`need_auth = route->auth_required || is_write_method()`), so a GET route is
+ * protected only when it is *marked* with http_router_require_auth(). These
+ * carry the user's own data: the todo list and the AI conversation log.
+ *
+ * The SSE stream (/api/v1/events) is marked the same way - it is owned by this
+ * component, see s_own_routes[].
+ */
+static const struct {
+    const char *path;
+    httpd_method_t method;
+} s_protected_routes[] = {
+    { "/api/v1/todos", HTTP_GET },
+    { "/api/v1/todos/*", HTTP_GET },
+    { "/api/v1/ai/history", HTTP_GET },
 };
 
 /**
@@ -65,8 +98,46 @@ static httpd_handle_t s_server;
 static sync_server_config_t s_cfg;
 static char s_url[64];
 
+/**
+ * Cached HTTP auth token.
+ *
+ * token_matches() runs on every request that needs a token. Reading the token
+ * from NVS there costs two nvs_get_str() calls *and* the global config lock
+ * (`xSemaphoreTake(s_lock, portMAX_DELAY)`) - and that lock is also taken by
+ * the UI task, so a burst of requests can park the httpd task behind a flash
+ * write. The token only changes when it is set, so it is cached here and
+ * refreshed on every change instead.
+ *
+ * The token is a secret: it is never logged and never read back through an API
+ * (same rule as the AI key).
+ */
+#define SYNC_AUTH_TOKEN_MAX 80
+static char s_auth_token[SYNC_AUTH_TOKEN_MAX];
+
+/**
+ * Whether a token is configured.
+ *
+ * Kept apart from the token itself so a token that does not fit into the cache
+ * (only possible when somebody wrote NVS behind our back) fails *closed*
+ * instead of silently opening the device up.
+ */
+static bool s_auth_enabled;
+
 static QueueHandle_t s_sse_queues[SYNC_SSE_MAX_CLIENTS];
-static size_t s_sse_clients;
+
+/**
+ * Lock for the subscriber table.
+ *
+ * sse_register() runs in the httpd task while sse_unregister() runs in the SSE
+ * task: without a lock a single lost update makes the counter disagree with
+ * the real number of connections, and notify_handler() uses "nobody is
+ * listening" as the reason to drop the event - so one lost update would
+ * silently stop every push while the web page still shows "推送中".
+ *
+ * The critical sections are a couple of pointer assignments long and never
+ * block.
+ */
+static SemaphoreHandle_t s_sse_lock;
 
 /* ------------------------------------------------------------------------ */
 /* Helpers                                                                   */
@@ -82,9 +153,40 @@ static void config_defaults(sync_server_config_t *cfg)
     cfg->mdns_enabled = sys_config_get_bool_or(SYS_KEY_MDNS_ENABLED, true);
     strlcpy(cfg->hostname, SYNC_SERVER_DEFAULT_HOSTNAME, sizeof(cfg->hostname));
 
-    char token[80];
-    cfg->auth_enabled = (sys_config_get_str(SYS_KEY_AUTH_TOKEN, token, sizeof(token)) == ESP_OK) &&
-                        (token[0] != '\0');
+    /*
+     * The auth state is not read here: it comes from the token cache, which
+     * auth_cache_refresh() fills. NVS is the single source of truth for the
+     * token, so the flag is derived from it instead of being read twice.
+     */
+    cfg->auth_enabled = s_auth_enabled;
+}
+
+/**
+ * Re-read the token from NVS into the cache and update the auth flag.
+ *
+ * Called when the server starts and whenever the token is set or cleared. The
+ * token itself is never written to the log.
+ */
+static void auth_cache_refresh(void)
+{
+    char token[SYNC_AUTH_TOKEN_MAX] = { 0 };
+    const esp_err_t err = sys_config_get_str(SYS_KEY_AUTH_TOKEN, token, sizeof(token));
+
+    if (err == ESP_OK) {
+        strlcpy(s_auth_token, token, sizeof(s_auth_token));
+        s_auth_enabled = (s_auth_token[0] != '\0');
+    } else if (err == ESP_ERR_INVALID_SIZE) {
+        /* The stored token is longer than the cache: it can never match a
+         * request, so fail closed (auth on, nobody gets in) instead of
+         * treating the device as unprotected. */
+        s_auth_token[0] = '\0';
+        s_auth_enabled = true;
+    } else {
+        s_auth_token[0] = '\0';
+        s_auth_enabled = false;
+    }
+
+    s_cfg.auth_enabled = s_auth_enabled;
 }
 
 static void refresh_url(void)
@@ -150,32 +252,54 @@ const char *sync_server_url(void)
 /* Auth (requirement 8.8)                                                    */
 /* ------------------------------------------------------------------------ */
 
-static bool path_always_needs_auth(const char *path)
+/** Is this one of the paths that always need a valid token? */
+static bool path_is_strict(const char *path)
 {
-    for (size_t i = 0; i < sizeof(s_always_auth) / sizeof(s_always_auth[0]); i++) {
-        if (strcmp(path, s_always_auth[i]) == 0) {
+    for (size_t i = 0; i < sizeof(s_strict_auth_paths) / sizeof(s_strict_auth_paths[0]); i++) {
+        if (strcmp(path, s_strict_auth_paths[i]) == 0) {
             return true;
         }
     }
     return false;
 }
 
+/**
+ * Compare the request's token with the cached one.
+ *
+ * Only the `X-Auth-Token` header is accepted - a token in the URL query would
+ * end up in the access log.
+ */
 static bool token_matches(httpd_req_t *req)
 {
-    char expected[80];
-    if (sys_config_get_str(SYS_KEY_AUTH_TOKEN, expected, sizeof(expected)) != ESP_OK ||
-        expected[0] == '\0') {
-        /* Authentication enabled without a token cannot be satisfied. */
+    char provided[SYNC_AUTH_TOKEN_MAX];
+    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", provided, sizeof(provided)) != ESP_OK) {
+        /* No header at all: fail without touching NVS. */
         return false;
     }
 
-    char provided[80];
-    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", provided, sizeof(provided)) != ESP_OK) {
-        return false;
+    if (s_auth_enabled && s_auth_token[0] != '\0' && strcmp(s_auth_token, provided) == 0) {
+        return true;   /* cache hit: the happy path never reads NVS */
     }
-    return strcmp(expected, provided) == 0;
+
+    /*
+     * Cache miss. Either the client sent the wrong token, or the token was
+     * changed behind our back (the debug shell writes NVS directly). Re-read
+     * once so a fresh token cannot be locked out by a stale cache - this only
+     * happens on the failure path.
+     */
+    auth_cache_refresh();
+    return s_auth_enabled && s_auth_token[0] != '\0' && strcmp(s_auth_token, provided) == 0;
 }
 
+/**
+ * @brief Auth decision for one request (requirement 8.8).
+ *
+ * Three layers:
+ *  1. strict paths (reboot, token change, AI config, AI history): a valid
+ *     token is required even when the global switch is off;
+ *  2. every other path: the token is required as soon as one is configured;
+ *  3. the token itself is only read from the `X-Auth-Token` header.
+ */
 bool sync_server_check_auth(httpd_req_t *req)
 {
     char path[128];
@@ -183,16 +307,8 @@ bool sync_server_check_auth(httpd_req_t *req)
         return false;
     }
 
-    if (path_always_needs_auth(path)) {
-        const bool ok = token_matches(req);
-        if (!ok) {
-            SYS_LOGW(TAG, "auth failed for %s", path);
-            (void)sys_event_post_to(SYNC_EVENT, SYNC_EVENT_AUTH_FAILED, path, strlen(path) + 1);
-        }
-        return ok;
-    }
-
-    if (!s_cfg.auth_enabled) {
+    if (!path_is_strict(path) && !s_auth_enabled) {
+        /* LAN default: no token configured -> open (requirement 8.8). */
         return true;
     }
 
@@ -206,13 +322,15 @@ bool sync_server_check_auth(httpd_req_t *req)
 
 bool sync_server_auth_required(void)
 {
-    return s_cfg.auth_enabled;
+    return s_auth_enabled;
 }
 
 esp_err_t sync_server_set_auth_token(const char *token)
 {
     if (token == NULL || token[0] == '\0') {
         (void)sys_config_erase(SYS_KEY_AUTH_TOKEN);
+        s_auth_token[0] = '\0';
+        s_auth_enabled = false;
         s_cfg.auth_enabled = false;
         SYS_LOGI(TAG, "HTTP authentication disabled");
         return ESP_OK;
@@ -226,10 +344,53 @@ esp_err_t sync_server_set_auth_token(const char *token)
     if (err != ESP_OK) {
         return err;
     }
+
+    /* Refresh the cache right away: the next request must see the new token
+     * without waiting for a reboot. */
+    strlcpy(s_auth_token, token, sizeof(s_auth_token));
+    s_auth_enabled = true;
     s_cfg.auth_enabled = true;
     /* The token itself must never be logged. */
     SYS_LOGI(TAG, "HTTP authentication enabled");
     return ESP_OK;
+}
+
+/**
+ * Mark the read routes that have to be authenticated.
+ *
+ * http_router_require_auth() looks the route up by its exact (path, method)
+ * pair, so it only works *after* the owner registered the route. The owners
+ * register in their own init - todo_manager before sync_server, ai_service
+ * after it - so the marks are applied twice: once when the server starts and
+ * once when every module has finished initialising (SYS_EVENT_READY).
+ */
+static void apply_auth_marks(void)
+{
+    for (size_t i = 0; i < sizeof(s_protected_routes) / sizeof(s_protected_routes[0]); i++) {
+        const esp_err_t err = http_router_require_auth(s_protected_routes[i].path,
+                                                       s_protected_routes[i].method, true);
+        if (err != ESP_OK) {
+            /* The owning component has not registered the route (yet). */
+            SYS_LOGD(TAG, "auth mark skipped for %s (%s)",
+                     s_protected_routes[i].path, esp_err_to_name(err));
+        }
+    }
+}
+
+/**
+ * Every module has finished initialising.
+ *
+ * The components that start after sync_server (ai_service) have registered
+ * their routes by now, so their routes can be marked as auth-required too.
+ */
+static void ready_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
+
+    apply_auth_marks();
 }
 
 /* ------------------------------------------------------------------------ */
@@ -308,7 +469,7 @@ static esp_err_t device_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "free_psram",
                             (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(root, "routes", (double)http_router_count());
-    cJSON_AddNumberToObject(root, "sse_clients", (double)s_sse_clients);
+    cJSON_AddNumberToObject(root, "sse_clients", (double)sync_server_sse_clients());
     cJSON_AddNumberToObject(root, "wifi_rssi", st.wifi_rssi);
     cJSON_AddBoolToObject(root, "wifi_connected", st.wifi_connected);
     cJSON_AddBoolToObject(root, "time_synced", sys_time_synced());
@@ -379,46 +540,112 @@ static esp_err_t device_auth_post_handler(httpd_req_t *req)
 /* Server-sent events                                                        */
 /* ------------------------------------------------------------------------ */
 
+/** Take the subscriber lock. No-op when it could not be created. */
+static void sse_lock(void)
+{
+    if (s_sse_lock != NULL) {
+        (void)xSemaphoreTake(s_sse_lock, portMAX_DELAY);
+    }
+}
+
+static void sse_unlock(void)
+{
+    if (s_sse_lock != NULL) {
+        (void)xSemaphoreGive(s_sse_lock);
+    }
+}
+
+/** Number of attached subscribers. The caller must hold the lock. */
+static size_t sse_clients_locked(void)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
+        if (s_sse_queues[i] != NULL) {
+            count++;
+        }
+    }
+    return count;
+}
+
 size_t sync_server_sse_clients(void)
 {
-    return s_sse_clients;
+    sse_lock();
+    const size_t count = sse_clients_locked();
+    sse_unlock();
+    return count;
 }
 
 /** Take a free per-client queue slot, or NULL when all are in use. */
 static QueueHandle_t sse_register(void)
 {
+    /* Created outside the lock: the queue allocation must not happen while
+     * the table is locked. */
+    QueueHandle_t q = xQueueCreate(8, sizeof(char *));
+    if (q == NULL) {
+        return NULL;
+    }
+
+    sse_lock();
+    QueueHandle_t slot = NULL;
     for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
         if (s_sse_queues[i] == NULL) {
-            QueueHandle_t q = xQueueCreate(8, sizeof(char *));
-            if (q == NULL) {
-                return NULL;
-            }
             s_sse_queues[i] = q;
-            s_sse_clients++;
-            return q;
+            slot = q;
+            break;
         }
     }
-    return NULL;
+    sse_unlock();
+
+    if (slot == NULL) {
+        vQueueDelete(q);
+        return NULL;
+    }
+    return slot;
 }
 
 static void sse_unregister(QueueHandle_t q)
 {
-    for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
-        if (s_sse_queues[i] != q) {
-            continue;
-        }
-
-        char *pending = NULL;
-        while (xQueueReceive(q, &pending, 0) == pdTRUE) {
-            free(pending);
-        }
-        vQueueDelete(q);
-        s_sse_queues[i] = NULL;
-        if (s_sse_clients > 0) {
-            s_sse_clients--;
-        }
+    if (q == NULL) {
         return;
     }
+
+    /*
+     * Detach the queue from the table first: a broadcaster that is already
+     * inside its critical section holds the lock, so it cannot be looking at
+     * a queue that is about to disappear.
+     */
+    sse_lock();
+    for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
+        if (s_sse_queues[i] == q) {
+            s_sse_queues[i] = NULL;
+            break;
+        }
+    }
+    sse_unlock();
+
+    /* The queue is owned by whoever registered it, so it is always torn down
+     * here - even when it was detached from the table already (server stop). */
+    char *pending = NULL;
+    while (xQueueReceive(q, &pending, 0) == pdTRUE) {
+        free(pending);
+    }
+    vQueueDelete(q);
+}
+
+/**
+ * Detach every subscriber queue from the table without deleting it.
+ *
+ * Used when the server stops: the SSE tasks are still blocked on their
+ * queues, and deleting a queue a task is waiting on is undefined behaviour.
+ * The tasks own their queue and delete it when they notice the dead socket.
+ */
+static void sse_detach_all(void)
+{
+    sse_lock();
+    for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
+        s_sse_queues[i] = NULL;
+    }
+    sse_unlock();
 }
 
 esp_err_t sync_server_broadcast_event(const char *event_name, const char *json_payload)
@@ -436,7 +663,12 @@ esp_err_t sync_server_broadcast_event(const char *event_name, const char *json_p
     }
     snprintf(chunk, needed, "event: %s\ndata: %s\n\n", event_name, payload);
 
-    size_t delivered = 0;
+    /*
+     * The whole fan-out happens under the lock: the SSE task may tear a
+     * queue down at any moment, and a send on a deleted queue is a crash.
+     * The sends never block, so the critical section stays short.
+     */
+    sse_lock();
     for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
         QueueHandle_t q = s_sse_queues[i];
         if (q == NULL) {
@@ -453,8 +685,9 @@ esp_err_t sync_server_broadcast_event(const char *event_name, const char *json_p
             free(copy);
             continue;
         }
-        delivered++;
     }
+    sse_unlock();
+
     free(chunk);
 
     (void)sys_event_post_to(SYNC_EVENT, SYNC_EVENT_BROADCAST, event_name, strlen(event_name) + 1);
@@ -495,7 +728,7 @@ static void sse_client_task(void *arg)
     /* Tell the client to retry after 3 s and announce the channel. */
     bool alive = (httpd_resp_send_chunk(req, "retry: 3000\n\n", HTTPD_RESP_USE_STRLEN) == ESP_OK);
     if (alive) {
-        SYS_LOGI(TAG, "SSE client attached (%u/%d)", (unsigned)s_sse_clients,
+        SYS_LOGI(TAG, "SSE client attached (%u/%d)", (unsigned)sync_server_sse_clients(),
                  SYNC_SSE_MAX_CLIENTS);
     }
 
@@ -512,7 +745,7 @@ static void sse_client_task(void *arg)
     }
 
     sse_unregister(client->queue);
-    SYS_LOGI(TAG, "SSE client detached (%u left)", (unsigned)s_sse_clients);
+    SYS_LOGI(TAG, "SSE client detached (%u left)", (unsigned)sync_server_sse_clients());
 
     /* Terminate the chunked body, then give the socket back to the server.
      * Not completing the async request would leak the session slot and, as the
@@ -570,7 +803,7 @@ static const struct {
     const char *path;
     httpd_method_t method;
     http_route_handler_t handler;
-    bool always_auth;
+    bool require_auth;   /**< 标记为"读方法也要过鉴权钩子" */
 } s_own_routes[] = {
     { "/", HTTP_GET, root_get_handler, false },
     { "/index.html", HTTP_GET, root_get_handler, false },
@@ -578,7 +811,10 @@ static const struct {
     { "/api/v1/device/status", HTTP_GET, device_status_get_handler, false },
     { "/api/v1/device/reboot", HTTP_POST, device_reboot_post_handler, true },
     { "/api/v1/device/auth", HTTP_POST, device_auth_post_handler, true },
-    { "/api/v1/events", HTTP_GET, events_get_handler, false },
+    /* The stream carries the very data the read routes protect, so it is
+     * marked as well: the web page sends X-Auth-Token on the SSE connection
+     * (fetch based stream) and falls back to polling when it gets a 401. */
+    { "/api/v1/events", HTTP_GET, events_get_handler, true },
 };
 
 /**
@@ -612,8 +848,10 @@ static void notify_handler(void *arg, esp_event_base_t base, int32_t id, void *d
     if (note == NULL) {
         return;
     }
-    if (s_sse_clients == 0) {
-        /* Nobody is listening: skip formatting entirely. */
+    if (sync_server_sse_clients() == 0) {
+        /* Nobody is listening: skip formatting entirely. The count is taken
+         * under the lock, so it cannot drift away from the real number of
+         * subscribers (which used to silently swallow every push). */
         return;
     }
     (void)sync_server_broadcast_event(note->name, note->payload);
@@ -690,10 +928,29 @@ esp_err_t sync_server_start(const sync_server_config_t *cfg)
     } else {
         config_defaults(&s_cfg);
     }
+
+    /*
+     * Fill the token cache before anything can ask for authentication: NVS is
+     * the single source of truth, and s_cfg.auth_enabled is derived from it
+     * (a caller-provided auth_enabled is overwritten on purpose - otherwise
+     * the flag and the token could disagree).
+     */
+    auth_cache_refresh();
+
     refresh_url();
 
     /* The router owns auth policy decisions; sync_server provides the check. */
     http_router_set_auth_check(sync_server_check_auth);
+
+    /* The subscriber table is touched by the httpd task and by the SSE tasks. */
+    if (s_sse_lock == NULL) {
+        s_sse_lock = xSemaphoreCreateMutex();
+        if (s_sse_lock == NULL) {
+            /* Not fatal: the web server still works, only the subscriber count
+             * could drift again. */
+            SYS_LOGE(TAG, "SSE lock unavailable");
+        }
+    }
 
     /* Relay every project notification to the SSE subscribers. */
     static bool notify_subscribed;
@@ -707,6 +964,15 @@ esp_err_t sync_server_start(const sync_server_config_t *cfg)
                                 NULL, NULL) != ESP_OK) {
             SYS_LOGW(TAG, "connectivity relay unavailable");
         }
+        /*
+         * The components that start after sync_server (ai_service) register
+         * their routes later, so their auth marks are applied once every
+         * module has finished initialising.
+         */
+        if (sys_event_subscribe(SYS_EVENT, SYS_EVENT_READY, ready_handler,
+                                NULL, NULL) != ESP_OK) {
+            SYS_LOGW(TAG, "auth mark hook unavailable");
+        }
     }
 
     for (size_t i = 0; i < sizeof(s_own_routes) / sizeof(s_own_routes[0]); i++) {
@@ -716,10 +982,14 @@ esp_err_t sync_server_start(const sync_server_config_t *cfg)
             SYS_LOGE(TAG, "register %s failed: %s", s_own_routes[i].path, esp_err_to_name(err));
             return err;
         }
-        if (s_own_routes[i].always_auth) {
+        if (s_own_routes[i].require_auth) {
             (void)http_router_require_auth(s_own_routes[i].path, s_own_routes[i].method, true);
         }
     }
+
+    /* Routes of the components that registered before us are marked right
+     * away; the others are marked on SYS_EVENT_READY. */
+    apply_auth_marks();
 
     for (size_t i = 0; i < sizeof(s_placeholder_routes) / sizeof(s_placeholder_routes[0]); i++) {
         (void)http_router_register_not_implemented(s_placeholder_routes[i].path,
@@ -770,11 +1040,12 @@ esp_err_t sync_server_start(const sync_server_config_t *cfg)
 
 esp_err_t sync_server_stop(void)
 {
-    for (size_t i = 0; i < SYNC_SSE_MAX_CLIENTS; i++) {
-        if (s_sse_queues[i] != NULL) {
-            sse_unregister(s_sse_queues[i]);
-        }
-    }
+    /*
+     * Only detach the queues: the SSE tasks are still waiting on them, and a
+     * queue that is deleted under a waiting task is undefined behaviour. Each
+     * task deletes its own queue when the socket dies.
+     */
+    sse_detach_all();
 
     if (s_server == NULL) {
         return ESP_OK;

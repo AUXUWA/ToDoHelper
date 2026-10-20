@@ -20,6 +20,7 @@
 
 #include "esp_err.h"
 #include "esp_event.h"
+#include "cJSON.h"
 
 #include "sys_err.h"
 #include "sys_keys.h"
@@ -225,6 +226,41 @@ size_t sys_heap_largest_internal(void);
  * `ESP_ERROR_CHECK`. See AGENT.md 9.0.5 and `sys_json.c`.
  */
 void sys_json_use_psram(void);
+
+/**
+ * @brief 解析 JSON，但限制嵌套深度。**解析外部输入时一律用它，不要用 cJSON_Parse()。**
+ *
+ * **为什么 cJSON 自带的 1000 层上限在本工程里远远不够**
+ *
+ * - cJSON 1.7.19 的 `CJSON_NESTING_LIMIT` 默认 **1000**
+ *   （`managed_components/espressif__cjson/cJSON/cJSON.h:137`），而
+ *   `parse_array()` / `parse_object()` 是**递归**调用 `parse_value()` 的。
+ * - 用 objdump 看编译产物（`riscv32-esp-elf-objdump -d
+ *   build/esp-idf/espressif__cjson/.../cJSON.c.obj`）：`parse_value` 的 prologue 是
+ *   `addi sp,sp,-96` —— **每深一层吃掉 96 字节栈**，1000 层最坏要 ~96 KB。
+ * - 而本工程的栈都很小：
+ *   - 开机主任务 `CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288`（`sdkconfig.defaults:49`）
+ *     → 12288 / 96 = **128 层**就爆；
+ *   - httpd 任务 `http_cfg.stack_size = 6144`
+ *     （`components/sync_server/src/sync_server.c:741`）→ **64 层**就爆。
+ * - `todos.json` 这类文件用户可以直接在 SD 卡上编辑，一个 `[`×200 的畸形文件就能让
+ *   设备**每次开机都崩**（AGENT.md §9.0.5 那一类故障）。
+ *
+ * 所以深度必须在**进 cJSON 之前**拦掉。实现方式是解析前自己扫一遍文本统计
+ * `{` / `[` 的嵌套深度（字符串字面量里的括号会被跳过），超限直接返回 NULL。
+ * **没有改 cJSON 组件本身**（`managed_components/espressif__cjson` 是外部依赖，
+ * 升级即丢）。
+ *
+ * @param json      待解析文本；NULL 直接返回 NULL
+ * @param max_depth 允许的最大嵌套深度（根容器算第 1 层）。待办这种两三层结构给
+ *                  **32** 就足够；给小了会误杀合法数据，给大了会逼近栈上限。
+ *                  小于 1 的值按 1 处理（至少允许 `{}` / `[]`）。
+ * @return 成功返回 cJSON 根节点，**调用方负责 `cJSON_Delete()`**（与 `cJSON_Parse()`
+ *         的约定一致）；失败返回 NULL —— 可能是深度超限，也可能是语法错误或内存不足。
+ *         调用方应当走「保留旧数据 / 空数据」的降级路径，**绝不能**因为解析失败
+ *         在开机路径上把设备带崩。
+ */
+cJSON *sys_json_parse(const char *json, int max_depth);
 
 #ifdef __cplusplus
 }

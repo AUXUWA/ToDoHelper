@@ -94,6 +94,17 @@ typedef struct {
     /** true when `/interpretations` specifically was refused, tracked apart from
      *  the note/phrase pair (whose refusal sets `unavailable`). */
     bool meaning_unavailable;
+    /** true when the last enrichment attempt was conclusive: every endpoint
+     *  answered (even with "no data" or "not in scope"), so asking again
+     *  cannot produce anything new.
+     *
+     *  This is what makes the cache usable: without it, a word the API simply
+     *  has nothing for would be fetched again on every card view. */
+    bool fetched;
+    /** true when the last `/interpretations` attempt died on the transport
+     *  (timeout, connection reset) rather than being answered. Only then is a
+     *  retry worth another round trip. */
+    bool meaning_retryable;
 } mm_cache_entry_t;
 
 static mm_cache_entry_t *s_cache;
@@ -323,7 +334,9 @@ static esp_err_t mm_post(const char *path, const char *body, cJSON **out_root)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    cJSON *root = cJSON_Parse(resp.buf);
+    /* The reply is external input: parse it with a depth limit so a malformed
+     * answer cannot blow the stack of the worker that asked for it (roadmap B3). */
+    cJSON *root = sys_json_parse(resp.buf, 32);
     free(resp.buf);
     if (root == NULL) {
         SYS_LOGW(TAG, "POST %s: response is not JSON", path);
@@ -432,9 +445,10 @@ static esp_err_t mm_get(const char *path, const char *query, cJSON **out_root)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    cJSON *root = cJSON_Parse(resp.buf);
+    cJSON *root = sys_json_parse(resp.buf, 32);
     free(resp.buf);
     if (root == NULL) {
+        SYS_LOGW(TAG, "GET %s: response is not JSON", path);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -781,7 +795,7 @@ static void mm_cache_load(void)
         return;
     }
 
-    cJSON *root = cJSON_Parse(text);
+    cJSON *root = sys_json_parse(text, 32);
     free(text);
     if (root == NULL) {
         SYS_LOGW(TAG, "enrich cache is not valid JSON; starting empty");
@@ -812,6 +826,17 @@ static void mm_cache_load(void)
                     cJSON_GetObjectItemCaseSensitive(entry, "meaning_unavailable");
                 dst->meaning_unavailable =
                     cJSON_IsBool(meaning_unavailable) && cJSON_IsTrue(meaning_unavailable);
+                /* "fetched" was added in v1.5.0. An entry written by an older
+                 * firmware does not have it: such an entry is treated as "not
+                 * conclusive", so it is fetched once more and then rewritten
+                 * with the flag. Self-healing, and only for words the old
+                 * cache knows nothing about. */
+                const cJSON *fetched = cJSON_GetObjectItemCaseSensitive(entry, "fetched");
+                dst->fetched = cJSON_IsBool(fetched) && cJSON_IsTrue(fetched);
+                const cJSON *meaning_retryable =
+                    cJSON_GetObjectItemCaseSensitive(entry, "meaning_retryable");
+                dst->meaning_retryable =
+                    cJSON_IsBool(meaning_retryable) && cJSON_IsTrue(meaning_retryable);
                 if (dst->spelling[0] != '\0') {
                     index++;
                 }
@@ -856,6 +881,12 @@ static void mm_cache_save(void)
         }
         if (src->meaning_unavailable) {
             cJSON_AddBoolToObject(obj, "meaning_unavailable", true);
+        }
+        if (src->fetched) {
+            cJSON_AddBoolToObject(obj, "fetched", true);
+        }
+        if (src->meaning_retryable) {
+            cJSON_AddBoolToObject(obj, "meaning_retryable", true);
         }
         cJSON_AddItemToArray(entries, obj);
     }
@@ -976,6 +1007,34 @@ static esp_err_t mm_fetch_field(const char *path, const char *voc_id,
     return result;
 }
 
+/**
+ * Is this answer conclusive?
+ *
+ * "Conclusive" means the API answered: it either gave the data, said "there is
+ * nothing for this word", said "your token may not read this", or answered with
+ * an error envelope. Asking again with the same token cannot produce anything
+ * new, so the cache may answer from then on.
+ *
+ * Only the transport failures (timeout, connection reset) are worth another
+ * try - and only for the field that failed. Everything else being treated as
+ * retryable would bring back the "four HTTPS round trips per card view" that
+ * the cache exists to avoid.
+ */
+static bool mm_answer_final(esp_err_t err)
+{
+    switch (err) {
+    case ESP_OK:
+    case ESP_ERR_NOT_FOUND:        /**< the API answered: there is no data */
+    case ESP_ERR_NOT_SUPPORTED:    /**< the token may not read this endpoint */
+    case ESP_ERR_INVALID_STATE:    /**< the token was rejected */
+    case ESP_ERR_INVALID_RESPONSE: /**< the API answered with an error envelope */
+    case ESP_ERR_INVALID_SIZE:     /**< the answer does not fit - deterministic */
+        return true;
+    default:
+        return false;               /**< transport: timeout, reset, ... */
+    }
+}
+
 esp_err_t maimemo_fetch_meaning(const char *spelling, char *out, size_t len)
 {
     if (spelling == NULL || spelling[0] == '\0' || out == NULL || len == 0) {
@@ -1045,13 +1104,20 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
     mm_cache_entry_t *cached = mm_cache_find(spelling);
     if (cached != NULL) {
         /*
-         * Serve from cache when there is anything to serve. Note that
-         * `unavailable` (notes/phrases refused) no longer short-circuits the
-         * whole call: `/interpretations` has its own scope, so a token that
-         * cannot read 助记 may still be able to read 释义, and those words are
-         * exactly the ones that need it most (they are missing from the local
-         * book). Only when *both* halves are known-unobtainable is the answer
-         * final.
+         * Cache hit rules (v1.5.0 fix).
+         *
+         * The old condition was
+         *     have_text && (meaning_unavailable || meaning != "" || unavailable)
+         * i.e. "we have a mnemonic but no 释义, and 释义 was not refused" -> **miss**.
+         * That is exactly the shape of a study-scoped token (助记 readable,
+         * 释义 empty), so every card of that kind re-ran four HTTPS round trips
+         * and rewrote the whole enrich.json - while the user was *flipping
+         * through* the cards.
+         *
+         * The rule now: the cache answers whenever it holds anything at all,
+         * or when the previous attempt was conclusive (the API answered "there
+         * is nothing here"). Only a request that died on the transport leaves
+         * the entry open for a retry.
          */
         const bool have_text = cached->mnemonic[0] != '\0' ||
                                cached->example[0] != '\0' ||
@@ -1061,14 +1127,15 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
             xSemaphoreGive(s_lock);
             return ESP_ERR_NOT_SUPPORTED;   /* already known unobtainable */
         }
-        if (have_text && (cached->meaning_unavailable || cached->meaning[0] != '\0' ||
-                          cached->unavailable)) {
+        if (!cached->meaning_retryable && (have_text || cached->fetched)) {
             strlcpy(out->mnemonic, cached->mnemonic, sizeof(out->mnemonic));
             strlcpy(out->example, cached->example, sizeof(out->example));
             strlcpy(out->meaning, cached->meaning, sizeof(out->meaning));
             out->from_cache = true;
             xSemaphoreGive(s_lock);
-            return ESP_OK;
+            /* Nothing to serve and nothing more to ask for: same answer as a
+             * fresh lookup that found nothing. */
+            return have_text ? ESP_OK : ESP_ERR_NOT_FOUND;
         }
     }
     xSemaphoreGive(s_lock);
@@ -1107,6 +1174,12 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
     const bool out_of_scope = (notes_err == ESP_ERR_NOT_SUPPORTED &&
                                phrases_err == ESP_ERR_NOT_SUPPORTED);
     const bool meaning_out_of_scope = (meaning_err == ESP_ERR_NOT_SUPPORTED);
+    /* Whether the attempt was conclusive decides if the cache may answer next
+     * time (see the hit rules in maimemo_enrich). */
+    const bool conclusive = mm_answer_final(notes_err) &&
+                            mm_answer_final(phrases_err) &&
+                            mm_answer_final(meaning_err);
+    const bool meaning_retryable = !mm_answer_final(meaning_err);
     SYS_LOGD(TAG, "'%s': 助记=%s 例句=%s 释义=%s%s", spelling,
              esp_err_to_name(notes_err), esp_err_to_name(phrases_err),
              esp_err_to_name(meaning_err),
@@ -1126,11 +1199,35 @@ esp_err_t maimemo_enrich(const char *spelling, maimemo_enrich_t *out)
         slot = mm_cache_add(spelling);
     }
     if (slot != NULL) {
-        strlcpy(slot->mnemonic, out->mnemonic, sizeof(slot->mnemonic));
-        strlcpy(slot->example, out->example, sizeof(slot->example));
-        strlcpy(slot->meaning, out->meaning, sizeof(slot->meaning));
-        slot->unavailable = out_of_scope;
-        slot->meaning_unavailable = meaning_out_of_scope;
+        /*
+         * Only a field whose request actually answered may overwrite the cache.
+         *
+         * A timeout must not wipe what an earlier, successful lookup had
+         * stored - otherwise one flaky network moment loses the mnemonic for
+         * good and the next card view has to fetch everything again. The same
+         * applies to the scope flags: "not in scope" is permanent, so a later
+         * transport error must not clear it.
+         */
+        if (mm_answer_final(notes_err)) {
+            strlcpy(slot->mnemonic, out->mnemonic, sizeof(slot->mnemonic));
+            slot->unavailable = out_of_scope;
+        } else if (slot->mnemonic[0] != '\0') {
+            /* Keep serving what we already know. */
+            strlcpy(out->mnemonic, slot->mnemonic, sizeof(out->mnemonic));
+        }
+        if (mm_answer_final(phrases_err)) {
+            strlcpy(slot->example, out->example, sizeof(slot->example));
+        } else if (slot->example[0] != '\0') {
+            strlcpy(out->example, slot->example, sizeof(out->example));
+        }
+        if (mm_answer_final(meaning_err)) {
+            strlcpy(slot->meaning, out->meaning, sizeof(slot->meaning));
+            slot->meaning_unavailable = meaning_out_of_scope;
+        } else if (slot->meaning[0] != '\0') {
+            strlcpy(out->meaning, slot->meaning, sizeof(out->meaning));
+        }
+        slot->fetched = conclusive;
+        slot->meaning_retryable = meaning_retryable;
         mm_cache_save();
     }
     xSemaphoreGive(s_lock);

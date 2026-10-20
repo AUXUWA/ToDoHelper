@@ -225,9 +225,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return http_reply_bad_request(req, "missing body");
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = sys_json_parse(body, 32);
     free(body);
     if (root == NULL) {
+        SYS_LOGW(TAG, "config body is not valid JSON");
         return http_reply_bad_request(req, "invalid json");
     }
 
@@ -522,9 +523,10 @@ static esp_err_t push_post_handler(httpd_req_t *req)
     if (http_read_body(req, &body, NULL) != ESP_OK) {
         return http_reply_bad_request(req, "missing body");
     }
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = sys_json_parse(body, 32);
     free(body);
     if (root == NULL) {
+        SYS_LOGW(TAG, "push body is not valid JSON");
         return http_reply_bad_request(req, "invalid json");
     }
 
@@ -688,6 +690,18 @@ typedef struct {
     size_t count;
 } advance_job_t;
 
+static void advance_job_free(advance_job_t *job)
+{
+    if (job == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < job->count; i++) {
+        free(job->spellings[i]);
+    }
+    free(job->spellings);
+    free(job);
+}
+
 static void advance_worker(httpd_req_t *req, void *arg)
 {
     advance_job_t *job = (advance_job_t *)arg;
@@ -707,18 +721,9 @@ static void advance_worker(httpd_req_t *req, void *arg)
                  esp_err_to_name(err));
         (void)http_reply_json(req, 500, "advance words", json);
     }
-}
-
-static void advance_job_free(advance_job_t *job)
-{
-    if (job == NULL) {
-        return;
-    }
-    for (size_t i = 0; i < job->count; i++) {
-        free(job->spellings[i]);
-    }
-    free(job->spellings);
-    free(job);
+    /* The job and the spellings it owns belong to the worker: the handler has
+     * long returned, so nobody else can free them. */
+    advance_job_free(job);
 }
 
 /**
@@ -743,9 +748,10 @@ static esp_err_t advance_post_handler(httpd_req_t *req)
     if (http_read_body(req, &body, NULL) != ESP_OK) {
         return http_reply_bad_request(req, "missing body");
     }
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = sys_json_parse(body, 32);
     free(body);
     if (root == NULL) {
+        SYS_LOGW(TAG, "advance body is not valid JSON");
         return http_reply_bad_request(req, "invalid json");
     }
 

@@ -235,6 +235,23 @@ I (xxx) TH:word: memo wordbook written: 55 cards, 2043 B
 - `word_review()` 找不到本地记录 → 写进**学习记录**（见下），不再只是打一行 DEBUG 日志；
 - `page_word.c` 的 **uplink** 路径把它排进墨墨复习计划（见 `maimemo_client` 方案 D）。
 
+**⚠️ 云端独占词的 id 全都是 `WORD_ID_CLOUD`，所以 id 说明不了"用户刚评的是哪个词"**（v1.5.0 修）。
+`word_review()` 原来靠"遍历队列找第一个 id == `WORD_ID_CLOUD` 的"来取拼写 —— 那必然是**队列里第一个**
+云端词，而不是用户眼前这张卡，于是 `review_log.jsonl` 里每一条记录的词都是错的。
+现在 `word_next()` 记住自己发出的那张卡（`s_current_spelling` / `s_current_id`），
+`word_review()` 把**这个拼写**显式交给 `word_history_append()`；取不到拼写时**宁可不写**，
+也不写一个猜出来的词（记一条 WARN）。
+
+### ⚠️ 异步 worker 的参数必须按值传递（v1.5.0 修）
+
+`word_run_async()` 把 socket 交给 worker 任务，handler 立刻返回。**worker 的参数因此不能在
+handler 的栈上**：handler 返回后栈帧被 httpd 任务复用，worker 再去解引用就是 use-after-return
+（表现为"接口随机返回空 / 几条 / NO_MEM"，取决于时序）。
+
+规矩：**worker 的参数一律按值传**——用 `word_run_async_copy()` 把参数**复制进 job**，
+job 由 worker 拥有并释放。只有"堆上分配、所有权明确转移给 worker"的参数才能传指针
+（`maimemo_http.c` 的 `strdup` 拼写就是这个套路）。
+
 ## 设备端学习记录 `words/review_log.jsonl`（v1.4.0）
 
 `progress.json` 只存**每词最新状态**，回答不了"今天背了什么、结果如何"。而墨墨开放 API
@@ -259,6 +276,19 @@ I (xxx) TH:word: memo wordbook written: 55 cards, 2043 B
   绝不能出现在评分路径上；空间由用户在网页点「清空记录」回收。
 - `word_history_read(out, max, &count, today_only)` 只解析需要的那部分；`today_only`
   用 `day_start_stamp()`（`sys_time_ts()` 已含时区偏移，所以是整除 86400）。
+
+### 追加的三条 durability 规矩（v1.5.0 修）
+
+1. **写失败要把行放回队列**：排空时是先出队再写盘（这样两个排空者不会写重同一行），
+   所以写失败时那一行必须**放回队首**，否则一次 FAT 错误就永久丢掉一条记录。
+2. **断电撕裂的半行要先封口**：掉电可能留下一个没有换行符的半行，下一次追加会**粘在它后面**，
+   读取端按 `\n` 切分就会把两条记录一起跳过。追加前先看文件尾是不是完整行；
+   不是就先补一个 `\n`。这个判断只做一次并记住（我们追加的行总是以 `\n` 结尾），
+   只有追加本身失败时才需要重新判断。
+3. **清空后不需要封口**：`word_history_clear()` 删掉文件，尾部状态随之重置。
+
+`POST /api/v1/words/history {"clear":true}` 的**删除动作在 worker 里做**（v1.5.0 修）：
+在 httpd 任务里同步删 SD 卡文件会卡住唯一的 httpd 任务（`AGENT.md §9.0.1`）。
 
 ## 今日队列的构建顺序
 
@@ -294,6 +324,11 @@ I (xxx) TH:word: memo wordbook written: 55 cards, 2043 B
    `word_review()` 会把该错误原样返回给调用方。
 5. **事件**：`WORD_EVENT` 的 `LOADED`（payload `size_t` 词数）、`REVIEWED`（`uint32_t id`）、
    `PROGRESS_SAVED`（无 payload）、`LOAD_FAILED`（`esp_err_t`）。
+6. **解析外部输入一律用 `sys_json_parse(json, 32)`**（v1.5.0）：词库文件、`progress.json`、
+   `review_log.jsonl` 的每一行、以及三个 HTTP 请求体都不再用裸 `cJSON_Parse()`。
+   cJSON 1.7.19 的嵌套上限是 1000、每层约 96 字节栈帧，而开机主任务的栈只有 12 KB ——
+   一个畸形文件就能让设备**每次开机都崩**。`sys_json_parse()` 先扫文本统计嵌套深度，
+   超限直接返回 NULL，调用方走"保留旧数据 / 空数据"的降级路径。
 
 ## HTTP 路由表（需求 §8.4）
 
