@@ -688,9 +688,15 @@ static esp_err_t voice_event_cb(int32_t event_id, void *data)
         (void)ai_service_chat_async(text);
         break;
     }
-    case VOICE_EVENT_PLAY_DONE:
-        ui_toast("朗读完成");
+    case VOICE_EVENT_PLAY_DONE: {
+        const esp_err_t *err = (const esp_err_t *)data;
+        if (err != NULL && *err != ESP_OK) {
+            ui_toast("朗读失败：%s", esp_err_to_name(*err));
+        } else {
+            ui_toast("朗读完成");
+        }
         break;
+    }
     default:
         break;
     }
@@ -776,7 +782,8 @@ static esp_err_t ai_chat_create(lv_obj_t *parent)
                              sizeof(voice_recording_t), voice_event_cb);
     (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_ASR_DONE, VOICE_TEXT_MAX,
                              voice_event_cb);
-    (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, 0, voice_event_cb);
+    (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, sizeof(esp_err_t),
+                             voice_event_cb);
 
     SYS_LOGD(TAG, "ai chat page built");
     return ESP_OK;

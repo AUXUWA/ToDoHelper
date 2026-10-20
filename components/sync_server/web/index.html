@@ -2240,7 +2240,9 @@ $("ai-test").addEventListener("click", function () {
   box.hidden = false;
   out.textContent = "正在问…";
   $("ai-test").disabled = true;
-  api("/api/v1/ai/chat", {
+  /* The slow queue, not the page-wide one: an AI answer can take 45 s, and
+     on the shared queue it would hold up the todo polling as well. */
+  apiSlow("/api/v1/ai/chat", {
     method: "POST",
     body: JSON.stringify({ text: "用一句话打个招呼" }),
     timeoutMs: 60000

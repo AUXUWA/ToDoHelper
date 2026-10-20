@@ -60,6 +60,7 @@ static volatile bool s_playing;
 /** Audio bring-up state (see voice_service_ensure_audio()). */
 static volatile bool s_init_task_running;
 static volatile bool s_init_done;
+static volatile bool s_init_gave_up;
 static volatile esp_err_t s_init_result;
 static SemaphoreHandle_t s_init_sem;
 
@@ -166,6 +167,7 @@ esp_err_t voice_service_ensure_audio(void)
     }
     s_init_task_running = true;
     s_init_done = false;
+    s_init_gave_up = false;
     s_init_result = ESP_FAIL;
 
     if (xTaskCreate(audio_init_task, "th_audio", 4096, NULL, 4, NULL) != pdPASS) {
@@ -183,6 +185,10 @@ esp_err_t voice_service_ensure_audio(void)
     if (!s_init_done) {
         SYS_LOGW(TAG, "audio bring-up did not finish in %d ms; giving up on it",
                  (int)VOICE_INIT_TIMEOUT_MS);
+        /* The task is still running and may succeed later. Mark it as given up
+         * so its late result does not change the state behind the caller's
+         * back (the caller already answered "no audio hardware"). */
+        s_init_gave_up = true;
         s_init_task_running = false;
         return ESP_ERR_TIMEOUT;
     }
@@ -259,8 +265,16 @@ static void audio_init_task(void *arg)
 {
     (void)arg;
     ensure_audio();
+    if (s_init_gave_up) {
+        /* The caller already gave up on us; do not change the state now. */
+        SYS_LOGW(TAG, "audio bring-up finished after the caller gave up; ignored");
+        s_init_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
     s_init_result = (s_mic_ok || s_speaker_ok) ? ESP_OK : ESP_ERR_NOT_FOUND;
     s_init_done = true;
+    s_init_task_running = false;
     vTaskDelete(NULL);
 }
 
@@ -514,7 +528,8 @@ static esp_err_t play_mono_pcm(const int16_t *mono, size_t count)
     }
     s_playing = false;
 
-    (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, NULL, 0);
+    const esp_err_t play_result = ESP_OK;
+    (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, &play_result, sizeof(play_result));
     return ESP_OK;
 }
 
@@ -572,7 +587,14 @@ typedef struct {
     bool overflow;
 } voice_body_t;
 
-#define VOICE_MAX_RESPONSE (256 * 1024)
+/**
+ * The biggest speech response we accept.
+ *
+ * A TTS answer is raw PCM: 16 kHz / 16 bit / mono = 32 KB per second, so
+ * 256 KB was only 8 seconds of speech - and anything longer was thrown away
+ * whole. 1 MB gives ~32 seconds, which covers a normal answer.
+ */
+#define VOICE_MAX_RESPONSE (1024 * 1024)
 
 static esp_err_t voice_http_event(esp_http_client_event_t *evt)
 {
@@ -795,6 +817,12 @@ esp_err_t voice_service_speak(const char *text)
 
     const esp_err_t play_err = play_mono_pcm((const int16_t *)response, samples);
     free(response);
+
+    /* Tell the UI how it went: a silent failure (no sound, no message) is the
+     * worst kind - the user cannot tell "it did not work" from "it is talking". */
+    if (play_err != ESP_OK) {
+        (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, &play_err, sizeof(play_err));
+    }
     return play_err;
 }
 

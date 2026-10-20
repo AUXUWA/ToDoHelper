@@ -43,7 +43,7 @@ ESP_EVENT_DECLARE_BASE(VOICE_EVENT);
 typedef enum {
     VOICE_EVENT_RECORD_DONE = 0, /**< payload: voice_recording_t */
     VOICE_EVENT_ASR_DONE,        /**< payload: const char *text ("" on failure) */
-    VOICE_EVENT_PLAY_DONE,       /**< no payload */
+    VOICE_EVENT_PLAY_DONE,       /**< payload: esp_err_t (ESP_OK = played) */
     VOICE_EVENT_WAKE,            /**< no payload: user pressed to talk */
 } voice_event_id_t;
 
