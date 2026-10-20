@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "wifi_manager.h"
+#include "esp_attr.h"
 
 static const char *TAG = "page_wifi";
 
@@ -112,7 +113,7 @@ static void render_scan_list(void)
     for (size_t i = 0; i < shown; i++) {
         /* AP records are only valid until the next scan, so copy the SSID into
          * a per-row buffer that lives as long as the widget. */
-        static char ssid_bufs[WIFI_MANAGER_MAX_APS][WIFI_MANAGER_SSID_MAX + 1];
+        static EXT_RAM_BSS_ATTR char ssid_bufs[WIFI_MANAGER_MAX_APS][WIFI_MANAGER_SSID_MAX + 1];
         strlcpy(ssid_bufs[i], aps[i].ssid[0] ? aps[i].ssid : "(隐藏网络)", sizeof(ssid_bufs[i]));
 
         lv_obj_t *row = lv_button_create(s_scan_list);

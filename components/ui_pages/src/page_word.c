@@ -21,6 +21,7 @@
 
 #include "maimemo_client.h"
 #include "word_service.h"
+#include "esp_attr.h"
 
 static const char *TAG = "page_word";
 
@@ -32,7 +33,7 @@ static lv_obj_t *s_grade_bar;
 /** 助记/例句 fetched from MaiMemo (plan B); hidden when unavailable. */
 static lv_obj_t *s_enrich_label;
 
-static word_item_t s_word;
+static EXT_RAM_BSS_ATTR word_item_t s_word;
 static bool s_have_word;
 static bool s_revealed;
 
@@ -43,7 +44,7 @@ static bool s_revealed;
  * updated from that task via lv_async_call, never from inside the fetch (AGENT.md
  * 9.0.1: LVGL work must happen on the LVGL task).
  */
-static maimemo_enrich_t s_enrich;
+static EXT_RAM_BSS_ATTR maimemo_enrich_t s_enrich;
 static bool s_enrich_valid;
 static bool s_enrich_pending;
 
@@ -76,7 +77,7 @@ static bool s_enrich_pending;
  */
 #define WORD_UPLINK_MAX 24
 
-static char s_uplink[WORD_UPLINK_MAX][WORD_SPELLING_MAX];
+static EXT_RAM_BSS_ATTR char s_uplink[WORD_UPLINK_MAX][WORD_SPELLING_MAX];
 static size_t s_uplink_count;
 static bool s_uplink_running;
 

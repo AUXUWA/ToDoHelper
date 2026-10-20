@@ -20,6 +20,7 @@
 #include "lwip/ip_addr.h"
 
 #include "th_bsp.h"
+#include "esp_attr.h"
 
 static const char *TAG = "wifi";
 
@@ -81,7 +82,7 @@ static uint8_t s_last_reason;
 static int s_reconnect_left;
 static bool s_allow_reconnect;
 
-static wifi_ap_info_t s_scan_cache[WIFI_SCAN_CACHE_MAX];
+static EXT_RAM_BSS_ATTR wifi_ap_info_t s_scan_cache[WIFI_SCAN_CACHE_MAX];
 static size_t s_scan_count;
 
 /* ------------------------------------------------------------------------- */

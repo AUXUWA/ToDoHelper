@@ -22,6 +22,7 @@
 
 #include "ai_service.h"
 #include "pages_internal.h"
+#include "esp_attr.h"
 
 static const char *TAG = "page_ai";
 
@@ -55,7 +56,7 @@ static bool s_waiting_reply;
 
 static lv_obj_t *s_stream_bubble;      /**< bubble currently receiving chunks */
 static lv_obj_t *s_stream_label;
-static char s_stream_text[AI_CHAT_STREAM_MAX];
+static EXT_RAM_BSS_ATTR char s_stream_text[AI_CHAT_STREAM_MAX];
 static size_t s_stream_len;
 static uint32_t s_last_scroll_ms;
 

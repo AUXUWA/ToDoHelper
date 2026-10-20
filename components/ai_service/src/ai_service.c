@@ -22,6 +22,7 @@
 
 #include "idle_face.h"
 #include "storage_manager.h"
+#include "esp_attr.h"
 
 static const char *TAG = "ai";
 
@@ -69,7 +70,7 @@ static bool s_save_history;
  */
 static ai_message_t *s_messages;
 static size_t s_message_count;
-static char s_last_reply[AI_MESSAGE_MAX];
+static EXT_RAM_BSS_ATTR char s_last_reply[AI_MESSAGE_MAX];
 
 static StaticSemaphore_t s_lock_buf;
 static SemaphoreHandle_t s_lock;

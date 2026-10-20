@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_attr.h"
 
 static const char *TAG = "http_router";
 
@@ -25,7 +26,7 @@ typedef struct {
     bool used;
 } http_route_t;
 
-static http_route_t s_routes[HTTP_ROUTER_MAX_ROUTES];
+static EXT_RAM_BSS_ATTR http_route_t s_routes[HTTP_ROUTER_MAX_ROUTES];
 static size_t s_route_count;
 static http_auth_check_t s_auth_check;
 

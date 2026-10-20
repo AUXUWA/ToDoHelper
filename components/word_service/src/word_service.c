@@ -22,6 +22,7 @@
 
 #include "maimemo_client.h"
 #include "sys_keys.h"
+#include "esp_attr.h"
 
 static const char *TAG = "word";
 
@@ -2068,7 +2069,7 @@ static bool s_history_full;
 #define WORD_HISTORY_QUEUE 16
 #define WORD_HISTORY_LINE_MAX 192
 
-static char s_history_queue[WORD_HISTORY_QUEUE][WORD_HISTORY_LINE_MAX];
+static EXT_RAM_BSS_ATTR char s_history_queue[WORD_HISTORY_QUEUE][WORD_HISTORY_LINE_MAX];
 static size_t s_history_head;   /**< next slot to write */
 static size_t s_history_len;    /**< entries currently queued */
 static StaticSemaphore_t s_history_lock_buf;

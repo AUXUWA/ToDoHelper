@@ -57,6 +57,7 @@
 #include "weather_service.h"
 #include "wifi_manager.h"
 #include "word_service.h"
+#include "esp_attr.h"
 
 static const char *TAG = "page_settings";
 
@@ -109,7 +110,7 @@ static char s_tz_state_text[64];
 #define INFO_ROW_COUNT 8
 
 static lv_obj_t *s_info_value[INFO_ROW_COUNT];
-static char s_info_cache[INFO_ROW_COUNT][80];
+static EXT_RAM_BSS_ATTR char s_info_cache[INFO_ROW_COUNT][80];
 
 /* ---- Security card ----------------------------------------------------- */
 

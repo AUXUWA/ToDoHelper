@@ -15,6 +15,7 @@
 #include "ui_fonts.h"
 #include "ui_internal.h"
 #include "ui_theme.h"
+#include "esp_attr.h"
 
 static const char *TAG = "ui_core";
 
@@ -76,7 +77,7 @@ static bool s_initialized;
 /** Page that was visible when the idle timer fired (FR6 11.4). */
 static ui_page_id_t s_page_before_idle = UI_PAGE_HOME;
 
-static ui_binding_t s_bindings[UI_MAX_BINDINGS];
+static EXT_RAM_BSS_ATTR ui_binding_t s_bindings[UI_MAX_BINDINGS];
 static esp_event_base_t s_event_bases[UI_MAX_EVENT_BASES];
 static size_t s_event_base_count;
 

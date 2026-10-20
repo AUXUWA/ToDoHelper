@@ -34,6 +34,22 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
+# WiFi 静态收发缓冲：16 → 10（IDF 在不用 PSRAM-for-WiFi 时的默认值）。
+#
+# esp32s31 的 WiFi 适配层把静态队列存储和所有 DMA 缓冲**硬钉在内部 RAM**
+# （IDF components/esp_wifi/esp32s31/esp_adapter.c），所以
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP 在这些缓冲上完全无效。
+# 每个缓冲约 1.6 KB（IDF components/esp_wifi/Kconfig），16 → 10 就是
+# 2 × 6 × 1.6 KB ≈ **19 KB 内部 DRAM**。
+#
+# 为什么重要：内部堆的最大连续块是 WiFi PHY 重新使能的硬需求（约 30 KB，
+# 见 AGENT.md 9.0.3），拿不到就 abort 重启。v1.7.0 上机实测：地址刚到时
+# 天气 / 墨墨 / 云端队列三个 TLS 握手并发，内部连续块不够，mbedTLS 报
+# -0x008D（PSA_ERROR_INSUFFICIENT_MEMORY）。把这 19 KB 拿回来正是解药。
+#
+# 约束：RX_BA_WIN=16 ≤ STATIC_RX_BUFFER_NUM << 1 = 20，IDF 的检查仍满足。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=10
 CONFIG_FREERTOS_HZ=1000
 # Lets the components that support it place their worker task stacks in PSRAM.
 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
