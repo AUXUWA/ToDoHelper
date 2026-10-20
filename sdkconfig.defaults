@@ -110,36 +110,58 @@ CONFIG_ESP_LVGL_ADAPTER_FREETYPE_SMALL_RENDER_POOL=y
 CONFIG_ESP_LVGL_ADAPTER_FREETYPE_MINIMAL_BUILD=y
 CONFIG_TODOHELPER_FONT_FREETYPE=y
 
-# FreeType 字形缓存：256 → 64。
+# FreeType 字形缓存：64 → 512（v1.8.5）。
 #
-# 这个缓存装的是**每一个用过的汉字的位图**（16 px 约 256 B，28 px 约 784 B，
-# 48 px 约 2.3 KB），而 LVGL 用的是 C 库的 malloc（CONFIG_LV_USE_CLIB_MALLOC=y），
-# 所以这些位图全部落在内部堆里（≤4096 B 的分配优先内部，见上面
-# CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL）。
+# 这个缓存装的是**每一个用过的（汉字, 字号）组合的位图**
+# （16 px 约 256 B，28 px 约 784 B，48 px 约 2.3 KB）。
 #
-# 缓存越大，界面越流畅（被挤掉的字形每一帧都要重新渲染，
-# FreeType 每个汉字约 100~200 µs）；但内部堆只有 290 KB，撑不住 256。
+# 关键事实（v1.8.5 在真机上查证）：LVGL 9 的 FreeType 是按
+# **（字体文件, 样式, 渲染模式）** 给缓存做 key 的，**不是按字号**——
+# 四个字号共用同一份缓存。所以这个上限是**整个界面共用**的预算：
+# 64 条 / 4 个字号 ≈ 每个字号只有 16 个字的位置，一屏 30~40 个汉字根本装不下，
+# 于是每个新字都要重新光栅化（读 SD 卡里的 TTF + FreeType 渲染，约 9 ms 一个字）。
 #
-# 真机实测（同一个固件，只改这一个数，绕开所有页面各走三遍）：
-#   256 → 内部堆掉到 **0 KB**（最大连续块 0 KB），设备崩；
-#   128 → 最低水位掉到 0 KB，分配失败，随时可能 panic；
-#   64  → 最低水位 31 KB，最大连续块 23 KB，绕完三遍还剩 114 KB；← 选它
-#   32  → 最低水位 54 KB，最大连续块 22~35 KB（更安全，但界面明显卡）
+# 真机实测（debug shell 的 bench 命令，同一段 30 个新汉字，同一个固件只改上限）：
+#   64  → 重绘 1.35 s      ← v1.8.4 就是这个，界面卡就是它
+#   512 → 重绘 65~99 ms    ← 现在这个
+# 缓存热了以后，同样的重绘只要 24~27 ms。
+# 切页也从 16~174 ms 降到 4~6 µs（切页慢的同一个原因：切页要画字）。
 #
-# 代价：被挤掉的字形要重新渲染。一屏 30~40 个汉字 → 每帧多几毫秒，
-# 滚动略慢但不掉帧；而「逛一遍页面就把内存吃光、然后崩掉」是不能接受的。
+# 之所以现在敢开 512，是因为位图**和缓存的元数据**都搬去了 PSRAM：
+#   - 位图：LVGL 的 font_draw_buf_handlers（components/ui_core/src/ui_font_mem.c）
+#   - 元数据：LVGL 换成自定义分配器（components/ui_core/src/ui_lv_mem.c），
+#     只有「画字」这一个区间里的分配走 PSRAM，其余分配行为一个字没动。
 #
-# 想回到 256（完全不卡），前提是**字形位图搬到 PSRAM**——
-# 试过把 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL 压到 128（让位图落 PSRAM），
-# 结果 **TLS 握手直接失败**（mbedtls_ssl_handshake 返回 -0x008D），
-# 所以这条路留给下一轮：只给 FreeType 一条通往 PSRAM 的路，别动全局的分配阈值。
-CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=64
+# **不要动全局的 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL。** 试过把它压到 128
+# （让所有小分配都落 PSRAM），结果 **TLS 握手直接失败**
+# （mbedtls_ssl_handshake 返回 -0x008D = 内存不足）。全局阈值一动，
+# mbedTLS 握手时的小分配也被赶去 PSRAM，连续块就不够了。
+#
+# 实测：整个界面用到 517 个（字形, 字号）组合、416 个位图。
+# 512 刚好装得下；上限可以用 NVS 键 "ft_glyph_cache" 在运行时调
+# （范围 16~4096，默认值见 components/ui_core/src/ui_fonts.c）。
+CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=512
 
 # Display / UI
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_FS=y
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_DECODER=y
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS=y
-CONFIG_LV_USE_CLIB_MALLOC=y
+# LVGL 的分配器改成我们自己写的（components/ui_core/src/ui_lv_mem.c）。
+#
+# 为什么要接管：字形缓存的**元数据**（红黑树节点 + 缓存条目 + draw_buf 结构）
+# 每个字形约 200 B，而整个界面用到 517 个（字形, 字号）组合 —— 光元数据就
+# 100 KB，内部堆一共才 290 KB，撑不住。
+#
+# 接管之后**平时一个字没动**（还是 malloc/realloc/free，行为与原来的
+# CONFIG_LV_USE_CLIB_MALLOC 完全一致），只有「画字」这一个区间里的分配
+# 走 PSRAM：那个区间由 FreeType 的两个回调（get_glyph_dsc / get_glyph_bitmap）
+# 包出来，区间里分配的正好就是字形缓存的元数据。
+#
+# 效果（真机，页面巡游三遍之后）：内部堆最大连续块 12 KB → **80 KB**，
+# 空闲 73 KB → **150 KB**。
+#
+# CONFIG_LV_USE_CLIB_MALLOC is not set
+CONFIG_LV_USE_CUSTOM_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y
 CONFIG_LV_USE_CLIB_SPRINTF=y
 CONFIG_LV_DEF_REFR_PERIOD=15

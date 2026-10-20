@@ -21,9 +21,13 @@ idf_component_register(
         "src/ui_core.c"
         "src/ui_theme.c"
         "src/ui_fonts.c"
+        "src/ui_font_mem.c"
+        "src/ui_lv_mem.c"
         "src/ui_statusbar.c"
         "src/ui_widgets.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
-    REQUIRES sys_utils bsp storage_manager lvgl esp_lvgl_adapter
+    # espressif__freetype: only for the FreeType headers behind LVGL's private
+    # header (lv_freetype_private.h), which the glyph-cache statistics need.
+    REQUIRES sys_utils bsp storage_manager lvgl esp_lvgl_adapter espressif__freetype
 )

@@ -20,12 +20,14 @@
 
 #include "ui_theme.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_lv_adapter.h"
 #include "storage_manager.h"
 
 #include "ui_fonts.h"
+#include "ui_font_mem.h"
 
 #include "storage_manager.h"
 #include "sys_utils.h"
@@ -45,6 +47,30 @@ static const uint16_t s_role_size[UI_FONT_ROLE_MAX] = {
     [UI_FONT_TITLE] = 28,
     [UI_FONT_HUGE] = 48,
 };
+
+/**
+ * Glyph-cache limit (entries of the bitmap cache) - **shared by all sizes**.
+ *
+ * LVGL 9's FreeType keys the cache on (file, style, render mode), not on the
+ * size: all four of our sizes come from the same .ttf, so they share ONE
+ * draw_data_cache and ONE metrics cache. The limit is therefore the budget for
+ * the whole UI, not per size - a limit of 64 with four sizes in use is really
+ * ~16 glyphs per size, and a screen shows more than that, so the cache
+ * thrashes and every new character has to be rasterised again (read the TTF
+ * from the SD card + render) - that is the jank.
+ *
+ * The bitmaps live in PSRAM (ui_font_mem.c) and so does the cache *metadata*
+ * (ui_lv_mem.c) - so the limit no longer decides how much internal RAM the
+ * fonts cost, it only decides how much PSRAM and how smooth the scrolling is.
+ * The limit is only a cap: the cache grows with what is actually drawn.
+ *
+ * The value can be overridden at runtime with the NVS key "ft_glyph_cache"
+ * (see ui_fonts_init) - that is how the number below was measured.
+ */
+#define UI_FONT_GLYPH_CACHE_CNT 512
+
+/** NVS key for the runtime override of the glyph cache limit. */
+#define UI_FONT_CACHE_NVS_KEY "ft_glyph_cache"
 
 /**
  * Font file inside <app_dir>/ that the embedded subset is written to.
@@ -150,6 +176,21 @@ static bool ft_load_from_file(void)
         return false;
     }
 
+    /* The cache limit is read when the *first* font of this file is created -
+     * all sizes share one cache - so set it before the loop. */
+    int32_t limit = UI_FONT_GLYPH_CACHE_CNT;
+    char limit_buf[16];
+    if (sys_config_get_str(UI_FONT_CACHE_NVS_KEY, limit_buf, sizeof(limit_buf)) == ESP_OK) {
+        limit = atoi(limit_buf);
+    }
+    if (limit < 16 || limit > 4096) {
+        SYS_LOGW(TAG, "glyph cache limit %d out of range, using %d", (int)limit,
+                 UI_FONT_GLYPH_CACHE_CNT);
+        limit = UI_FONT_GLYPH_CACHE_CNT;
+    }
+    ui_font_mem_set_cache_cnt((uint32_t)limit);
+    SYS_LOGI(TAG, "glyph cache limit: %d entries", (int)limit);
+
     for (int i = 0; i < UI_FONT_ROLE_MAX; i++) {
         const esp_lv_adapter_ft_font_config_t cfg =
             ESP_LV_ADAPTER_FT_FONT_FILE_CONFIG(path, s_role_size[i],
@@ -237,6 +278,10 @@ void ui_fonts_init(void)
     }
     s_initialized = true;
 
+    /* 必须在任何 FreeType 字体被创建之前：字形位图要走 PSRAM，
+     * 否则缓存开到 512 时内部堆会被吃光。详见 ui_font_mem.c。 */
+    (void)ui_font_mem_init();
+
     memset(s_fonts, 0, sizeof(s_fonts));
 
 #if CONFIG_TODOHELPER_FONT_FREETYPE
@@ -265,6 +310,8 @@ void ui_fonts_init(void)
         if (s_fonts[i] == NULL) {
             s_fonts[i] = builtin_font((ui_font_role_t)i);
         }
+        /* 让 ftstats 能报出各字号的字形缓存情况（内置字体会被自动忽略）。 */
+        ui_font_mem_track(s_fonts[i]);
     }
 }
 
@@ -292,6 +339,10 @@ void ui_fonts_reload(void)
         }
     }
 #endif
+
+    /* The fonts are gone now - the pointers the memory manager still holds
+     * would dangle. */
+    ui_font_mem_forget_all();
 
     memset(s_fonts, 0, sizeof(s_fonts));
     s_initialized = false;

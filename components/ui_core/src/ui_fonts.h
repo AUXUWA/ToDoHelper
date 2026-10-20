@@ -13,6 +13,7 @@
 
 #include "lvgl.h"
 
+#include "ui_font_mem.h"
 #include "ui_theme.h"
 
 #ifdef __cplusplus

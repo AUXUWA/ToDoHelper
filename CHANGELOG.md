@@ -12,6 +12,56 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.8.5] — 2026-10-21
+
+**界面流畅度还回去了。** 这一轮先把「卡」变成数字，再照着数字改。
+纯性能修复 + 加测量工具（按 `AGENT.md §8.1` 的判据是 **PATCH**）。
+
+### Fixed
+
+- **字形缓存太小，界面每个字都要重新光栅化。**
+  查出来的真相有三层：
+  1. LVGL 9 的 FreeType 按**（字体文件, 样式, 渲染模式）**给缓存做 key，
+     **没有把字号算进去** —— 四个字号（16/20/28/48 px）**共用同一份位图缓存**。
+     所以 `CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=64` 的真实含义是
+     「四个字号加起来 64 个字」，每个字号平均只有 16 个位置，
+     而一屏就有 30~40 个汉字 → 缓存永远不够用。
+  2. 光栅化一个字要 **9 ms**（FreeType 自己只要 100~200 µs，其余是从 SD 卡读 TTF）。
+  3. 卡的不只是滚动，**切页也一样卡**（16~174 ms）—— 同一个原因。
+  现在缓存上限 **64 → 512**（实测整个界面用到 517 个组合、416 个位图），
+  并且位图与缓存元数据都搬去了 PSRAM（内部堆腾得出来）。
+  **实测：30 个新汉字的一次重绘 1.35 s → 65~99 ms（快 14~20 倍）**，
+  缓存热了以后 24~27 ms；切页 16~174 ms → **4~6 µs**。
+
+### Added
+
+- **只给 FreeType 一条通往 PSRAM 的路**（不动全局分配阈值）：
+  - `components/ui_core/src/ui_font_mem.c` —— 把 LVGL 的 `font_draw_buf_handlers`
+    换成显式带 `MALLOC_CAP_SPIRAM` 的 `heap_caps_malloc`，
+    **不经过 `malloc()`**，所以 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 一个字没动
+    （v1.8.2 试过压它，结果 **TLS 握手失败** `-0x008D`）。
+  - `components/ui_core/src/ui_lv_mem.c` —— LVGL 换成 `CONFIG_LV_USE_CUSTOM_MALLOC=y`，
+    自己实现分配器：**平时跟 `malloc()` 完全一样**，只有「画字」这一个区间
+    （由 FreeType 的 `get_glyph_dsc` / `get_glyph_bitmap` 两个回调包出来）
+    改走 PSRAM —— 区间里分配的正好就是字形缓存的元数据。
+  - 效果（页面巡游三遍之后）：内部堆最大连续块 **12 KB → 80 KB**，
+    空闲 **73 KB → 150 KB**，最低水位 38 KB → 109 KB。
+- **三条测速工具**（这一轮的结论全靠它们）：
+  - debug shell `bench <target> <text> [index] [repeats]` ——
+    设标签文本 → `lv_refr_now()` 同步重绘 → 打印耗时（µs）；
+  - debug shell `ftstats` —— 打印 FreeType 字形缓存的条目数；
+  - debug shell `page` —— 现在会打印切页耗时；
+  - `tools/page_tour.py`（巡游所有页面并打印堆）、
+    `tools/bench_glyphs.py`（连续用新汉字测重绘耗时）。
+- **字形缓存上限可以在运行时调**：NVS 键 `ft_glyph_cache`（范围 16~4096），
+  不用重新编译就能对比。
+
+### Changed
+
+- 内部堆的账变好了：开机后 166 KB / 最大连续块 122 KB → **186 KB / 140 KB**。
+
+---
+
 ## [1.8.4] — 2026-10-21
 
 **独立复核员在 v1.8.3 里查出的四个问题，其中一个是越界读。**

@@ -741,9 +741,14 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
 
     → 所以这个数**必须**压到 32。代价是被挤掉的字形要重新渲染
     （FreeType 每个汉字约 100~200 µs，一屏 30~40 个汉字 → 每帧多几毫秒）。
+    → **（v1.8.5 更正：这里的结论只对了一半。真正卡的原因不是「位图太大」，
+    而是「缓存是整个界面共用一份、64 条根本不够」—— 见 §9.0.1.8 第 17~18 条。
+    现在这个数是 512，位图和元数据都搬去了 PSRAM。）**
     → 这个实验用的「自动巡览页面 + 打印堆」是临时加在 app_main.c 里的，
     **不要提交**。它也证明了另一件事：**页面巡览是个很好的内存体检**，
     比单看某个页面的读数有用得多。
+    → v1.8.5 把它做成了常驻工具：`tools/page_tour.py`（走一遍所有页面并打印堆），
+    再加上 debug shell 的 `ftstats`（字形缓存条目数）和 `bench`（重绘耗时）。
 16. **中文字库放在 SD 卡上，SD 卡挂不上就变成方块。**
     字库 `fonts/ui_cjk.ttf`（1.25 MB）在卡上，挂载失败 → FreeType 用不了 →
     退回内嵌的 GB2312 一级子集（~2500 字）→ **生僻字变成方块**。
@@ -753,6 +758,68 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
     反初始化，所以重试是安全的）。
     → 还没做的更彻底的一步：**把字库复制一份到内部 flash**，
     让文字渲染彻底不依赖 SD 卡。
+
+### 9.0.1.8 v1.8.5 补进来的五条实测结论
+
+17. **LVGL 9 的 FreeType 字形缓存是「整个界面共用一份」，不是每个字号一份。**
+    缓存的 key 是 **（字体文件, 样式, 渲染模式）**，`lv_freetype.c` 里的
+    `search_key` **没有把字号算进去**。四个字号（16/20/28/48 px）来自同一个
+    .ttf，所以**共用同一份位图缓存**。
+    → 所以 `CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT=64` 的真实含义是
+    「四个字号加起来 64 个字」，每个字号平均只有 16 个位置 ——
+    而一屏就有 30~40 个汉字，缓存永远不够用。
+    → 怎么一眼看出来：`ftstats`（debug shell 新增）把每个字号的缓存条目数
+    都打出来，**四个数字一模一样**就说明是共用一份。
+    → 教训：改 LVGL 的行为之前，先把它到底怎么组织的读一遍
+    （`managed_components/lvgl__lvgl/src/libs/freetype/lv_freetype.c`），
+    不要按名字猜。
+18. **画一个字要 9 ms，而且卡的不只是滚动，切页也一样卡。**
+    真机实测（debug shell 新增的 `bench` 命令：设标签文本 → `lv_refr_now()`
+    同步重绘 → 打印耗时）：30 个没缓存过的汉字，一次重绘 **1.35 s**
+    （缓存上限 64）→ 约 **9 ms 一个字**。FreeType 渲染本身只有 100~200 µs，
+    其余是**从 SD 卡读 TTF**。
+    → 顺带查清了一件想当然的事：切页慢（16~174 ms）**不是**因为
+    v1.8.3 把页面控件隐藏时销毁了 —— 缓存热了以后切页只要 **4~6 µs**，
+    慢的同样是画字。
+    → 教训：**「测出来慢」和「想当然慢」经常不是一回事**，
+    而 `lv_refr_now()` 是把「重绘耗时」变成数字的最便宜办法
+    （光设文本不触发画字，HTTP 往返里根本看不到光栅化的成本）。
+19. **只要给一条窄路，不必动全局的分配阈值。**
+    v1.8.2 试过把 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 压到 128，
+    结果 **TLS 握手失败**（`-0x008D`）。v1.8.5 换了个做法：
+    - **位图**走 LVGL 的 `font_draw_buf_handlers`（`lv_draw_buf_get_font_handlers()`），
+      换成显式带 `MALLOC_CAP_SPIRAM` 的 `heap_caps_malloc` ——
+      **不经过 `malloc()`**，全局阈值一个字没动；
+    - **元数据**（红黑树节点 + 缓存条目 + draw_buf 结构，每个字形约 200 B，
+      517 个组合就是 100 KB）走 `CONFIG_LV_USE_CUSTOM_MALLOC=y` 自定义分配器，
+      但**只有「画字」这一个区间**改道（区间由 FreeType 的
+      `get_glyph_dsc` / `get_glyph_bitmap` 两个回调包出来），
+      其余分配行为跟原来一模一样。
+    → 效果：页面巡游三遍之后，内部堆最大连续块 12 KB → **80 KB**，
+    空闲 73 KB → **150 KB**。
+    → 关键前提（查过 IDF 源码）：`CONFIG_SPIRAM_USE_CAPS_ALLOC` 没开也不妨碍
+    —— PSRAM 仍然被 `esp_psram_extram_add_to_heap_allocator()` 用
+    `MALLOC_CAP_SPIRAM` 注册进了 heap_caps 分配器；而 ALWAYSINTERNAL 的限制
+    只作用在 `heap_caps_malloc_default()`（普通 `malloc()`），
+    显式带 caps 的 `heap_caps_malloc()` 走 `heap_caps_malloc_base()`，不受它管。
+    → 教训：**全局开关是最后手段**。先找那条「只有它需要」的窄路。
+20. **位图搬走不等于缓存搬走：元数据才是内部堆的大头。**
+    位图只是一半，缓存的元数据每个字形还要约 200 B 内部堆。
+    只搬位图的话，缓存开到 256 一样会把内部堆吃光（v1.8.2 的实测就是这样）。
+    → 教训：算一笔内存账时，**要把「一项开销」拆干净**：
+    数据、索引、每条记录的固定开销，三块分别算。
+21. **LVGL 的分配器可以自己接管，但「什么时候改道」要自己定。**
+    `CONFIG_LV_USE_CUSTOM_MALLOC=y` 之后，LVGL 不再提供
+    `lv_malloc_core` 等函数，得自己实现（照着
+    `managed_components/lvgl__lvgl/src/stdlib/uefi/lv_mem_core_uefi.c` 抄形状：
+    `lv_mem_init` / `lv_mem_deinit` / `lv_malloc_core` / `lv_realloc_core` /
+    `lv_free_core` / `lv_mem_monitor_core` / `lv_mem_test_core`）。
+    → `lv_malloc_core` 里**平时必须跟 `malloc()` 完全一样**
+    （小分配留在内部堆），只有需要改道的区间才换地方；
+    `lv_free_core` 用 `free()` 就够（它对任何堆的块都对），
+    `lv_realloc_core` 用 `realloc()`（它知道块原来在哪个堆里）。
+    → **别把整套 LVGL 分配都赶到 PSRAM**：LVGL 的控件对象每帧都要读，
+    放 PSRAM 会让整个界面变慢。
 
 ### 9.0.1.1 流畅度五条铁律（v1.2.0 加入，**改 UI 前必读**）
 
@@ -1055,11 +1122,22 @@ riscv32-esp-elf-nm -C --numeric-sort --defined-only build\todohelper.elf > build
 
 ```bash
 bash tools/dsh.sh heap                 # 内部 RAM / 最大连续块 / int-low
-bash tools/dsh.sh page settings        # 切页
+bash tools/dsh.sh page settings        # 切页（顺带打印切页耗时）
 bash tools/dsh.sh widgets 生成         # 对象树（按文本过滤）
 bash tools/dsh.sh click 生成并开启      # 按控件，并当场报出弹窗
 bash tools/dsh.sh tap 745 162 click    # 按坐标（能按到没有文字的「×」）
+bash tools/dsh.sh ftstats              # 字形缓存条目数（各字号）
+bash tools/dsh.sh bench label 测试文字  # 同步重绘一次，打印耗时（µs）
 ```
+
+> **v1.8.5 新增的两条测速命令。**
+> `bench` 会设标签文本 → `lv_refr_now()` **同步重绘** → 打印耗时。
+> 光设文本是不触发的（画字发生在下一次刷新里），所以不强制重绘就量不到
+> 光栅化的成本 —— 而「界面卡」几乎总是卡在这里。
+> `ftstats` 打印 FreeType 字形缓存的条目数：四个字号报出来的数字
+> **一模一样**是正常的（缓存是整个界面共用一份，见 §9.0.1.8 第 17 条）。
+> 两个脚本 `tools/page_tour.py`（巡游所有页面并打印堆）和
+> `tools/bench_glyphs.py`（连续用新汉字测重绘）把这两条命令串了起来。
 
 #### ① `click <标签>` 必须自己往上找**可点击祖先**
 
@@ -1443,6 +1521,21 @@ common_invalid_param: {base} must have required property 'advance'
 ---
 
 ### 9.7 剩余待办（下一轮从这里开始）
+
+> **v1.8.5 之后最该做的三件事**（按收益排序，细节见 `docs/ROADMAP_v1.8.5.md`）：
+>
+> 1. **字库搬进内部 flash。** 现在光栅化一个字要 9 ms，其中约 8.8 ms 是
+>    **从 SD 卡读 TTF**（FreeType 自己只要 100~200 µs）。字库进了内部 flash，
+>    光栅化就能掉到 0.2 ms 上下 —— 缓存偶尔没命中也不卡，顺带解决
+>    「SD 卡挂不上就满屏方块」。
+> 2. **页面控件别销毁重建。** v1.8.3 为了内存放弃了常驻。
+>    现在字形缓存不占内部堆了，账要重算：实测各页内容约
+>    todo 8 KB / calendar 23 KB / settings 28 KB / 其余 2~6 KB，全部常驻约 80~90 KB；
+>    内部堆现在有 150 KB 空闲 —— 够，但要给 WiFi PHY 留连续块（§9.0.3），
+>    这笔账要单独验。
+> 3. **TLS 连接复用。** 每次开机 3~4 次握手 ≈ 18~24 秒的射频时间。
+>
+> 其余老待办（TLS keep-alive、httpd socket 槽位、SD 写放大）见下面各条。
 
 > **已完成**（原先列在这里的两项）：
 > - ~~把 1.2 MB 字库移出 app~~ —— 已做：app 4.16 MB → 2.94 MB，烧录 43.6 s → 31.6 s。

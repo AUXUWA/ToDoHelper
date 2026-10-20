@@ -63,6 +63,10 @@
 #include "sys_status.h"
 #include "sys_utils.h"
 #include "ui_core.h"
+#include "ui_font_mem.h"
+
+/* lv_refr_now(): refresh the screen synchronously, so a redraw can be timed. */
+#include "core/lv_refr.h"
 
 #include "storage_manager.h"
 #include "th_bsp.h"
@@ -330,12 +334,14 @@ static void cmd_help(dbg_out_t *o)
         "  time                     wall clock / uptime\n"
         "  log <tag> [level]        set a tag's log level (0-5)\n"
         "  storage                  storage backend + free space\n"
+        "  ftstats                  glyph cache per font size\n"
         "  ui                       current page + top-layer overview\n"
         "  widgets [filter] [depth] dump the object tree under the screen\n"
         "  click <target>           press a widget (by label text or index)\n"
         "  text <target> <value>    set a label's text\n"
         "  slider <target> <value>  move a slider (fires VALUE_CHANGED, like a tap)\n"
         "  scroll <target> <dy>     scroll a scrollable object by dy pixels\n"
+        "  bench <target> <text>    time a redraw (index, repeats optional)\n"
         "  page <id|name>           switch page (0..10 or splash/home/...)\n"
         "  tap <x> <y>              report which widget is at a screen point\n"
         "  idle <enter|exit>        force idle-face enter/leave\n"
@@ -402,6 +408,35 @@ static void cmd_heap(dbg_out_t *o)
                (unsigned)psram_free, (unsigned)(psram_free / 1024));
     out_printf(o, "default free     %8u B\n",
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+}
+
+/**
+ * Glyph cache status per font size.
+ *
+ * The bitmap cache is what makes scrolling smooth: a glyph that is not cached
+ * has to be rasterised again (read the TTF from the SD card + render), which is
+ * tens of milliseconds. The bitmaps live in PSRAM, but the cache *metadata*
+ * lives in internal RAM (~200 bytes per glyph), so the limit is what decides
+ * how much internal RAM the fonts cost.
+ */
+static void cmd_ftstats(dbg_out_t *o)
+{
+    ui_font_cache_stat_t stats[UI_FONT_MEM_MAX_FONTS];
+    const uint32_t count = ui_font_mem_stats(stats, UI_FONT_MEM_MAX_FONTS);
+
+    out_printf(o, "glyph cache limit now %u (per font size)\n", (unsigned)ui_font_mem_cache_cnt());
+    if (count == 0) {
+        out_printf(o, "no FreeType font in use\n");
+        return;
+    }
+
+    out_printf(o, "  size  glyphs  bitmaps\n");
+    for (uint32_t i = 0; i < count; i++) {
+        out_printf(o, "  %4u  %6u  %7u\n",
+                   (unsigned)stats[i].size,
+                   (unsigned)stats[i].glyph_entries,
+                   (unsigned)stats[i].bitmap_entries);
+    }
 }
 
 static void cmd_tasks(dbg_out_t *o)
@@ -643,6 +678,8 @@ typedef struct {
     bool do_text;
     bool do_slider;
     bool do_scroll;
+    bool do_bench;
+    int repeats;
     const char *value;
 } click_args_t;
 
@@ -654,6 +691,35 @@ static void ui_click_cb(void *arg)
     if (obj == NULL) {
         out_printf(c->out, "no widget matching '%s' (index %d); %d match(es) total\n",
                    c->target, c->index, count);
+        return;
+    }
+    if (c->do_bench) {
+        /*
+         * Time a real redraw.
+         *
+         * Setting a label's text only invalidates it; the glyphs are rasterised
+         * later, during the next refresh - so the HTTP round trip of the plain
+         * `text` command says nothing about how long the drawing took. Here the
+         * screen is refreshed synchronously (lv_refr_now), so the measured time
+         * includes the glyph rendering - which is exactly what a scrolling list
+         * pays for every character that is not in the FreeType cache.
+         */
+        if (!lv_obj_check_type(obj, &lv_label_class)) {
+            out_printf(c->out, "'%s' is a %s, not a label\n", c->target,
+                       class_name_of(obj));
+            return;
+        }
+        lv_display_t *disp = lv_display_get_default();
+        const int repeats = c->repeats > 0 ? c->repeats : 1;
+        for (int i = 0; i < repeats; i++) {
+            const int64_t t0 = esp_timer_get_time();
+            lv_label_set_text(obj, c->value);
+            if (disp != NULL) {
+                lv_refr_now(disp);
+            }
+            const int64_t dt = esp_timer_get_time() - t0;
+            out_printf(c->out, "bench %d: %lld us\n", i + 1, (long long)dt);
+        }
         return;
     }
     if (c->do_text) {
@@ -830,12 +896,15 @@ typedef struct {
 static void ui_page_cb(void *arg)
 {
     page_args_t *p = (page_args_t *)arg;
+    const int64_t t0 = esp_timer_get_time();
     const esp_err_t err = ui_page_switch(p->id);
+    const int64_t t_switch = esp_timer_get_time() - t0;
     const ui_page_id_t now = ui_page_current();
     const ui_page_t *page = ui_page_get(now);
-    out_printf(p->out, "switch -> %s (%d), now on %d (%s)\n",
+    out_printf(p->out, "switch -> %s (%d), now on %d (%s) in %lld us\n",
                esp_err_to_name(err), (int)p->id, (int)now,
-               (page != NULL && page->name != NULL) ? page->name : "?");
+               (page != NULL && page->name != NULL) ? page->name : "?",
+               (long long)t_switch);
 
     /*
      * Re-read the page a little later, still inside the LVGL task.
@@ -848,6 +917,12 @@ static void ui_page_cb(void *arg)
      * 5 s timeout).
      */
     lv_timer_handler();
+    /* The redraw of the new page happens in the next refresh - measure it, so
+     * "the page switch feels slow" becomes a number. */
+    const int64_t t_redraw0 = esp_timer_get_time();
+    lv_timer_handler();
+    const int64_t t_redraw = esp_timer_get_time() - t_redraw0;
+    out_printf(p->out, "first redraw took %lld us\n", (long long)t_redraw);
     vTaskDelay(pdMS_TO_TICKS(300));
     lv_timer_handler();
 
@@ -1099,6 +1174,8 @@ static void dbg_exec(char *line, dbg_out_t *out)
         cmd_status(out);
     } else if (strcmp(cmd, "heap") == 0) {
         cmd_heap(out);
+    } else if (strcmp(cmd, "ftstats") == 0) {
+        cmd_ftstats(out);
     } else if (strcmp(cmd, "tasks") == 0) {
         cmd_tasks(out);
     } else if (strcmp(cmd, "routes") == 0) {
@@ -1201,6 +1278,22 @@ static void dbg_exec(char *line, dbg_out_t *out)
             .value = value,
         };
         if (!run_on_lvgl(ui_click_cb, &args, 5000)) {
+            out_printf(out, "LVGL task did not respond\n");
+        }
+    } else if (strcmp(cmd, "bench") == 0) {
+        if (a1 == NULL || a2 == NULL) {
+            out_printf(out, "usage: bench <target> <text> [index] [repeats]\n");
+            return;
+        }
+        click_args_t args = {
+            .out = out,
+            .target = a1,
+            .index = (argc >= 4) ? atoi(argv[3]) : 0,
+            .do_bench = true,
+            .repeats = (argc >= 5) ? atoi(argv[4]) : 1,
+            .value = argv[2],
+        };
+        if (!run_on_lvgl(ui_click_cb, &args, 15000)) {
             out_printf(out, "LVGL task did not respond\n");
         }
     } else if (strcmp(cmd, "scroll") == 0) {
