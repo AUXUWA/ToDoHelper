@@ -10,13 +10,13 @@
  *
  * ## 为什么界面不流畅
  *
- * LVGL 9 的 FreeType 集成给**每一个字号**各留一份位图缓存，
- * `CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT` 是「每个字号」的上限，不是全局上限
- * （lv_freetype.c: 每个 face 各建一个 glyph_cache（上限 2 倍）和一个
- * draw_data_cache（位图，上限 1 倍））。
+ * LVGL 9 的 FreeType 集成**所有字号共用一份位图缓存**：缓存节点的 key 是
+ * （字体文件, 样式, 渲染模式），**没有字号**（lv_freetype.c 的 search_key）。
+ * 所以 `CONFIG_LV_FREETYPE_CACHE_FT_GLYPH_CNT` 是**整个界面共用**的上限：
+ * 64 条 / 4 个字号 ≈ 每个字号只有 16 个字的位置，而一屏就有 30~40 个汉字。
  *
  * 缓存一满，新字就必须重新光栅化：读 SD 卡里的 TTF + FreeType 渲染，
- * 一次几十毫秒 —— 滚动时就是一卡一卡。v1.8.2 为了不崩把上限压到 32，
+ * 一个字约 10 ms —— 滚动时就是一卡一卡。v1.8.2 为了不崩把上限压到 32，
  * v1.8.3 放回 64，用户反馈「还是没有之前流畅」（v1.8.2 之前是默认的 256）。
  *
  * ## 为什么不能直接开 256
@@ -32,8 +32,19 @@
  * FreeType 的字形位图正是走这条路（lv_freetype_image.c 用 font_draw_buf_handlers
  * 分配位图），而这条路**不经过 malloc()**，所以：
  *   - 全局阈值一个字没动 → TLS 握手不受影响；
- *   - LVGL 每帧的其他小分配仍然留在内部 RAM → 速度不变；
- *   - 只有「字形位图」这一类大块搬去了 PSRAM。
+ *   - 只有「字体绘制缓冲」这一类搬去了 PSRAM。
+ *
+ * **这条路的影响面比「只有 FreeType 的位图」宽一点**（独立复核员查出来的）：
+ * LVGL 给每个 label 准备的 A8 字形暂存缓冲也走同一组回调
+ * （lv_draw_label.c:646），画完就释放 —— 那是**每帧每个 label 一次
+ * PSRAM 分配/释放**。它不影响正确性，实测整屏重画 24 ms 里已经算上了；
+ * 要把两者分开只能改 LVGL 源码（两者用的是同一组 handler），本轮不动。
+ *
+ * 位图本身也从内部 RAM 换到了 PSRAM，于是**混合（blend）时掩码是从 PSRAM 读的**
+ * （lv_draw_sw_letter.c 的 mask_buf）。PSRAM 250 MHz，够用。
+ *
+ * 缓存的**元数据**（红黑树节点 + 缓存条目 + draw_buf 结构，每个字形约 200 B）
+ * 也搬去了 PSRAM —— 那是另一条路（ui_lv_mem.c，接管 LVGL 的分配器）。
  *
  * ## 前提：显式指定 MALLOC_CAP_SPIRAM 一定能拿到 PSRAM
  *

@@ -838,10 +838,24 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
     `lv_free_core` / `lv_mem_monitor_core` / `lv_mem_test_core`）。
     → `lv_malloc_core` 里**平时必须跟 `malloc()` 完全一样**
     （小分配留在内部堆），只有需要改道的区间才换地方；
-    `lv_free_core` 用 `free()` 就够（它对任何堆的块都对），
-    `lv_realloc_core` 用 `realloc()`（它知道块原来在哪个堆里）。
+    `lv_free_core` 用 `free()` 就够（它对任何堆的块都对）；
+    `lv_realloc_core` **要小心**：普通 `realloc()` 对 ≤4096 B 的块是要内部 RAM 的，
+    而 `heap_caps_realloc_base()` 只在「请求的 caps 与原堆兼容」时才原地扩 ——
+    于是画字区间里从 PSRAM 分配的块，realloc 一下就被搬回内部堆。
+    画字区间里要用 `heap_caps_realloc(p, n, MALLOC_CAP_8BIT)`（两个堆都满足，
+    块留在原处）。
     → **别把整套 LVGL 分配都赶到 PSRAM**：LVGL 的控件对象每帧都要读，
     放 PSRAM 会让整个界面变慢。
+23. **在 LVGL 任务里调 `lv_timer_handler()` 是重入调用，什么都测不到。**
+    LVGL 的 `lv_timer_handler()` 第一件事就是重入保护
+    （`lv_timer.c` 的 `already_running`）→ 直接 return 1。
+    而调试 shell 的 UI 作业是**在 LVGL 的定时器回调里**跑的
+    （`ui_event_drain_cb`），所以里面再调 `lv_timer_handler()` 一定被挡掉 ——
+    「首次重绘耗时 1 µs」就是这么来的，测的是函数进出的开销。
+    → **要同步重绘就用 `lv_refr_now(disp)`**（它不走那个重入保护）。
+    改完之后量出来的数才有意义：某页的首次绘制 226~416 ms（冷，字要重新光栅化），
+    而整屏重画的稳态是 24 ms。
+    → 教训：**「测出来一个漂亮的小数字」先怀疑这个数字测的是不是你要的东西。**
 
 ### 9.0.1.1 流畅度五条铁律（v1.2.0 加入，**改 UI 前必读**）
 

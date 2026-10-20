@@ -107,7 +107,13 @@ void *lv_malloc_core(size_t size)
         if (buf != NULL) {
             return buf;
         }
-        /* PSRAM full: fall back to the normal heap rather than failing. */
+        /* PSRAM full: fall back to the normal heap rather than failing.
+         *
+         * This fallback only works while CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS
+         * is off - with it on, a failed allocation aborts the firmware instead
+         * of returning NULL. It is off in this project's sdkconfig; if you ever
+         * turn it on, this branch becomes unreachable and a full PSRAM is an
+         * abort, not a slow-but-working UI. */
     }
 
     /* Exactly what LVGL's C library backend did: malloc() keeps small

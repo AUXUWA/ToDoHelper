@@ -40,14 +40,19 @@ typedef struct {
 esp_err_t ui_font_mem_init(void);
 
 /**
- * @brief 设置**下一个**创建的 FreeType 字体的字形缓存上限
+ * @brief 设置 FreeType 的字形缓存上限
  *
- * LVGL 9 的 FreeType 给每个字号各留一份位图缓存，条目数是同一个上限
- * （位图缓存 = 上限，字形描述缓存 = 2 倍上限）。上限越大越流畅，
- * 但缓存的元数据在内部堆里，每个字形约 200 B。
+ * LVGL 9 的 FreeType **所有字号共用一份缓存**：缓存节点的 key 是
+ * （字体文件, 样式, 渲染模式），**没有字号**（lv_freetype.c 的 search_key）。
+ * 所以这个上限是**整个界面共用**的预算，不是每个字号一份。
+ * （缓存条目自己的 key 才带字号：{unicode, size}。）
  *
- * 所以按字号分别给：正文给大的，标题/小字/巨字给小的。
- * 必须在该字体的 esp_lv_adapter_ft_font_init() 之前调用。
+ * 上限越大越流畅（被挤掉的字形每一帧都要重新光栅化，一个字约 10 ms），
+ * 但缓存的元数据也要跟着涨（每个字形约 200 B，现在住在 PSRAM）。
+ *
+ * 上限只在**第一次**创建这个字体文件的缓存节点时被读一次
+ * （`cache_hitting == false` 那条分支），所以必须在创建**第一个**
+ * FreeType 字体之前调用。
  */
 void ui_font_mem_set_cache_cnt(uint32_t cnt);
 

@@ -335,7 +335,7 @@ static void cmd_help(dbg_out_t *o)
         "  time                     wall clock / uptime\n"
         "  log <tag> [level]        set a tag's log level (0-5)\n"
         "  storage                  storage backend + free space\n"
-        "  ftstats                  glyph cache per font size\n"
+        "  ftstats                  glyph cache (one cache shared by all sizes)\n"
         "  ui                       current page + top-layer overview\n"
         "  widgets [filter] [depth] dump the object tree under the screen\n"
         "  click <target>           press a widget (by label text or index)\n"
@@ -412,21 +412,25 @@ static void cmd_heap(dbg_out_t *o)
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
 }
 
-/**
- * Glyph cache status per font size.
+/*
+ * Glyph cache status.
+ *
+ * The cache is **shared by all font sizes** - LVGL keys the cache node on
+ * (file, style, render mode), not on the size - so every row below shows the
+ * same numbers. (The four rows are the four font roles; they all point at the
+ * one shared cache.)
  *
  * The bitmap cache is what makes scrolling smooth: a glyph that is not cached
- * has to be rasterised again (read the TTF from the SD card + render), which is
- * tens of milliseconds. The bitmaps live in PSRAM, but the cache *metadata*
- * lives in internal RAM (~200 bytes per glyph), so the limit is what decides
- * how much internal RAM the fonts cost.
+ * has to be rasterised again (read the TTF from the SD card + render), which
+ * is about 10 ms. The bitmaps and the cache metadata both live in PSRAM now,
+ * so the limit decides how much PSRAM they use, not internal RAM.
  */
 static void cmd_ftstats(dbg_out_t *o)
 {
     ui_font_cache_stat_t stats[UI_FONT_MEM_MAX_FONTS];
     const uint32_t count = ui_font_mem_stats(stats, UI_FONT_MEM_MAX_FONTS);
 
-    out_printf(o, "glyph cache limit now %u (per font size)\n", (unsigned)ui_font_mem_cache_cnt());
+    out_printf(o, "glyph cache limit now %u (shared by all sizes)\n", (unsigned)ui_font_mem_cache_cnt());
     if (count == 0) {
         out_printf(o, "no FreeType font in use\n");
         return;
@@ -942,16 +946,23 @@ static void ui_page_cb(void *arg)
      * whatever is overriding it. Sleeping here is safe because this runs on the
      * LVGL task and the delay is bounded (the caller waits on a semaphore with a
      * 5 s timeout).
+     *
+     * NOTE: lv_timer_handler() must NOT be used to force a redraw here - this
+     * callback already runs inside one (the shell's UI work is dispatched from
+     * a lv_timer callback), so the call returns immediately on LVGL's
+     * already_running guard and measures nothing. lv_refr_now() is the way to
+     * redraw synchronously.
      */
-    lv_timer_handler();
-    /* The redraw of the new page happens in the next refresh - measure it, so
-     * "the page switch feels slow" becomes a number. */
+    lv_display_t *disp = lv_display_get_default();
     const int64_t t_redraw0 = esp_timer_get_time();
-    lv_timer_handler();
+    if (disp != NULL) {
+        lv_refr_now(disp);
+    }
     const int64_t t_redraw = esp_timer_get_time() - t_redraw0;
     out_printf(p->out, "first redraw took %lld us\n", (long long)t_redraw);
     vTaskDelay(pdMS_TO_TICKS(300));
-    lv_timer_handler();
+    /* After the delay the timers are pumped by the adapter's own task, so
+     * there is nothing to do here. */
 
     const ui_page_id_t later = ui_page_current();
     if (later != p->id) {
