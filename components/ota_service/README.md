@@ -1,27 +1,41 @@
 # ota_service —— 固件在线升级（OTA）
 
-把新固件传上来，设备写进**另一个**槽位，校验通过后重启进新固件。
-写坏了不会变砖。
+把新固件传上来，设备写进**另一个**槽位，校验通过后「上膛」，
+下一次启动就跑它。写坏了不会变砖。
 
 ## 用法
 
 **网页端**（推荐）：首页 → 「固件升级」→ 选 `build/todohelper.bin` → 上传并升级。
-上传期间设备照常工作（待办、AI、天气都不受影响），只有最后会重启一次（约 10 秒）。
+上传期间设备照常工作（待办、AI、天气都不受影响），上传成功之后设备会重启一次
+（约 10 秒后刷新页面就能看到新版本）。
 
 **命令行**：
 
 ```bash
-curl -X POST http://192.168.137.138/api/v1/ota/upload \\
-     -H "Content-Type: application/octet-stream" \\
+curl -X POST http://192.168.137.138/api/v1/ota/upload \
+     -H "Content-Type: application/octet-stream" \
      --data-binary @build/todohelper.bin
+# → {"ok":true,"state":"ready","written":3284624,"total":3284624,"boot":"ota_0"}
+
+curl -X POST http://192.168.137.138/api/v1/ota/reboot
+# → {"ok":true,"state":"rebooting"}
 ```
 
 | 路由 | 说明 |
 |---|---|
-| `POST /api/v1/ota/upload` | **请求体就是固件镜像**。写完校验通过就切到新槽位并重启 |
-| `GET /api/v1/ota/status` | `{state, written, total, error, running, pending}` |
+| `POST /api/v1/ota/upload` | **请求体就是固件镜像**。写完校验通过就切到新槽位并「上膛」（下次启动就跑它） |
+| `POST /api/v1/ota/reboot` | **v1.12.0 新增**。重启进刚写好的固件；没有待启动的镜像时回 503 |
+| `GET /api/v1/ota/status` | `{state, written, total, error, running, pending, boot, busy}` |
 
-`state`：`idle` / `writing` / `verifying` / `rebooting` / `failed`。
+`state`：`idle` / `writing` / `verifying` / `ready` / `rebooting` / `failed`。
+
+槽位字段：
+
+* `running` —— 现在跑的是哪个槽位；
+* `boot` —— **下次启动**会跑哪个（等于 `running` 表示没有待启动的）；
+* `pending` —— 下一个会被**写进去**的槽位（**永远等于「另一个」**，
+  别拿它判断「有没有升级等着启动」，那是 `boot` 的事）；
+* `busy` —— 现在正忙（擦除/写入/校验/上膛期间都是 true）。
 
 ## 三条安全线
 
@@ -46,8 +60,14 @@ curl -X POST http://192.168.137.138/api/v1/ota/upload \\
   但任何 TCP 连接都建不上」（`AGENT.md` §9.0.1 最后一条）。
   所以用 `httpd_req_async_handler_begin()` 把 socket 交给自有任务，
   handler 立刻返回（和 ai_service 同一套做法）。
-* **重启用定时器**：在 handler 里直接重启会把响应切掉（浏览器看到的是失败，
-  设备其实已经换了固件）。所以重启推迟 1.5 秒。
+* **重启是单独一步**：在上传的 handler 里直接重启（或定时重启）会把**响应**切掉 ——
+  芯片复位把 WiFi 协议栈一起带走，那个响应就丢了，
+  浏览器看到的是「上传失败」，而设备其实已经换了固件。
+  所以上传只负责「写好并上膛」，重启由 `POST /api/v1/ota/reboot` 发起。
+* **一次只允许一个升级**：从请求被接受到重启之前都算忙，
+  这期间再来一次上传会回 503。没有这道护栏，第二次上传会写**同一个**槽位
+  （还没重启，`esp_ota_get_next_update_partition()` 返回的就是另一个），
+  把刚校验通过的镜像擦掉，甚至让设备从一个写了一半的镜像启动。
 
 ## 槽位与容量的坑
 

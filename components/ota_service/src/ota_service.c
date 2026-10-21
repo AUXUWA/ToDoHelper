@@ -40,6 +40,21 @@ static volatile uint32_t s_written;
 static volatile uint32_t s_total;
 static char s_error[96];
 
+/**
+ * True from the moment an upload is accepted until the device reboots.
+ *
+ * The state alone is not enough to keep a second upload out: `esp_ota_begin()`
+ * erases the whole target slot *before* the state becomes WRITING, and that
+ * erase takes seconds. A second upload arriving in that window would be
+ * accepted, would target the same slot (the running partition has not changed
+ * yet, so `esp_ota_get_next_update_partition()` returns the same one), and
+ * would erase the image the first upload had just written and validated.
+ * The same window exists between "image validated" and "reboot" (1.5 s).
+ *
+ * So the guard is a separate flag that is set before anything is touched.
+ */
+static volatile bool s_busy;
+
 /** Record the reason of a failure and hand it back to the caller. */
 static esp_err_t ota_fail(ota_state_t state, const char **err, const char *reason)
 {
@@ -85,6 +100,24 @@ const char *ota_service_pending_partition(void)
         return "";
     }
     return target->label;
+}
+
+const char *ota_service_boot_partition(void)
+{
+    /* The partition the bootloader will start **next** - this is the one that
+     * esp_ota_set_boot_partition() points at. It is not the same thing as
+     * "the slot that would be written next" (ota_service_pending_partition),
+     * which is always simply the other slot. */
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    if (boot == NULL) {
+        return "";
+    }
+    return boot->label;
+}
+
+bool ota_service_busy(void)
+{
+    return s_busy;
 }
 
 ota_state_t ota_service_state(void)
@@ -149,12 +182,24 @@ static void reboot_timer_cb(void *arg)
  */
 esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const char **err)
 {
+    /* Take the slot before touching anything: see the comment on s_busy. */
+    if (s_busy) {
+        SYS_LOGW(TAG, "an upload is already in progress - refusing a second one");
+        if (err != NULL) {
+            *err = "已有一次升级正在进行，请等它结束";
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_busy = true;
+
     const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
     if (target == NULL) {
+        s_busy = false;
         return ota_fail(OTA_STATE_FAILED, err, "找不到 OTA 槽位（分区表是不是没刷对？）");
     }
 
     if (content_length > target->size) {
+        s_busy = false;
         return ota_fail(OTA_STATE_FAILED, err, "固件比槽位还大");
     }
 
@@ -164,6 +209,7 @@ esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const cha
                                               &handle);
     if (begin_err != ESP_OK) {
         SYS_LOGE(TAG, "ota_begin failed: %s", esp_err_to_name(begin_err));
+        s_busy = false;
         (void)ota_fail(OTA_STATE_FAILED, err, "擦除目标槽位失败");
         return begin_err;
     }
@@ -176,23 +222,30 @@ esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const cha
     char *buf = heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (buf == NULL) {
         (void)esp_ota_abort(handle);
+        s_busy = false;
         (void)ota_fail(OTA_STATE_FAILED, err, "内存不够（32 KB 的缓冲都没了）");
         return ESP_ERR_NO_MEM;
     }
 
     size_t remaining = content_length;
+    bool truncated = false;
     for (;;) {
         const int want = (remaining > 0 && remaining < OTA_CHUNK_SIZE)
                              ? (int)remaining
                              : OTA_CHUNK_SIZE;
         const int got = (int)httpd_req_recv(req, buf, (size_t)want);
         if (got == 0) {
-            break;   /* the body ended */
+            /* The body ended. If the client announced more than it sent, the
+             * image is cut short - that is a different problem from "this file
+             * is not a firmware", and it must not be reported as one. */
+            truncated = (remaining > 0);
+            break;
         }
         if (got < 0) {
             SYS_LOGE(TAG, "recv failed: %d", got);
             (void)esp_ota_abort(handle);
             free(buf);
+            s_busy = false;
             (void)ota_fail(OTA_STATE_FAILED, err, "读取上传内容中断");
             return ESP_FAIL;
         }
@@ -205,6 +258,7 @@ esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const cha
             SYS_LOGE(TAG, "ota_write failed: %s", esp_err_to_name(write_err));
             (void)esp_ota_abort(handle);
             free(buf);
+            s_busy = false;
             (void)ota_fail(OTA_STATE_FAILED, err, "写入固件失败（flash 写不进去）");
             return write_err;
         }
@@ -212,12 +266,22 @@ esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const cha
     }
     free(buf);
 
+    if (truncated) {
+        SYS_LOGE(TAG, "the upload stopped early: %u of %u bytes",
+                 (unsigned)s_written, (unsigned)s_total);
+        (void)esp_ota_abort(handle);
+        s_busy = false;
+        (void)ota_fail(OTA_STATE_FAILED, err, "上传被中断（固件没传完）");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     s_state = OTA_STATE_VERIFYING;
 
     /* End the image: this is where the bootloader-format check happens, so a
      * truncated or foreign file is rejected here and not at the next boot. */
     if (esp_ota_end(handle) != ESP_OK) {
         SYS_LOGE(TAG, "ota_end failed: the image is not valid");
+        s_busy = false;
         (void)ota_fail(OTA_STATE_FAILED, err, "固件校验不通过（不是有效的 ESP-IDF 镜像？）");
         return ESP_ERR_INVALID_ARG;
     }
@@ -225,14 +289,34 @@ esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const cha
     const esp_err_t set_err = esp_ota_set_boot_partition(target);
     if (set_err != ESP_OK) {
         SYS_LOGE(TAG, "set boot partition failed: %s", esp_err_to_name(set_err));
+        s_busy = false;
         (void)ota_fail(OTA_STATE_FAILED, err, "设置启动分区失败");
         return set_err;
     }
 
-    SYS_LOGI(TAG, "new firmware written to %s; rebooting into it", target->label);
+    SYS_LOGI(TAG, "new firmware written to %s; it will start at the next reboot",
+             target->label);
+    s_state = OTA_STATE_READY;
+    /* No reboot here on purpose: the HTTP response of this request still has
+     * to reach the browser, and resetting the chip takes the WiFi stack with
+     * it - the answer would be lost and the console would call a successful
+     * upgrade a failure. The caller reboots explicitly afterwards. */
+    return ESP_OK;
+}
+
+esp_err_t ota_service_reboot(void)
+{
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    const esp_partition_t *running = running_partition();
+    if (boot == NULL || running == NULL || strcmp(boot->label, running->label) == 0) {
+        SYS_LOGW(TAG, "reboot refused: no new image is waiting");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    SYS_LOGI(TAG, "rebooting into %s", boot->label);
     s_state = OTA_STATE_REBOOTING;
 
-    /* Give the HTTP response time to reach the browser before the reset. */
+    /* A short delay so the answer to this request can still get out. */
     const esp_timer_create_args_t args = {
         .callback = reboot_timer_cb,
         .arg = NULL,
@@ -241,9 +325,10 @@ esp_err_t ota_service_receive(httpd_req_t *req, size_t content_length, const cha
     };
     esp_timer_handle_t timer = NULL;
     if (esp_timer_create(&args, &timer) == ESP_OK) {
-        (void)esp_timer_start_once(timer, 1500);
+        (void)esp_timer_start_once(timer, 800);
     } else {
         SYS_LOGW(TAG, "reboot timer unavailable");
+        return ESP_FAIL;
     }
     return ESP_OK;
 }
@@ -252,6 +337,9 @@ esp_err_t ota_service_init(void)
 {
     s_state = OTA_STATE_IDLE;
     s_error[0] = '\0';
+    s_busy = false;
+    s_written = 0;
+    s_total = 0;
 
     const esp_err_t http_err = ota_service_register_http();
     if (http_err != ESP_OK) {

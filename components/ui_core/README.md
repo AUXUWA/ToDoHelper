@@ -92,6 +92,28 @@
 开启方式：`CONFIG_LV_USE_FREETYPE` + `CONFIG_ESP_LVGL_ADAPTER_ENABLE_FREETYPE`
 + `CONFIG_TODOHELPER_FONT_FREETYPE`。
 
+### 字库在内存里（v1.12.0）
+
+FreeType 读字库用的是最普通的 `fopen()`，
+所以**「字库文件在哪儿」直接等于「画一个字多快」** ——
+字库在 SD 卡上时，每画一个字要花约 9.8 ms 去读卡。
+
+`src/ui_font_ramfs.c` 注册了一个**只读**的内存文件系统（IDF 的
+`esp_vfs_register_fs`，挂在 `/ramfont`）：开机把字库读进 PSRAM 并发布出去，
+FreeType 改用 `/ramfont/ui_cjk.ttf` 这个路径 —— 它照样 fopen，
+只是路径背后是内存。
+
+实测（同一台设备、同一段代码、同一串 74 个从没画过的字，
+用「第一次画减第二次画」把布局和整屏刷新的开销减掉）：
+**SD 卡 7 816 µs/字 → PSRAM 604 µs/字，约 13 倍**。
+代价：开机多约 400 ms（读 1.25 MB）+ PSRAM 多占 1.25 MB。
+开关：`CONFIG_TODOHELPER_FONT_IN_RAM`（默认开）；
+关掉就退回直接从 SD 卡读，任何一步失败也会自动退回。
+
+> 为什么不用 LVGL 自带的 memfs：它要 `LV_FREETYPE_USE_LVGL_PORT` 才生效，
+> 而打开它 FreeType 和 LVGL 会各自导出一个 `FT_Stream_Open` → 链接失败。
+> 详见 `docs/ROADMAP_v1.12.0.md` 与 `AGENT.md §9.0.1.12`。
+
 ## 待机策略（FR6 §11.4）
 
 `ui_core` 是策略唯一归属地：收到 `SYS_EVENT_IDLE_TIMEOUT` → 切到 `UI_PAGE_IDLE_FACE`

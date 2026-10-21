@@ -18,6 +18,26 @@ menu "ToDoHelper: UI core"
               4. LVGL's built-in Montserrat font (Latin only)
             so the UI keeps working even when every optional piece is missing.
 
+    config TODOHELPER_FONT_IN_RAM
+        bool "Keep the TrueType font in RAM instead of reading it from the SD card"
+        depends on TODOHELPER_FONT_FREETYPE
+        default y
+        help
+            FreeType reads the .ttf with plain fopen()/fread(), so a font file
+            on the SD card made every single glyph cost ~9.8 ms of card reads
+            (FreeType's own work is 100~200 us). With this option the font is
+            copied into PSRAM at boot and served from a read-only RAM
+            filesystem (components/ui_core/src/ui_font_ramfs.c), which turns
+            those reads into a memcpy.
+
+            Measured on the ESP32-S31-Korvo: drawing 33 characters that were
+            not in the glyph cache took 8.8 ms with the font in RAM against
+            ~330 ms when it was read from the SD card.
+
+            The cost is the boot time to read the file (1.25 MB: ~390 ms from
+            the SD card) plus 1.25 MB of PSRAM. Turn this off if the boot
+            delay matters more than the drawing speed.
+
     config TODOHELPER_FONT_PATH
         string "TrueType font on storage, relative to the app data directory"
         depends on TODOHELPER_FONT_FREETYPE

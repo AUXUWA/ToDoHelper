@@ -2496,9 +2496,14 @@ function loadOta() {
       return null;
     }
     var names = { idle: "空闲", writing: "正在写入", verifying: "正在校验",
-                  rebooting: "等待重启", failed: "失败" };
-    otaSetState((names[state.state] || state.state) + " · 槽位 " + state.running +
-                 (state.pending ? " → " + state.pending : ""));
+                  ready: "已就绪，等待重启", rebooting: "等待重启", failed: "失败" };
+    /* boot = 下次启动会跑哪个槽位；pending = 下一个会被写进去的槽位
+     * （永远是「另一个」，不是「待启动的」）。 */
+    var slots = "槽位 " + state.running;
+    if (state.boot && state.boot !== state.running) {
+      slots += " → " + state.boot + "（下次启动）";
+    }
+    otaSetState((names[state.state] || state.state) + " · " + slots);
     if (state.state === "failed" && state.error) {
       setText($("ota-result"), "上次升级失败：" + state.error);
     }
@@ -2507,6 +2512,17 @@ function loadOta() {
     otaSetState("读取失败");
     if (err.kind === "auth") { reachableWithProblem(err); }
     return null;
+  });
+}
+
+/* 设备真正写进去多少字节 —— 比浏览器「已经交给 socket 多少」准。 */
+var otaPollTimer = null;
+function otaPollProgress() {
+  loadOta().then(function (state) {
+    if (!state || state.total === 0 || state.state !== "writing") { return; }
+    var pct = Math.round((state.written / state.total) * 100);
+    otaSetProgress(pct, pct + "%（设备已写入 " +
+                   Math.round(state.written / 1024) + " KB）");
   });
 }
 
@@ -2525,6 +2541,7 @@ $("ota-upload").addEventListener("click", function () {
   otaSetState("上传中");
   otaSetProgress(0, "0%");
   setText($("ota-result"), "");
+  $("ota-upload").disabled = true;
 
   /* XHR 而不是 fetch：要上传进度。 */
   var xhr = new XMLHttpRequest();
@@ -2532,30 +2549,55 @@ $("ota-upload").addEventListener("click", function () {
   xhr.setRequestHeader("Content-Type", "application/octet-stream");
   if (token) { xhr.setRequestHeader("X-Auth-Token", token); }
 
+  /* 浏览器的 onprogress 只说明「字节交给了 socket」；设备把固件写进 flash
+   * 还要好几秒，那段时间进度条会一直停在 100%。所以同时轮询设备自己的
+   * 写入进度（/ota/status 里的 written/total）。 */
+  if (otaPollTimer) { clearInterval(otaPollTimer); }
+  otaPollTimer = setInterval(otaPollProgress, 1000);
+
   xhr.upload.onprogress = function (e) {
-    if (e.lengthComputable) {
+    if (e.lengthComputable && !otaPollTimer) {
       otaSetProgress((e.loaded / e.total) * 100, Math.round((e.loaded / e.total) * 100) + "%");
     }
   };
   xhr.onload = function () {
+    if (otaPollTimer) { clearInterval(otaPollTimer); otaPollTimer = null; }
+    $("ota-upload").disabled = false;
     var body = null;
     try { body = JSON.parse(xhr.responseText); } catch (e) { /* not json */ }
     if (xhr.status === 200 && body && body.ok) {
-      otaSetState("写入完成，设备正在重启");
+      otaSetState("写入完成，正在重启");
       otaSetProgress(100, "100%");
       setText($("ota-result"), "升级成功，设备正在重启进新固件（约 10 秒后可以刷新看看）。");
+      /* 重启是**单独一步**：上传的响应必须先到浏览器，否则重启把 WiFi 协议栈
+       * 一起带走，这个响应就丢了（网页会误判成「上传失败」）。
+       * 这里用 fetch 而不是 api()，免得排在别的请求后面。 */
+      var rebootHeaders = {};
+      if (token) { rebootHeaders["X-Auth-Token"] = token; }
+      fetch("/api/v1/ota/reboot", { method: "POST", headers: rebootHeaders })
+        .catch(function () { /* the device is going down; the answer may be lost */ });
       setTimeout(function () { loadOta(); loadDevice(); }, 12000);
     } else {
       var msg = (body && body.error) ? body.error : ("HTTP " + xhr.status);
       otaSetState("升级失败");
       setText($("ota-result"), "升级失败：" + msg);
+      loadOta();
     }
   };
   xhr.onerror = function () {
+    if (otaPollTimer) { clearInterval(otaPollTimer); otaPollTimer = null; }
+    $("ota-upload").disabled = false;
     otaSetState("上传失败");
     setText($("ota-result"), "上传失败：连不上设备");
   };
   xhr.send(file);
+});
+
+/* 折叠时不打扰设备：展开才拉状态。 */
+$("ota").addEventListener("toggle", function (event) {
+  if (event.currentTarget.open) {
+    loadOta();
+  }
 });
 
 

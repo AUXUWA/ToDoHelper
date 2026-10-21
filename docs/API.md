@@ -1402,8 +1402,9 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/` | sync_server | 内嵌浏览器待办页（`EMBED_FILES web/index.html`，`text/html; charset=utf-8`，`Cache-Control: no-cache`） | ✅ 200 |
 | GET | `/index.html` | sync_server | 同上 | ✅ 200 |
 | GET | `/api/v1/device/info` | sync_server | 芯片/固件版本/IDF/`mac`/`ip`/`hostname`/`wifi_state`/存储状态/`auth_enabled`；**不含任何密钥或 token**。`version` 来自工程根目录 `version.txt`（规则见 `AGENT.md §8.1`），1.0.0 实测 `"version":"1.0.0"` | ✅ 200 |
-| POST | `/api/v1/ota/upload` | ota_service | **请求体就是固件镜像**（`application/octet-stream`）。写进另一个槽位、校验通过后切过去并重启。升级期间设备其它接口照常可用（异步 handler） | ✅ 200 |
-| GET | `/api/v1/ota/status` | ota_service | `{state:"idle"/"writing"/"verifying"/"rebooting"/"failed", written, total, error, running, pending}`（`running`/`pending` 是槽位名） | ✅ 200 |
+| POST | `/api/v1/ota/upload` | ota_service | **请求体就是固件镜像**（`application/octet-stream`）。写进另一个槽位 → 校验 → **上膛**（下次启动就跑它）。**不自动重启**（见下面「为什么重启是单独一步」）。升级期间设备其它接口照常可用（异步 handler）；**同一时间只允许一次上传**，第二次回 503 | ✅ 200 |
+| POST | `/api/v1/ota/reboot` | ota_service | **v1.12.0 新增**。重启进刚写好的固件；没有待启动的镜像时回 503 | ✅ 200 |
+| GET | `/api/v1/ota/status` | ota_service | `{state:"idle"/"writing"/"verifying"/"ready"/"rebooting"/"failed", written, total, error, running, pending, boot, busy}`。**`running`** = 现在跑的是哪个槽位；**`boot`** = 下次启动会跑哪个槽位（= `running` 表示没有待启动的）；**`pending`** = 下一个会被写进去的槽位（**永远等于「另一个」**，别拿它判断「有没有升级等着启动」）；**`busy`** = 现在正忙（擦除/写入/校验/上膛期间都是 true，这时再来一次上传会回 503） | ✅ 200 |
 | GET | `/api/v1/device/status` | sync_server | `uptime_s`/`free_heap`/`min_free_heap`/`free_psram`/`routes`/`sse_clients`/`wifi_rssi`/`wifi_connected`/`time_synced`/`server_ts`/`url`；1.0.0 实测 `routes:45`、`sse_clients` 随订阅数变化 | ✅ 200 |
 | POST | `/api/v1/device/reboot` | sync_server | 先回 `{"rebooting":true}`，再 700 ms 后 `esp_restart()`。**强制鉴权** | ✅ 200（需 token） |
 | POST | `/api/v1/device/auth` | sync_server | body `{"token":"..."}`；空串/`null` 关闭鉴权、开启鉴权时长度 ≤63。**强制鉴权** | ✅ 200（需 token） |
@@ -1464,6 +1465,34 @@ I (xxx) TH:app: ready (storage=/sdcard)
 
 > **路径参数写法**：路由器只支持**一个** `*`，所以单项接口注册为 `/api/v1/todos/*`、动作为 `/api/v1/todos/*/done`。
 > `*` 必须至少吞掉一个字符，因此 `/api/v1/todos/`（尾斜杠）**不**匹配 `/api/v1/todos/*`，会落到 404。
+
+### 2.1.1 OTA 的两步流程（v1.12.0 起）
+
+```
+POST /api/v1/ota/upload   （请求体 = 固件镜像）   → 200 {"ok":true,"state":"ready",...}
+POST /api/v1/ota/reboot                             → 200 {"ok":true,"state":"rebooting"}
+```
+
+**为什么重启是单独一步**：上传的响应还没送到浏览器的时候重启，
+芯片复位会把 WiFi 协议栈一起带走 —— 那个响应就丢了，
+网页上看到的是「上传失败」，而固件其实已经写好了。
+（v1.11.0 就是这样：上传成功但网页显示失败，还查了很久。）
+所以上传只负责「写好并上膛」，重启由调用方显式发起。
+
+**上膛是什么意思**：`esp_ota_set_boot_partition()` 之后，
+**下次**启动就会跑新固件（`GET /api/v1/ota/status` 的 `boot` 字段会显示它）。
+所以即使设备没有立刻重启，新固件也已经「上膛」了；
+`POST /api/v1/ota/reboot` 只是让这件事现在发生。
+
+**三条安全线**（真机都验过，见 `docs/ROADMAP_v1.11.0.md`）：
+写进另一个槽位 / 写完校验（截断镜像当场被拒，设备不重启）/ 开机回滚
+（新固件启动后调 `esp_ota_mark_app_valid_cancel_rollback()` 认下自己）。
+
+**一次只能有一个升级在进行**：从请求被接受到重启之前，
+`busy` 都是 true，这期间再来一次上传会回 **503**。
+（这个护栏不是多余的：第二次上传会写**同一个**槽位 ——
+还没重启，`esp_ota_get_next_update_partition()` 返回的就是另一个 ——
+于是刚校验通过的镜像被擦掉，甚至让设备从一个写了一半的槽位启动。）
 
 ### 2.2 响应信封
 

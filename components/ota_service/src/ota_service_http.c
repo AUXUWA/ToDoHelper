@@ -66,8 +66,10 @@ static void ota_job_run(ota_job_t *job)
     char body[192];
     if (rc == ESP_OK) {
         snprintf(body, sizeof(body),
-                 "{\"ok\":true,\"state\":\"rebooting\",\"written\":%u,\"total\":%u}",
-                 (unsigned)ota_service_written(), (unsigned)ota_service_total());
+                 "{\"ok\":true,\"state\":\"ready\",\"written\":%u,\"total\":%u,"
+                 "\"boot\":\"%s\"}",
+                 (unsigned)ota_service_written(), (unsigned)ota_service_total(),
+                 ota_service_boot_partition());
     } else {
         snprintf(body, sizeof(body),
                  "{\"ok\":false,\"error\":\"%s\",\"state\":\"failed\"}",
@@ -134,7 +136,11 @@ static esp_err_t ota_http_ensure_worker(void)
  */
 static esp_err_t upload_post_handler(httpd_req_t *req)
 {
-    if (ota_service_state() == OTA_STATE_WRITING) {
+    /* One upgrade at a time. The check covers the whole window - the erase of
+     * the target slot, the write, the validation, and the 1.5 s before the
+     * reboot - because a second upload in any of those windows would erase the
+     * image the first one had just written. */
+    if (ota_service_busy() || ota_service_state() == OTA_STATE_WRITING) {
         return http_reply_unavailable(req, "another upgrade is in progress");
     }
 
@@ -164,6 +170,22 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 }
 
 /**
+ * POST /api/v1/ota/reboot - start the firmware that was just written.
+ *
+ * A separate step on purpose: rebooting inside the upload request would
+ * reset the chip (and with it the WiFi stack) before the answer to that
+ * request could reach the browser.
+ */
+static esp_err_t reboot_post_handler(httpd_req_t *req)
+{
+    const esp_err_t err = ota_service_reboot();
+    if (err != ESP_OK) {
+        return http_reply_unavailable(req, "没有待启动的新固件");
+    }
+    return http_reply_ok(req, "{\"ok\":true,\"state\":\"rebooting\"}");
+}
+
+/**
  * GET /api/v1/ota/status - what the upgrade is doing, and which slot is which.
  */
 static esp_err_t status_get_handler(httpd_req_t *req)
@@ -173,6 +195,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     switch (ota_service_state()) {
     case OTA_STATE_WRITING:   state = "writing"; break;
     case OTA_STATE_VERIFYING: state = "verifying"; break;
+    case OTA_STATE_READY:     state = "ready"; break;
     case OTA_STATE_REBOOTING: state = "rebooting"; break;
     case OTA_STATE_FAILED:    state = "failed"; break;
     case OTA_STATE_IDLE:
@@ -181,13 +204,15 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     snprintf(body, sizeof(body),
              "{\"state\":\"%s\",\"written\":%u,\"total\":%u,\"error\":\"%s\","
-             "\"running\":\"%s\",\"pending\":\"%s\"}",
+             "\"running\":\"%s\",\"pending\":\"%s\",\"boot\":\"%s\",\"busy\":%s}",
              state,
              (unsigned)ota_service_written(),
              (unsigned)ota_service_total(),
              ota_service_error(),
              ota_service_running_partition(),
-             ota_service_pending_partition());
+             ota_service_pending_partition(),
+             ota_service_boot_partition(),
+             ota_service_busy() ? "true" : "false");
     return http_reply_ok(req, body);
 }
 
@@ -199,6 +224,7 @@ esp_err_t ota_service_register_http(void)
         http_route_handler_t handler;
     } routes[] = {
         { "/api/v1/ota/upload", HTTP_POST, upload_post_handler },
+        { "/api/v1/ota/reboot", HTTP_POST, reboot_post_handler },
         { "/api/v1/ota/status", HTTP_GET, status_get_handler },
     };
 

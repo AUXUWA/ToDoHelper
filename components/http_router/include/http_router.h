@@ -53,8 +53,13 @@ typedef bool (*http_auth_check_t)(httpd_req_t *req);
  * would have been dropped silently. Raised to 64 to leave room for the next
  * feature; the cost is 16 * sizeof(http_route_t) of .bss (route paths are 64 B
  * each, so under 2 KB).
+ *
+ * v1.12.0 raised it to 96: with the two OTA routes the total was exactly 64
+ * again - full, with no headroom for the next endpoint. The same failure mode
+ * twice is a sign to stop tuning the number to the last route and leave real
+ * slack instead.
  */
-#define HTTP_ROUTER_MAX_ROUTES 64
+#define HTTP_ROUTER_MAX_ROUTES 96
 
 /* ------------------------------------------------------------------------ */
 /* Registration                                                              */

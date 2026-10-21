@@ -22,6 +22,7 @@ idf_component_register(
         "src/ui_theme.c"
         "src/ui_fonts.c"
         "src/ui_font_mem.c"
+        "src/ui_font_ramfs.c"
         "src/ui_lv_mem.c"
         "src/ui_statusbar.c"
         "src/ui_widgets.c"
@@ -29,5 +30,7 @@ idf_component_register(
     PRIV_INCLUDE_DIRS "src"
     # espressif__freetype: only for the FreeType headers behind LVGL's private
     # header (lv_freetype_private.h), which the glyph-cache statistics need.
-    REQUIRES sys_utils bsp storage_manager lvgl esp_lvgl_adapter espressif__freetype
+    # vfs: the read-only RAM filesystem the font file is served from
+    # (src/ui_font_ramfs.c).
+    REQUIRES sys_utils bsp storage_manager lvgl esp_lvgl_adapter espressif__freetype vfs
 )
