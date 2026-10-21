@@ -1182,6 +1182,67 @@ esp_err_t storage_read_text(const char *rel, char **out, size_t *len)
     return err;
 }
 
+esp_err_t storage_list_dir(const char *rel, char **out, size_t *len)
+{
+    *out = NULL;
+    if (len != NULL) {
+        *len = 0;
+    }
+    if (rel == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char dir[STORAGE_PATH_MAX];
+    if (join_path(dir, sizeof(dir), s_app_dir, rel) != ESP_OK) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* The names, one per line, so the caller can just walk it. */
+    size_t cap = 512;
+    size_t used = 0;
+    char *buf = storage_malloc(cap);
+    if (buf == NULL) {
+        closedir(d);
+        return ESP_ERR_NO_MEM;
+    }
+    buf[0] = '\0';
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        const size_t nlen = strlen(entry->d_name);
+        if (used + nlen + 2 > cap) {
+            const size_t grown = cap * 2;
+            /* Explicit PSRAM caps: a plain realloc() would move a small block
+             * into internal RAM (the ALWAYSINTERNAL rule). */
+            char *bigger = heap_caps_realloc(buf, grown, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (bigger == NULL) {
+                break;
+            }
+            buf = bigger;
+            cap = grown;
+        }
+        memcpy(buf + used, entry->d_name, nlen);
+        used += nlen;
+        buf[used++] = '\n';
+        buf[used] = '\0';
+    }
+    closedir(d);
+
+    *out = buf;
+    if (len != NULL) {
+        *len = used;
+    }
+    return ESP_OK;
+}
+
 esp_err_t storage_delete_file(const char *rel)
 {
     if (rel == NULL) {

@@ -600,12 +600,24 @@ static void mic_clicked_cb(lv_event_t *e)
         return;
     }
 
-    if (!voice_service_microphone_available() && voice_service_ensure_audio() != ESP_OK) {
-        ui_toast("这台设备没有麦克风，请用键盘或网页端提问");
-        return;
-    }
     if (!voice_service_asr_configured()) {
         ui_toast("没有配置语音识别端点（网页端 → AI 对话与语音）");
+        return;
+    }
+
+    /* The audio is opened in the background: waiting for the codec here would
+     * freeze the whole UI (the LVGL lock is held while a callback runs). */
+    if (!voice_service_audio_ready()) {
+        const esp_err_t init_err = voice_service_ensure_audio_async();
+        if (init_err != ESP_OK) {
+            ui_toast("麦克风启动失败：%s", esp_err_to_name(init_err));
+            return;
+        }
+        ui_toast("正在打开麦克风…稍等一下再点一次");
+        return;
+    }
+    if (!voice_service_microphone_available()) {
+        ui_toast("这台设备没有麦克风，请用键盘或网页端提问");
         return;
     }
 
@@ -626,14 +638,24 @@ static void speak_clicked_cb(lv_event_t *e)
         ui_toast("没有配置语音合成端点（网页端 → AI 对话与语音）");
         return;
     }
-    if (!voice_service_speaker_available() && voice_service_ensure_audio() != ESP_OK) {
-        ui_toast("这台设备没有扬声器");
-        return;
-    }
-
     const char *reply = ai_service_get_last_reply();
     if (reply == NULL || reply[0] == '\0') {
         ui_toast("还没有可朗读的回答");
+        return;
+    }
+
+    /* Also opened in the background - see mic_clicked_cb(). */
+    if (!voice_service_audio_ready()) {
+        const esp_err_t init_err = voice_service_ensure_audio_async();
+        if (init_err != ESP_OK) {
+            ui_toast("扬声器启动失败：%s", esp_err_to_name(init_err));
+            return;
+        }
+        ui_toast("正在打开扬声器…稍等一下再点一次");
+        return;
+    }
+    if (!voice_service_speaker_available()) {
+        ui_toast("这台设备没有扬声器");
         return;
     }
 
@@ -681,11 +703,20 @@ static esp_err_t voice_event_cb(int32_t event_id, void *data)
             ui_toast("没听清");
             break;
         }
+        /* 隐藏的页面不许继续建控件（铁律四）：把文字攒着，回来时补。 */
+        if (!s_visible) {
+            strlcpy(s_pending_user, text, sizeof(s_pending_user));
+            break;
+        }
         /* 识别出来的文字当成一次提问。 */
         add_bubble(text, true);
         strlcpy(s_pending_user, text, sizeof(s_pending_user));
         stream_finish();
-        (void)ai_service_chat_async(text);
+        const esp_err_t err = ai_service_chat_async(text);
+        if (err != ESP_OK) {
+            /* 上一轮还没结束：这条提问已经贴上去了，得告诉用户它不会有人回答。 */
+            ui_toast("上一轮还没结束，这条提问暂时不会被回答");
+        }
         break;
     }
     case VOICE_EVENT_PLAY_DONE: {

@@ -16,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -62,7 +63,9 @@ static volatile bool s_init_task_running;
 static volatile bool s_init_done;
 static volatile bool s_init_gave_up;
 static volatile esp_err_t s_init_result;
-static SemaphoreHandle_t s_init_sem;
+/** Guards the *creation* of the bring-up task (so two callers cannot start
+ * two of them). */
+static SemaphoreHandle_t s_init_lock;
 
 /** How long the codec gets to answer before we stop waiting for it. */
 #define VOICE_INIT_TIMEOUT_MS 3000
@@ -137,6 +140,54 @@ bool voice_service_audio_ready(void)
     return s_audio_ready;
 }
 
+esp_err_t voice_service_ensure_audio_async(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_audio_ready) {
+        return (s_mic_ok || s_speaker_ok) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * Start the bring-up and return immediately.
+     *
+     * The LVGL callbacks must never wait for the hardware: the bring-up talks
+     * to the codec over I2C and can take seconds, and the UI thread is frozen
+     * for as long as it waits (the adapter holds the LVGL lock).
+     *
+     * s_init_lock only guards the *creation* of the task (so two callers
+     * cannot start two of them); the completion is signalled by
+     * s_init_done_sem. They must not be the same object - a mutex whose count
+     * is given twice lets two tasks through.
+     */
+    if (s_init_lock == NULL) {
+        s_init_lock = xSemaphoreCreateMutex();
+        if (s_init_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!xSemaphoreTake(s_init_lock, pdMS_TO_TICKS(0))) {
+        return ESP_OK; /* someone else is already starting it */
+    }
+    if (s_init_task_running) {
+        xSemaphoreGive(s_init_lock);
+        return ESP_OK; /* already on its way */
+    }
+    s_init_task_running = true;
+    s_init_done = false;
+    s_init_gave_up = false;
+    s_init_result = ESP_FAIL;
+
+    if (xTaskCreate(audio_init_task, "th_audio", VOICE_HTTP_TASK_STACK, NULL, 4, NULL) != pdPASS) {
+        s_init_task_running = false;
+        xSemaphoreGive(s_init_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreGive(s_init_lock);
+    return ESP_OK;
+}
+
 esp_err_t voice_service_ensure_audio(void)
 {
     if (!s_initialized) {
@@ -156,31 +207,15 @@ esp_err_t voice_service_ensure_audio(void)
      * mismatched MCLK setup: the device stayed alive but stopped answering
      * HTTP.) So: own task, bounded wait, and the caller moves on.
      */
-    if (s_init_sem == NULL) {
-        s_init_sem = xSemaphoreCreateMutex();
-        if (s_init_sem == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    if (s_init_task_running) {
-        return ESP_ERR_INVALID_STATE; /* someone else is already trying */
-    }
-    s_init_task_running = true;
-    s_init_done = false;
-    s_init_gave_up = false;
-    s_init_result = ESP_FAIL;
-
-    if (xTaskCreate(audio_init_task, "th_audio", 4096, NULL, 4, NULL) != pdPASS) {
-        s_init_task_running = false;
-        return ESP_ERR_NO_MEM;
+    const esp_err_t started = voice_service_ensure_audio_async();
+    if (started != ESP_OK) {
+        return started;
     }
 
     /* Wait at most VOICE_INIT_TIMEOUT_MS for the codec to answer. */
-    for (int waited = 0; waited < VOICE_INIT_TIMEOUT_MS; waited += 50) {
-        if (s_init_done) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
+    const int64_t deadline = esp_timer_get_time() + (int64_t)VOICE_INIT_TIMEOUT_MS * 1000;
+    while (!s_init_done && esp_timer_get_time() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (!s_init_done) {
         SYS_LOGW(TAG, "audio bring-up did not finish in %d ms; giving up on it",
@@ -240,15 +275,19 @@ static void ensure_audio(void)
     if (s_audio_ready) {
         return;
     }
-    s_audio_ready = true;
 
     if (th_bsp_audio_init() != ESP_OK) {
+        /* Marked ready anyway, but with the flags left false: a caller that
+         * asks now must get the truth ("no audio"), not a half-initialised
+         * state. */
+        s_audio_ready = true;
         SYS_LOGW(TAG, "audio hardware unavailable; voice features disabled");
         return;
     }
 
     s_mic_ok = (mic_handle() != NULL);
     s_speaker_ok = (speaker_handle() != NULL);
+    s_audio_ready = true;
 
     if (!s_mic_ok) {
         SYS_LOGW(TAG, "no microphone; text input must be used instead (FR7 degradation)");
@@ -281,6 +320,83 @@ static void audio_init_task(void *arg)
 /* ------------------------------------------------------------------------ */
 /* Recording                                                                 */
 /* ------------------------------------------------------------------------ */
+
+/**
+ * Keep the recordings on the card from piling up.
+ *
+ * Every recording is a raw PCM file of up to 320 KB. Without a policy the
+ * card fills up (and every later write gets slower). Keep the newest
+ * CONFIG_TODOHELPER_VOICE_KEEP_PCM files and delete the rest.
+ */
+static void prune_recordings(void)
+{
+#if CONFIG_TODOHELPER_VOICE_KEEP_PCM > 0
+    char *listing = NULL;
+    size_t len = 0;
+    if (storage_list_dir("ai", &listing, &len) != ESP_OK || listing == NULL) {
+        return;
+    }
+
+    /* The names are rec_<uptime_ms>.pcm - the number is the age, so sort by
+     * it rather than by the string.
+     *
+     * These arrays are **static**: this runs on the record task, whose stack
+     * is small (the capture buffer alone takes 1 KB of it), and 700 bytes of
+     * locals there overflowed it - the device crashed with
+     * "A stack overflow in task th_record has been detected".
+     * Only the record task prunes, so no locking is needed. */
+    static uint64_t stamps[CONFIG_TODOHELPER_VOICE_KEEP_PCM + 8];
+    static char names[CONFIG_TODOHELPER_VOICE_KEEP_PCM + 8][48];
+    size_t count = 0;
+    const size_t cap = sizeof(stamps) / sizeof(stamps[0]);
+
+    char *save = NULL;
+    for (char *line = strtok_r(listing, "\n", &save); line != NULL;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (strncmp(line, "rec_", 4) != 0) {
+            continue;
+        }
+        const size_t nlen = strlen(line);
+        if (nlen < 5 || nlen >= sizeof(names[0]) || count >= cap) {
+            continue;
+        }
+        uint64_t stamp = 0;
+        if (sscanf(line + 4, "%llu", (unsigned long long *)&stamp) != 1) {
+            continue;
+        }
+        stamps[count] = stamp;
+        memcpy(names[count], line, nlen + 1);
+        count++;
+    }
+    free(listing);
+
+    if (count <= (size_t)CONFIG_TODOHELPER_VOICE_KEEP_PCM) {
+        return;
+    }
+
+    /* Sort by the timestamp: the oldest first. */
+    for (size_t i = 1; i < count; i++) {
+        const uint64_t stamp = stamps[i];
+        char name[48];
+        memcpy(name, names[i], sizeof(name));
+        size_t j = i;
+        while (j > 0 && stamps[j - 1] > stamp) {
+            stamps[j] = stamps[j - 1];
+            memcpy(names[j], names[j - 1], sizeof(names[j]));
+            j--;
+        }
+        stamps[j] = stamp;
+        memcpy(names[j], name, sizeof(name));
+    }
+
+    for (size_t i = 0; i + (size_t)CONFIG_TODOHELPER_VOICE_KEEP_PCM < count; i++) {
+        char rel[96];
+        snprintf(rel, sizeof(rel), "ai/%.48s", names[i]);
+        (void)storage_delete_file(rel);
+        SYS_LOGD(TAG, "pruned the oldest recording %s", rel);
+    }
+#endif
+}
 
 static void record_task(void *arg)
 {
@@ -393,6 +509,7 @@ static void record_task(void *arg)
                  (unsigned long long)sys_time_ms());
         if (storage_write_file(info.path, s_pcm, produced * sizeof(int16_t)) == ESP_OK) {
             info.saved = true;
+            prune_recordings();
         } else {
             info.path[0] = '\0';
         }
@@ -427,11 +544,18 @@ esp_err_t voice_service_start_record(void)
 
     s_stop_requested = false;
     s_pcm_count = 0;
+    /* Reset the statistics: if the capture fails, the probe must not report
+     * the previous recording's numbers. */
+    s_pcm_count = 0;
+    s_pcm_ms = 0;
+    s_pcm_peak = 0;
     s_recording = true;
 
     (void)sys_event_post_to(VOICE_EVENT, VOICE_EVENT_WAKE, NULL, 0);
 
-    if (xTaskCreate(record_task, "th_record", 4096, NULL, 5, NULL) != pdPASS) {
+    /* 8192: the capture buffer takes 1 KB of this stack and the codec's read
+     * path (I2S + esp_codec_dev) needs more on top of it. */
+    if (xTaskCreate(record_task, "th_record", VOICE_HTTP_TASK_STACK, NULL, 5, NULL) != pdPASS) {
         s_recording = false;
         return ESP_ERR_NO_MEM;
     }

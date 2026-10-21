@@ -71,6 +71,10 @@ static const struct {
      * and how much history is kept - the same "the user's own data" as the
      * conversation log above. */
     { "/api/v1/ai/config", HTTP_GET },
+    /* The voice status says whether the board has a microphone and a speaker
+     * and which endpoints are configured - the same kind of "the user's own
+     * data" as the conversation log. */
+    { "/api/v1/voice/status", HTTP_GET },
 };
 
 /**

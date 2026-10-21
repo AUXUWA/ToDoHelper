@@ -158,6 +158,15 @@ esp_err_t storage_read_text(const char *rel, char **out, size_t *len);
 esp_err_t storage_delete_file(const char *rel);
 
 /**
+ * @brief List the files in a directory.
+ *
+ * @param rel  directory relative to the app directory ("" = the app dir itself)
+ * @param[out] out  heap buffer with the file names, one per line (free() it)
+ * @param[out] len  the number of bytes written (optional)
+ */
+esp_err_t storage_list_dir(const char *rel, char **out, size_t *len);
+
+/**
  * @brief True when a previous generation of "<rel>" is kept as "<rel>.bak".
  */
 bool storage_backup_exists(const char *rel);

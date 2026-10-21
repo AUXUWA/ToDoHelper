@@ -111,6 +111,15 @@ bool voice_service_audio_ready(void);
 esp_err_t voice_service_ensure_audio(void);
 
 /**
+ * @brief Start the audio bring-up and return immediately.
+ *
+ * The UI must use this one: the bring-up talks to the codec over I2C and can
+ * take seconds, and the LVGL thread is frozen for as long as it waits
+ * (the adapter holds the LVGL lock while a callback runs).
+ */
+esp_err_t voice_service_ensure_audio_async(void);
+
+/**
  * @brief Peak absolute amplitude of the last capture (0 = silence).
  *
  * A capture that produced samples but a peak of 0 means the codec is running

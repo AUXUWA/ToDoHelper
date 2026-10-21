@@ -229,6 +229,8 @@
   /* ---------- 墨墨背单词 ---------- */
   #maimemo>summary{list-style:none;cursor:pointer}
   #maimemo>summary::-webkit-details-marker{display:none}
+#ai>summary::-webkit-details-marker{display:none}
+.ai-out{margin:8px 0 0;padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-radius:8px;white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;font-size:13px}
   #maimemo>summary::marker{content:""}
   .mm-sub{font-size:13px;margin:12px 0 6px;color:var(--muted)}
   /* 今日词表：设备最多返回 64 条，这里再截断到 50 行并说明省略了多少。 */
@@ -500,11 +502,11 @@
             <option value="deepseek-reasoner">deepseek-reasoner（会推理，慢一些）</option>
           </select></label>
 
-        <label class="field"><span>系统提示词（留空 = 不改）</span>
+        <label class="field"><span>系统提示词（留空 = 不改；<strong>改了会清空设备上的对话历史</strong>）</span>
           <input type="text" id="ai-prompt" placeholder="例如：你是一个记单词的助手，回答简短一些"></label>
 
         <label class="field"><span>保留对话轮数</span>
-          <input type="number" id="ai-rounds" min="1" max="20" step="1" placeholder="10"></label>
+          <input type="number" id="ai-rounds" min="1" max="12" step="1" placeholder="10"></label>
 
         <label class="inline-check"><input type="checkbox" id="ai-save-hist">
           <span>把对话历史存到 SD 卡（换设备或清历史后还能接着聊）</span></label>
@@ -517,7 +519,7 @@
 
         <div id="ai-test-box" hidden>
           <h3 class="mm-sub">试问结果</h3>
-          <pre id="ai-test-out" class="ai-out"></pre>
+          <pre id="ai-test-out" class="ai-out">（还没有试问）</pre>
         </div>
 
         <h3 class="mm-sub">语音（云端识别 / 合成）</h3>
@@ -539,10 +541,12 @@
           <select id="ai-wake">
             <option value="button">按屏幕上的麦克风按钮</option>
             <option value="none">关闭语音输入</option>
+            <option value="keyword">关键词唤醒（本固件未实现离线识别）</option>
           </select></label>
 
         <div class="row-actions">
           <button class="btn" type="button" id="ai-voice-save">保存语音配置</button>
+          <button class="btn danger" type="button" id="ai-voice-clear">清除两个端点</button>
           <button class="btn" type="button" id="ai-voice-refresh">刷新语音状态</button>
         </div>
         <p class="small muted" id="ai-voice-state">语音状态未知</p>
@@ -728,6 +732,13 @@ function apiSlow(path, options) {
 /* 设备把真正的原因放在 data.detail（英文上下文）和 data.esp_err（esp_err_t 名字）里，
    body.msg 往往只有一句 "internal error"。这里把三者都翻成中文再给人看。 */
 var MSG_TEXT = {
+  "no API key configured (POST /api/v1/ai/config)": "还没配置 DeepSeek API Key（网页端 → AI 对话与语音）",
+  "offline: AI is unavailable without a network": "设备不在线，AI 用不了",
+  "request aborted or timed out": "AI 请求被中断或超时了",
+  "AI worker busy": "上一轮还没结束，稍等一下",
+  "model must be deepseek-chat or deepseek-reasoner": "模型只能是 deepseek-chat 或 deepseek-reasoner",
+  "no TTS endpoint configured (POST /api/v1/voice/config)": "没配置语音合成端点",
+  "invalid json": "请求内容不是合法 JSON",
   "internal error": "设备内部错误",
   "invalid json": "请求内容不是合法 JSON",
   "not found": "设备上找不到这一项",
@@ -2257,13 +2268,19 @@ $("ai-test").addEventListener("click", function () {
 
 $("ai-voice-save").addEventListener("click", function () {
   $("ai-voice-save").disabled = true;
+  /* The endpoint URLs are never echoed back (they may carry a token in the
+   * query), so the inputs start empty every time. Sending the empty value
+   * would therefore **clear** the endpoints on the device while the toast
+   * says "saved" - so only send a field the user actually typed, and let the
+   * explicit "clear" button do the clearing. */
+  var body = { wake_mode: $("ai-wake").value };
+  var asr = $("ai-asr").value.trim();
+  var tts = $("ai-tts").value.trim();
+  if (asr) { body.asr_url = asr; }
+  if (tts) { body.tts_url = tts; }
   api("/api/v1/voice/config", {
     method: "POST",
-    body: JSON.stringify({
-      asr_url: $("ai-asr").value.trim(),
-      tts_url: $("ai-tts").value.trim(),
-      wake_mode: $("ai-wake").value
-    }),
+    body: JSON.stringify(body),
     timeoutMs: 10000
   }).then(function (state) {
     if (state) {
@@ -2274,11 +2291,33 @@ $("ai-voice-save").addEventListener("click", function () {
       bits.push(state.tts_configured ? "合成端点已配" : "合成端点未配");
       $("ai-voice-state").textContent = bits.join(" · ");
     }
-    toast("语音配置已保存", "ok");
+    toast((asr || tts) ? "语音配置已保存" : "唤醒方式已保存（端点未改动）", "ok");
   }).catch(function (err) {
     reportError(err, "保存语音配置");
   }).then(function () {
     $("ai-voice-save").disabled = false;
+  });
+});
+
+$("ai-voice-clear").addEventListener("click", function () {
+  $("ai-voice-clear").disabled = true;
+  api("/api/v1/voice/config", {
+    method: "POST",
+    body: JSON.stringify({ asr_url: "", tts_url: "" }),
+    timeoutMs: 10000
+  }).then(function (state) {
+    $("ai-asr").value = "";
+    $("ai-tts").value = "";
+    if (state) {
+      $("ai-voice-state").textContent =
+        (state.asr_configured ? "识别端点已配" : "识别端点未配") + " · " +
+        (state.tts_configured ? "合成端点已配" : "合成端点未配");
+    }
+    toast("已清除识别与合成端点", "ok");
+  }).catch(function (err) {
+    reportError(err, "清除语音端点");
+  }).then(function () {
+    $("ai-voice-clear").disabled = false;
   });
 });
 
