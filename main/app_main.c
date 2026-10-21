@@ -26,6 +26,7 @@
 #include "freertos/task.h"
 
 #include "ai_service.h"
+#include "ota_service.h"
 #include "calendar_service.h"
 #include "debug_shell.h"
 #include "idle_face.h"
@@ -91,6 +92,7 @@ static const app_module_t s_modules[] = {
     { .name = "sync_server",      .init = sync_server_init, .optional = true,  .after_ui = true },
     { .name = "idle_face",        .init = idle_face_init, .optional = true,  .after_ui = true },
     { .name = "ai_service",       .init = ai_service_init, .optional = true, .after_ui = true },
+    { .name = "ota_service",      .init = ota_service_init, .optional = true, .after_ui = true },
     { .name = "voice_service",    .init = voice_service_init, .optional = true, .after_ui = true },
     /* Last, and compiled out unless CONFIG_TODOHELPER_DEBUG_SHELL is set: it is
      * a development aid (/api/v1/debug/exec), not a product feature. */
@@ -268,6 +270,19 @@ void app_main(void)
         SYS_LOGW(TAG, "UI assets unavailable, pages will use text fallbacks");
     }
     sys_heap_log("ui_assets");
+
+    /*
+     * Confirm the running firmware **as early as possible**.
+     *
+     * After an OTA the bootloader starts the new image in the PENDING_VERIFY
+     * state and gives it a time window to say "I'm fine" (by calling
+     * esp_ota_mark_app_valid_cancel_rollback()). If the new image does not
+     * manage that in time, the bootloader rolls back to the previous one - which
+     * is exactly what should happen when a new image is broken. Calling it
+     * here (rather than at the very end of app_main) keeps as much of that
+     * window as possible for the real work of booting.
+     */
+    (void)ota_service_mark_valid();
 
     ESP_ERROR_CHECK(ui_core_init());
     sys_heap_log("ui_core");

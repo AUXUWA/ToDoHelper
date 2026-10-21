@@ -231,6 +231,9 @@
   .addr-url:hover{text-decoration:underline}
   .addr-row{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
   .addr-row input{flex:1 1 200px;min-width:0}
+  .ota-bar-wrap{margin-top:10px}
+  .ota-bar{height:10px;border-radius:5px;background:var(--line);overflow:hidden}
+  .ota-bar-fill{height:100%;width:0;background:var(--primary);transition:width .2s}
   .wifi-warn{border-left:4px solid var(--warning)}
 
   /* ---------- 墨墨背单词 ---------- */
@@ -510,6 +513,33 @@
           <ul class="mm-list" id="mm-hist-list"></ul>
           <p class="small muted" id="mm-hist-note"></p>
         </div>
+      </div>
+    </details>
+
+    <!-- 固件升级 -->
+    <details class="card" id="ota">
+      <summary class="card-head" style="cursor:pointer;list-style:none;margin:0">
+        <h2>固件升级</h2>
+        <span class="spacer"></span>
+        <span class="stamp" id="ota-state">状态未知</span>
+      </summary>
+      <div class="fields" style="padding-top:10px">
+        <p class="small muted">
+          选一个编译出来的 <code>build/todohelper.bin</code> 传上来，设备会把它写进
+          <strong>另一个</strong>槽位，写完校验通过再重启进新固件。升级期间设备照常工作
+          （待办、AI、天气都不受影响），只有最后会重启一次。<br>
+          写坏了也不会变砖：新固件起来之后要「认下」自己，认不了（崩了），
+          bootloader 会自动退回上一个版本。
+        </p>
+        <div class="row-actions">
+          <input type="file" id="ota-file" accept=".bin" aria-label="固件文件" style="flex:1 1 240px;min-width:0">
+          <button class="btn primary" type="button" id="ota-upload">上传并升级</button>
+        </div>
+        <div class="ota-bar-wrap" id="ota-bar-wrap" hidden>
+          <div class="ota-bar"><div class="ota-bar-fill" id="ota-bar-fill"></div></div>
+          <p class="small muted" id="ota-progress">0%</p>
+        </div>
+        <p class="small muted" id="ota-result"></p>
       </div>
     </details>
 
@@ -2445,6 +2475,89 @@ $("ai-voice-clear").addEventListener("click", function () {
 $("ai-voice-refresh").addEventListener("click", function () {
   loadVoice();
 });
+/* ------------------------------------------------------------------ */
+/* 固件升级                                                              */
+/* ------------------------------------------------------------------ */
+
+function otaSetState(text) {
+  setText($("ota-state"), text);
+}
+
+function otaSetProgress(percent, note) {
+  $("ota-bar-wrap").hidden = false;
+  $("ota-bar-fill").style.width = Math.max(0, Math.min(100, percent)) + "%";
+  setText($("ota-progress"), note || (Math.round(percent) + "%"));
+}
+
+function loadOta() {
+  return api("/api/v1/ota/status", { timeoutMs: 8000 }).then(function (state) {
+    if (!state) {
+      otaSetState("状态未知");
+      return null;
+    }
+    var names = { idle: "空闲", writing: "正在写入", verifying: "正在校验",
+                  rebooting: "等待重启", failed: "失败" };
+    otaSetState((names[state.state] || state.state) + " · 槽位 " + state.running +
+                 (state.pending ? " → " + state.pending : ""));
+    if (state.state === "failed" && state.error) {
+      setText($("ota-result"), "上次升级失败：" + state.error);
+    }
+    return state;
+  }).catch(function (err) {
+    otaSetState("读取失败");
+    if (err.kind === "auth") { reachableWithProblem(err); }
+    return null;
+  });
+}
+
+$("ota-upload").addEventListener("click", function () {
+  var input = $("ota-file");
+  if (!input.files || !input.files[0]) {
+    toast("先选一个固件文件（build/todohelper.bin）", "warn");
+    return;
+  }
+  var file = input.files[0];
+  if (!/[.]bin$/i.test(file.name)) {
+    toast("这不像一个固件镜像（应该是 .bin）", "warn");
+    return;
+  }
+
+  otaSetState("上传中");
+  otaSetProgress(0, "0%");
+  setText($("ota-result"), "");
+
+  /* XHR 而不是 fetch：要上传进度。 */
+  var xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/v1/ota/upload", true);
+  xhr.setRequestHeader("Content-Type", "application/octet-stream");
+  if (token) { xhr.setRequestHeader("X-Auth-Token", token); }
+
+  xhr.upload.onprogress = function (e) {
+    if (e.lengthComputable) {
+      otaSetProgress((e.loaded / e.total) * 100, Math.round((e.loaded / e.total) * 100) + "%");
+    }
+  };
+  xhr.onload = function () {
+    var body = null;
+    try { body = JSON.parse(xhr.responseText); } catch (e) { /* not json */ }
+    if (xhr.status === 200 && body && body.ok) {
+      otaSetState("写入完成，设备正在重启");
+      otaSetProgress(100, "100%");
+      setText($("ota-result"), "升级成功，设备正在重启进新固件（约 10 秒后可以刷新看看）。");
+      setTimeout(function () { loadOta(); loadDevice(); }, 12000);
+    } else {
+      var msg = (body && body.error) ? body.error : ("HTTP " + xhr.status);
+      otaSetState("升级失败");
+      setText($("ota-result"), "升级失败：" + msg);
+    }
+  };
+  xhr.onerror = function () {
+    otaSetState("上传失败");
+    setText($("ota-result"), "上传失败：连不上设备");
+  };
+  xhr.send(file);
+});
+
 
 /* 折叠时不打扰设备：展开才拉状态。 */
 $("ai").addEventListener("toggle", function (event) {

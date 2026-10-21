@@ -195,3 +195,9 @@ CONFIG_USB_HOST_HUBS_SUPPORTED=y
 # so the UI can be inspected and driven remotely. Off in a shipped build; see
 # components/debug_shell/Kconfig. Turn OFF before shipping.
 CONFIG_TODOHELPER_DEBUG_SHELL=y
+
+# OTA：两个 app 槽位（partitions.csv 里 ota_0 / ota_1）+ 开机回滚。
+# 新固件起来后要调用 esp_ota_mark_app_valid_cancel_rollback()「认下」自己，
+# 不认（崩了/卡死了）bootloader 就退回上一个版本 —— 一次坏升级不会变砖。
+# 见 components/ota_service/README.md。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

@@ -1402,6 +1402,8 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/` | sync_server | 内嵌浏览器待办页（`EMBED_FILES web/index.html`，`text/html; charset=utf-8`，`Cache-Control: no-cache`） | ✅ 200 |
 | GET | `/index.html` | sync_server | 同上 | ✅ 200 |
 | GET | `/api/v1/device/info` | sync_server | 芯片/固件版本/IDF/`mac`/`ip`/`hostname`/`wifi_state`/存储状态/`auth_enabled`；**不含任何密钥或 token**。`version` 来自工程根目录 `version.txt`（规则见 `AGENT.md §8.1`），1.0.0 实测 `"version":"1.0.0"` | ✅ 200 |
+| POST | `/api/v1/ota/upload` | ota_service | **请求体就是固件镜像**（`application/octet-stream`）。写进另一个槽位、校验通过后切过去并重启。升级期间设备其它接口照常可用（异步 handler） | ✅ 200 |
+| GET | `/api/v1/ota/status` | ota_service | `{state:"idle"/"writing"/"verifying"/"rebooting"/"failed", written, total, error, running, pending}`（`running`/`pending` 是槽位名） | ✅ 200 |
 | GET | `/api/v1/device/status` | sync_server | `uptime_s`/`free_heap`/`min_free_heap`/`free_psram`/`routes`/`sse_clients`/`wifi_rssi`/`wifi_connected`/`time_synced`/`server_ts`/`url`；1.0.0 实测 `routes:45`、`sse_clients` 随订阅数变化 | ✅ 200 |
 | POST | `/api/v1/device/reboot` | sync_server | 先回 `{"rebooting":true}`，再 700 ms 后 `esp_restart()`。**强制鉴权** | ✅ 200（需 token） |
 | POST | `/api/v1/device/auth` | sync_server | body `{"token":"..."}`；空串/`null` 关闭鉴权、开启鉴权时长度 ≤63。**强制鉴权** | ✅ 200（需 token） |

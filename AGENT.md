@@ -234,9 +234,10 @@ idf.py reconfigure               # 重跑 CMake + 组件管理器
 ```
 ToDoHelper/
 ├─ CMakeLists.txt              # EXTRA_COMPONENT_DIRS 指向 ../common_components；project(todohelper)
-├─ partitions.csv              # nvs 0x9000/0x6000, phy_init 0xf000/0x1000,
-│                              # factory 0x10000/0x800000, storage(littlefs) 0x810000/0x200000,
-│                              # assets(spiffs) 0xa10000/0x5f0000
+├─ partitions.csv              # nvs 0x9000/0x6000, otadata 0xf000/0x2000, phy_init 0x11000/0x1000,
+│                              # ota_0 0x20000/0x3e0000, ota_1 0x400000/0x410000,
+│                              # storage(littlefs) 0x810000/0x200000, assets(spiffs) 0xa10000/0x5f0000
+│                              # （v1.11.0 起是两个 app 槽位，storage/assets 的偏移量没动）
 ├─ sdkconfig.defaults          # 真正的默认配置来源（**含两条不可删的必需项**，见 §9）
 ├─ sdkconfig                   # 生成物，不要手改
 ├─ dependencies.lock           # 组件管理器锁文件（target: esp32s31）
@@ -393,7 +394,11 @@ Project build complete.
 烧录成功判据：每个镜像后出现 `Hash of data verified.`，结尾 `Hard resetting via RTS pin...` + `Done`。
 
 烧录地址（`idf.py flash` 自动处理）：
-`0x2000` bootloader、`0x8000` 分区表、`0x10000` app、`0x810000` storage(littlefs)、`0xa10000` assets。
+`0x2000` bootloader、`0x8000` 分区表、`0x20000` app 槽位 ota_0（`0x400000` 是 ota_1）、
+`0x810000` storage(littlefs)、`0xa10000` assets。
+**v1.11.0 起 app 有两个槽位**（OTA），槽位比原来那个 8 MB 的 factory 分区小得多
+（现在是 0x3E0000 = 3.97 MB，当前固件 3.28 MB，余量不多）——
+**固件涨过 3.9 MB 就装不下了**。
 
 ### 8.1 版本号与发布（`version.txt`）
 
@@ -856,6 +861,26 @@ pwsh tools/flash.ps1 -Monitor     # 烧完直接进监视器
     改完之后量出来的数才有意义：某页的首次绘制 226~416 ms（冷，字要重新光栅化），
     而整屏重画的稳态是 24 ms。
     → 教训：**「测出来一个漂亮的小数字」先怀疑这个数字测的是不是你要的东西。**
+
+### 9.0.1.11 v1.11.0 补进来的三条实测结论
+
+31. **OTA 的三条安全线，缺一条设备就可能变砖。**
+    真机把这三条都验过了：
+    * **写进另一个槽位**（不覆盖正在跑的那个）；
+    * **写完校验**（`esp_ota_end()` 拒掉截断/非法的镜像 —— 上传 1 MB 的
+      残缺文件，设备当场报「固件校验不通过」，而且**没有重启**，继续跑旧固件）；
+    * **开机回滚**（新固件起来要「认下」自己，认不了 bootloader 就退回上一个）。
+      这一条是这么验的：故意做一个不认自己的镜像传上去，设备重启后跑的是它；
+      **再重启一次**，bootloader 就把它退回去了，设备回到之前那个版本。
+32. **几百 MB 的固件不能一次性读进内存。**
+    固件是 3.3 MB，而内部堆只有 180 KB —— `http_read_body()` 会 malloc 3.3 MB，
+    直接就没了。所以 OTA 的请求体是**分块读、分块写**（32 KB 一块，
+    `httpd_req_recv()` + `esp_ota_write()`）。
+33. **「上传」这种长请求不能占着 httpd 任务。**
+    esp_http_server 只有一个 httpd 任务，URI handler 在里面串行执行：
+    handler 不返回，连 accept() 都不跑（AGENT.md §9.0.1 最后一条）。
+    一次上传是好几秒，所以用 `httpd_req_async_handler_begin()` 把 socket
+    交给自有任务（和 ai_service 同一套做法）。
 
 ### 9.0.1.10 v1.10.0 补进来的两条实测结论
 

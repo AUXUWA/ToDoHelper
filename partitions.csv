@@ -1,6 +1,16 @@
 # Name,   Type, SubType,  Offset,   Size,     Flags
+#
+# OTA: 两个 app 槽位（ota_0 / ota_1），设备一次只能从一个槽位启动，
+# 升级时把新固件写进另一个槽位 —— 所以 app 的空间是「一个槽位的大小」，
+# 不是两个。（v1.11.0 之前是单个 8 MB 的 factory 分区。）
+#
+# **storage 与 assets 的偏移量刻意没动**（0x810000 / 0xA10000）：
+# storage 里是设备本地的数据（待办、单词进度、AI 历史），动了偏移量
+# 那些数据就找不到了。
 nvs,      data, nvs,      0x9000,   0x6000,
-phy_init, data, phy,      0xf000,   0x1000,
-factory,  app,  factory,  0x10000,  0x800000,
+otadata,  data, ota,      0xF000,   0x2000,
+phy_init, data, phy,      0x11000,  0x1000,
+ota_0,    app,  ota_0,    0x20000,  0x3E0000,
+ota_1,    app,  ota_1,    0x400000, 0x410000,
 storage,  data, littlefs, 0x810000, 0x200000,
-assets,   data, spiffs,   0xa10000, 0x5f0000,
+assets,   data, spiffs,   0xA10000, 0x5F0000,
