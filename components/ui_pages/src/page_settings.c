@@ -1193,12 +1193,20 @@ static void refresh_info(void)
      * picked up. Both writes are dirty-checked: a 1 Hz unconditional
      * lv_label_set_text would repaint the page forever.
      */
+    /*
+     * The IP comes first on purpose.
+     *
+     * The mDNS name is the pretty one, but it only resolves where mDNS really
+     * works - Windows does not by default (it needs Bonjour) and some routers
+     * drop multicast - and on this bench `todohelper.local` simply does not
+     * open. The IP always works; the pretty name is the second choice.
+     */
     char url[128];
+    char ip_url[40];
+    sync_server_ip_url(ip_url, sizeof(ip_url));
     const char *primary = sync_server_url();
-    if (strstr(primary, ".local") != NULL) {
-        char ip_url[40];
-        sync_server_ip_url(ip_url, sizeof(ip_url));
-        snprintf(url, sizeof(url), "%s\n或 %s", primary, ip_url);
+    if (strstr(primary, ".local") != NULL && strncmp(ip_url, "http", 4) == 0) {
+        snprintf(url, sizeof(url), "%s\n或 %s", ip_url, primary);
     } else {
         snprintf(url, sizeof(url), "%s", primary);
     }

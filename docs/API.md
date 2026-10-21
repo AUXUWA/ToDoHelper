@@ -1440,7 +1440,7 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | POST | `/api/v1/wifi/scan` | wifi_manager | 触发异步扫描，立即返回 `{"scanning":true}`；结果靠随后 GET 轮询 | ✅ 200 |
 | POST | `/api/v1/wifi/connect` | wifi_manager | body `{"ssid","password"}`，异步发起；凭据写 NVS | ✅ 200 |
 | POST | `/api/v1/wifi/disconnect` | wifi_manager | 断开并停止自动重连 | ✅ 200 |
-| POST | `/api/v1/wifi/config` | wifi_manager | body `{"ssid","password","auto_connect"}`：只存凭据不连接 | ✅ 200 |
+| POST | `/api/v1/wifi/config` | wifi_manager | body `{"ssid","password","auto_connect"}`：只存凭据不连接。**v1.10.0 追加 `ip`**：固定地址（空串 = 改回 DHCP）；网关和子网掩码用设备上次租约里的值 | ✅ 200 |
 | POST | `/api/v1/wifi/forget` | wifi_manager | 清除 NVS 里的 SSID/密码（不主动断开） | ✅ 200 |
 | POST | `/api/v1/ai/chat` | ai_service | **v1.5.0 起异步**：handler 立刻把会话交给自有任务，AI 请求期间**设备其它 HTTP 接口照常可用**；对外响应格式不变 | ✅ 200 |
 | POST | `/api/v1/ai/chat/stream` | ai_service | **v1.5.0 起异步**（`text/event-stream`，异步 handler + 自有任务）；chunk/done/error 事件格式不变 | ✅ 200 |

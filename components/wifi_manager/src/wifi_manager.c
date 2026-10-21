@@ -76,6 +76,18 @@ typedef enum {
 
 static wifi_mgr_state_t s_state = WIFI_MGR_DISCONNECTED;
 static char s_ssid[WIFI_MANAGER_SSID_MAX + 1];
+
+/*
+ * A static address for the station (empty = DHCP).
+ *
+ * Why: the address the user types into the browser is handed out by DHCP, and
+ * it changes with every lease - on this bench it changed three times in one
+ * afternoon (192.168.137.232 -> .119 -> .138). With a static address the web
+ * console's URL never changes.
+ */
+static char s_static_ip[16];
+static char s_static_gw[16];
+static char s_static_mask[16];
 static char s_ip[16] = "0.0.0.0";
 static int8_t s_rssi;
 static uint8_t s_last_reason;
@@ -324,6 +336,42 @@ static bool stored_credentials(char *ssid, size_t ssid_len, char *pass, size_t p
 /* Connect                                                                   */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * Switch the station to the configured static address (or back to DHCP).
+ *
+ * The gateway and the netmask are not asked of the user: they are taken from
+ * the last DHCP lease this device saw (a hotspot or a home router gives the
+ * same parameters to everyone), so the user only types the address.
+ */
+static void apply_address_config(void)
+{
+    if (s_netif == NULL) {
+        return;
+    }
+
+    if (s_static_ip[0] == 0) {
+        (void)esp_netif_dhcpc_start(s_netif);
+        return;
+    }
+
+    esp_netif_ip_info_t info = { 0 };
+    info.ip.addr = ipaddr_addr(s_static_ip);
+    info.gw.addr = ipaddr_addr(s_static_gw[0] ? s_static_gw : "192.168.1.1");
+    info.netmask.addr = ipaddr_addr(s_static_mask[0] ? s_static_mask : "255.255.255.0");
+
+    (void)esp_netif_dhcpc_stop(s_netif);
+    const esp_err_t err = esp_netif_set_ip_info(s_netif, &info);
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "static address %s refused: %s", s_static_ip, esp_err_to_name(err));
+        /* Fall back to DHCP rather than being left without an address. */
+        (void)esp_netif_dhcpc_start(s_netif);
+    } else {
+        SYS_LOGI(TAG, "static address %s (gw %s, mask %s)", s_static_ip,
+                 s_static_gw[0] ? s_static_gw : "192.168.1.1",
+                 s_static_mask[0] ? s_static_mask : "255.255.255.0");
+    }
+}
+
 static esp_err_t connect_with(const char *ssid, const char *password, bool remember)
 {
     if (ssid == NULL || ssid[0] == '\0') {
@@ -363,6 +411,10 @@ static esp_err_t connect_with(const char *ssid, const char *password, bool remem
     s_allow_reconnect = true;
     set_state(WIFI_MGR_CONNECTING);
     (void)sys_event_post_to(WIFI_MGR_EVENT, WIFI_MGR_EVENT_CONNECTING, NULL, 0);
+
+    /* The address has to be in place before the association, otherwise the
+     * lease would overwrite it. */
+    apply_address_config();
 
     /* esp_wifi_connect() can fail immediately (e.g. still scanning); retrying it
      * is exactly what the reconnect timer is for. */
@@ -422,6 +474,30 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 
     const ip_event_got_ip_t *evt = (const ip_event_got_ip_t *)data;
     snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&evt->ip_info.ip));
+
+    /*
+     * Remember the network's gateway and netmask.
+     *
+     * A static address needs them, and the user should not have to type all
+     * three: a hotspot or a home router hands the same ones to everyone, so
+     * the last lease is a good source.
+     */
+    if (evt->ip_info.gw.addr != 0) {
+        char buf[16] = { 0 };
+        snprintf(buf, sizeof(buf), IPSTR, IP2STR(&evt->ip_info.gw));
+        if (strcmp(buf, s_static_gw) != 0) {
+            strlcpy(s_static_gw, buf, sizeof(s_static_gw));
+            (void)sys_config_set_str(SYS_KEY_WIFI_GW, s_static_gw);
+        }
+    }
+    if (evt->ip_info.netmask.addr != 0) {
+        char buf[16] = { 0 };
+        snprintf(buf, sizeof(buf), IPSTR, IP2STR(&evt->ip_info.netmask));
+        if (strcmp(buf, s_static_mask) != 0) {
+            strlcpy(s_static_mask, buf, sizeof(s_static_mask));
+            (void)sys_config_set_str(SYS_KEY_WIFI_MASK, s_static_mask);
+        }
+    }
     update_rssi();
     s_last_reason = 0;
     /* A successful association resets the retry budget for the next outage. */
@@ -615,6 +691,12 @@ esp_err_t wifi_manager_init(void)
             s_reconnect_timer = NULL;
         }
     }
+
+    /* The static address (if any) is read before the first connection, so the
+     * association never gets a DHCP lease in the first place. */
+    (void)sys_config_get_str_or(SYS_KEY_WIFI_IP, s_static_ip, sizeof(s_static_ip), "");
+    (void)sys_config_get_str_or(SYS_KEY_WIFI_GW, s_static_gw, sizeof(s_static_gw), "");
+    (void)sys_config_get_str_or(SYS_KEY_WIFI_MASK, s_static_mask, sizeof(s_static_mask), "");
 
     s_initialized = true;
     s_allow_reconnect = false;
@@ -825,6 +907,35 @@ int8_t wifi_manager_get_rssi(void)
 {
     update_rssi();
     return s_rssi;
+}
+
+esp_err_t wifi_manager_set_static_ip(const char *ip)
+{
+    if (ip != NULL && ip[0] != 0) {
+        /* A sanity check: it has to look like an address. */
+        const uint32_t parsed = ipaddr_addr(ip);
+        if (parsed == 0 || parsed == IPADDR_NONE) {
+            SYS_LOGW(TAG, "static address '%s' is not a valid IPv4 address", ip);
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(s_static_ip, ip, sizeof(s_static_ip));
+        (void)sys_config_set_str(SYS_KEY_WIFI_IP, s_static_ip);
+        SYS_LOGI(TAG, "static address set to %s", s_static_ip);
+    } else {
+        s_static_ip[0] = 0;
+        (void)sys_config_erase(SYS_KEY_WIFI_IP);
+        SYS_LOGI(TAG, "static address cleared (back to DHCP)");
+    }
+
+    /* Take effect now: the address has to be in place before the next
+     * association. */
+    apply_address_config();
+    return ESP_OK;
+}
+
+const char *wifi_manager_get_static_ip(void)
+{
+    return s_static_ip;
 }
 
 esp_err_t wifi_manager_save_config(const char *ssid, const char *password)

@@ -122,6 +122,19 @@ int8_t wifi_manager_get_rssi(void);
 /** @brief Persist credentials without connecting. Password may be NULL for open APs. */
 esp_err_t wifi_manager_save_config(const char *ssid, const char *password);
 
+/**
+ * @brief Use a static address for the station (empty = DHCP).
+ *
+ * The address the user types into the browser is handed out by DHCP and
+ * changes with every lease. With a static address the web console's URL stays
+ * the same. The gateway and the netmask are taken from the last lease this
+ * device saw, so only the address has to be given.
+ */
+esp_err_t wifi_manager_set_static_ip(const char *ip);
+
+/** @brief The configured static address ("" = DHCP). */
+const char *wifi_manager_get_static_ip(void);
+
 /** @brief Forget the stored credentials. */
 esp_err_t wifi_manager_clear_config(void);
 

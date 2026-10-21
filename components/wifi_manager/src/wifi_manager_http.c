@@ -222,6 +222,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(root, "ssid");
     const cJSON *password = cJSON_GetObjectItemCaseSensitive(root, "password");
     const cJSON *auto_connect = cJSON_GetObjectItemCaseSensitive(root, "auto_connect");
+    const cJSON *ip = cJSON_GetObjectItemCaseSensitive(root, "ip");
 
     esp_err_t err = ESP_OK;
     if (cJSON_IsString(ssid)) {
@@ -230,6 +231,9 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
     if (cJSON_IsBool(auto_connect) && err == ESP_OK) {
         err = sys_config_set_bool(SYS_KEY_WIFI_AUTO, cJSON_IsTrue(auto_connect));
+    }
+    if (cJSON_IsString(ip) && err == ESP_OK) {
+        err = wifi_manager_set_static_ip(ip->valuestring);
     }
     cJSON_Delete(root);
 

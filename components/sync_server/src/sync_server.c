@@ -475,6 +475,25 @@ static esp_err_t device_status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "server_ts", (double)sys_time_ts());
     cJSON_AddStringToObject(root, "url", sync_server_url());
 
+    /*
+     * The address to type into a browser.
+     *
+     * `url` is the friendly mDNS name when mDNS is on - but `*.local` only
+     * resolves where mDNS actually works (Windows needs Bonjour, and some
+     * routers block multicast), so the plain IP is published next to it.
+     * Measured on this bench: the mDNS name does not resolve at all from
+     * Windows, and the IP changes with every DHCP lease - so the console shows
+     * the IP one first.
+     */
+    char ip_url[48] = { 0 };
+    sync_server_ip_url(ip_url, sizeof(ip_url));
+    cJSON_AddStringToObject(root, "url_ip", ip_url);
+    char ip[16] = { 0 };
+    (void)wifi_manager_get_ip(ip, sizeof(ip));
+    cJSON_AddStringToObject(root, "ip", ip);
+    /* Empty when the address comes from DHCP. */
+    cJSON_AddStringToObject(root, "static_ip", wifi_manager_get_static_ip());
+
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 

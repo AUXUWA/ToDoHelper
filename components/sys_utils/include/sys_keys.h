@@ -32,6 +32,12 @@ extern "C" {
 #define SYS_KEY_WIFI_SSID      "wifi_ssid"
 #define SYS_KEY_WIFI_PASS      "wifi_pass"
 #define SYS_KEY_WIFI_AUTO      "wifi_auto"
+/* Optional static address for the station: empty = DHCP. */
+#define SYS_KEY_WIFI_IP        "wifi_ip"
+/* The gateway / netmask of the last DHCP lease, so a static address can use
+ * the same network parameters without asking the user for all three. */
+#define SYS_KEY_WIFI_GW        "wifi_gw"
+#define SYS_KEY_WIFI_MASK      "wifi_mask"
 
 /* ---- Locale / time (FR3, FR4) ---- */
 #define SYS_KEY_TZ             "tz"

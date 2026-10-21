@@ -43,6 +43,9 @@ static lv_obj_t *s_view[3];
 static lv_obj_t *s_scan_status;
 static lv_obj_t *s_scan_list;
 static lv_obj_t *s_pass_ssid;
+/** The "back to DHCP" button (only visible with a fixed address). */
+static lv_obj_t *s_dhcp_button;
+static lv_obj_t *s_dhcp_label;
 static lv_obj_t *s_pass_area;
 static lv_obj_t *s_status_detail;
 static char s_pending_ssid[WIFI_MANAGER_SSID_MAX + 1];
@@ -700,6 +703,24 @@ static void disconnect_clicked_cb(lv_event_t *e)
     }
 }
 
+/**
+ * Drop the fixed address and go back to DHCP.
+ *
+ * The escape hatch: a fixed address that the network does not route would
+ * make the web console unreachable, and the console is where the address was
+ * set in the first place.
+ */
+static void dhcp_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    const esp_err_t err = wifi_manager_set_static_ip("");
+    if (err != ESP_OK) {
+        ui_toast("改回 DHCP 失败：%s", esp_err_to_name(err));
+        return;
+    }
+    ui_toast("已改回 DHCP，设备正在重新连接");
+}
+
 static void status_back_cb(lv_event_t *e)
 {
     (void)e;
@@ -756,6 +777,25 @@ static esp_err_t wifi_create_status_view(lv_obj_t *parent)
     lv_obj_center(back_label);
     lv_obj_add_event_cb(back, status_back_cb, LV_EVENT_CLICKED, NULL);
 
+    /*
+     * The escape hatch for a fixed address.
+     *
+     * A fixed address makes the web console's URL stop changing, but if the
+     * address is one the network does not route, the console can no longer be
+     * reached - and then the only way out is this button, on the device
+     * itself. So it lives here, not only in the web console.
+     */
+    s_dhcp_button = lv_button_create(bar);
+    lv_obj_set_height(s_dhcp_button, UI_TOUCH_MIN);
+    lv_obj_set_flex_grow(s_dhcp_button, 1);
+    lv_obj_set_style_bg_color(s_dhcp_button, UI_COLOR_SURFACE_ALT, 0);
+    s_dhcp_label = lv_label_create(s_dhcp_button);
+    lv_label_set_text(s_dhcp_label, "改回 DHCP");
+    lv_obj_center(s_dhcp_label);
+    lv_obj_add_event_cb(s_dhcp_button, dhcp_clicked_cb, LV_EVENT_CLICKED, NULL);
+    /* Only shown when a fixed address is actually in use. */
+    lv_obj_add_flag(s_dhcp_button, LV_OBJ_FLAG_HIDDEN);
+
     return ESP_OK;
 }
 
@@ -780,6 +820,16 @@ static void refresh_status(void)
         return;
     }
 
+    /* The escape hatch is only useful (and only shown) with a fixed address. */
+    if (s_dhcp_button != NULL) {
+        const bool fixed = wifi_manager_get_static_ip()[0] != 0;
+        if (fixed && lv_obj_has_flag(s_dhcp_button, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_clear_flag(s_dhcp_button, LV_OBJ_FLAG_HIDDEN);
+        } else if (!fixed && !lv_obj_has_flag(s_dhcp_button, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(s_dhcp_button, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     wifi_mgr_state_t state = WIFI_MGR_DISCONNECTED;
     (void)wifi_manager_get_state(&state);
 
@@ -792,10 +842,11 @@ static void refresh_status(void)
 
     char text[sizeof(s_status_text)];
     snprintf(text, sizeof(text),
-             "状态：%s\n网络：%s\nIP：%s\n信号：%d dBm\nMAC：%s\n主机名：%s",
+             "状态：%s\n网络：%s\nIP：%s%s\n信号：%d dBm\nMAC：%s\n主机名：%s",
              wifi_manager_state_name(state),
              ssid[0] ? ssid : "（未连接）",
              ip,
+             wifi_manager_get_static_ip()[0] ? "（固定）" : "",
              (int)wifi_manager_get_rssi(),
              mac,
              WIFI_MANAGER_HOSTNAME);

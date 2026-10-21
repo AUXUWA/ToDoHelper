@@ -224,6 +224,13 @@
   .op-line.warn{border-left-color:var(--warning)}
   .op-line.err{border-left-color:var(--danger)}
   .wifi-sub{font-size:13px;margin:12px 0 6px}
+  .addr-box{margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface-alt)}
+  .addr-main{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .addr-label{font-size:13px;color:var(--muted)}
+  .addr-url{font-size:15px;font-weight:600;color:var(--primary);word-break:break-all;text-decoration:none}
+  .addr-url:hover{text-decoration:underline}
+  .addr-row{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
+  .addr-row input{flex:1 1 200px;min-width:0}
   .wifi-warn{border-left:4px solid var(--warning)}
 
   /* ---------- 墨墨背单词 ---------- */
@@ -319,6 +326,33 @@
         <button class="btn small" type="button" id="dev-refresh">刷新</button>
       </div>
       <div class="kv-grid" id="device-rows"></div>
+
+      <!--
+        访问地址。
+        设备上有两个地址：mDNS 的名字（好看，但只在 mDNS 真正能用的机器上解析得了
+        —— Windows 默认不行）和 IP（一定能用，但 DHCP 每次租约都可能变）。
+        所以这里把 IP 那个放前面，并且可以把它固定住。
+      -->
+      <div class="addr-box">
+        <div class="addr-main">
+          <span class="addr-label">浏览器里打开</span>
+          <a class="addr-url" id="dev-addr" href="#">—</a>
+          <button class="btn small" type="button" id="dev-addr-copy">复制</button>
+        </div>
+        <p class="small muted" id="dev-addr-note"></p>
+        <details class="more" id="dev-addr-more">
+          <summary>把地址固定下来（不再每次重连都变）</summary>
+          <div class="addr-row">
+            <input type="text" id="dev-static-ip" placeholder="例如 192.168.137.50" aria-label="固定 IP 地址">
+            <button class="btn" type="button" id="dev-static-ip-set">固定</button>
+            <button class="btn danger" type="button" id="dev-static-ip-clear">改回 DHCP</button>
+          </div>
+          <p class="small muted">
+            固定之后，网页端的地址永远是这一个，网关和子网掩码用设备上次拿到的租约。
+            换一个地址就意味着设备要重新连一次 WiFi。
+          </p>
+        </details>
+      </div>
     </section>
 
     <!-- 新增 -->
@@ -1064,12 +1098,99 @@ function renderDevice(err) {
     add("设备时间", status.time_synced ? "已同步（NTP）" : "未同步（到期提醒可能不准）",
         status.time_synced ? "ok" : "warn");
     add("推送客户端", (status.sse_clients || 0) + " / 3");
-    if (status.url) { add("访问地址", status.url); }
+    renderAddress(status);
   } else {
     add("运行时长", "未取到（/api/v1/device/status）", "warn");
   }
   add("鉴权", info.auth_enabled ? "已开启" : "未开启", info.auth_enabled ? "warn" : "ok");
 }
+
+/**
+ * 访问地址。
+ *
+ * 首选 IP 那个：http://<ip> —— 一定能打开。mDNS 的名字（http://xxx.local）
+ * 好看，但只在 mDNS 真正能用的机器上解析得了：Windows 默认解析不了
+ * （要装 Bonjour），有些路由器还会把组播直接丢掉 —— 实测这台设备
+ * 发布出去的 todohelper.local 在 Windows 上就打不开。
+ */
+function renderAddress(status) {
+  var link = $("dev-addr");
+  var note = $("dev-addr-note");
+  var ipUrl = (status && status.url_ip) || "";
+  var mdnsUrl = (status && status.url) || "";
+
+  if (ipUrl && ipUrl.indexOf("0.0.0.0") < 0) {
+    link.textContent = ipUrl;
+    link.href = ipUrl;
+    link.style.display = "";
+  } else {
+    link.textContent = "未连接 WiFi";
+    link.removeAttribute("href");
+    link.style.display = "none";
+  }
+
+  var bits = [];
+  if (mdnsUrl && mdnsUrl !== ipUrl) {
+    bits.push("也可以试 " + mdnsUrl + "（部分 Windows 解析不了 .local）。");
+  }
+  if (status && status.static_ip) {
+    bits.push("这个地址已经固定（" + status.static_ip + "），重连也不会变。");
+  } else {
+    bits.push("IP 由 DHCP 分配，重连后可能变；可以在下面把它固定住。");
+  }
+  note.textContent = bits.join(" ");
+}
+
+$("dev-addr-copy").addEventListener("click", function () {
+  var link = $("dev-addr");
+  var text = link.textContent || "";
+  if (!text || text.indexOf("http") !== 0) {
+    toast("现在没有可复制的地址", "warn");
+    return;
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () {
+      toast("已复制 " + text, "ok");
+    }).catch(function () {
+      toast("复制失败，请手动选中", "warn");
+    });
+  } else {
+    toast("这个浏览器不让脚本复制，请手动选中", "warn");
+  }
+});
+
+$("dev-static-ip-set").addEventListener("click", function () {
+  var value = $("dev-static-ip").value.trim();
+  if (!value) {
+    toast("请先填一个地址", "warn");
+    return;
+  }
+  api("/api/v1/wifi/config", {
+    method: "POST",
+    body: JSON.stringify({ ip: value }),
+    timeoutMs: 10000
+  }).then(function () {
+    $("dev-static-ip").value = "";
+    toast("已固定为 " + value + "，设备正在重新连接", "ok");
+    setTimeout(function () { loadDevice(); }, 4000);
+  }).catch(function (err) {
+    reportError(err, "固定地址");
+  });
+});
+
+$("dev-static-ip-clear").addEventListener("click", function () {
+  api("/api/v1/wifi/config", {
+    method: "POST",
+    body: JSON.stringify({ ip: "" }),
+    timeoutMs: 10000
+  }).then(function () {
+    $("dev-static-ip").value = "";
+    toast("已改回 DHCP，设备正在重新连接", "ok");
+    setTimeout(function () { loadDevice(); }, 4000);
+  }).catch(function (err) {
+    reportError(err, "改回 DHCP");
+  });
+});
 
 function renderAuthState() {
   var enabled = deviceInfo && deviceInfo.auth_enabled;
