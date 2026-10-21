@@ -41,6 +41,13 @@
 4. **浏览器页面**：`GET /` 与 `GET /index.html` 直接吐 embedded 的 `web/index.html`
    （`text/html; charset=utf-8`，`Cache-Control: no-cache`）。页面通过
    `EventSource("/api/v1/events")` 订阅推送，写操作带上 `X-Auth-Token`。
+   - **「设备控制台」卡片**（v1.13.0）：一个交互式终端 +
+     **19 个预置指令按钮**，走的是设备自带的调试 shell
+     （`/api/v1/debug/exec`，`debug_shell` 组件的命令表）。
+     预置表是数据（`web/index.html` 里的 `SHELL_PRESETS`），加一条指令就是加一个数组项；
+     每个按钮带一句话说明（`title`）。**危险指令要点两次才执行**
+     ——原生 `window.confirm()` 在嵌入式浏览器里会被自动接受，不能当唯一防线。
+     终端输出**一律当纯文本**（`textContent`），设备返回什么都不会被当成 HTML。
 5. **L0 通知中继**：启动时 `sys_notify_subscribe(notify_handler)`，任何组件 `sys_notify(name, payload)`
    都会被转成 SSE 事件（`sync_server_broadcast_event()`），这就是 `sync_server` 不需要依赖各业务组件的原因。
    没有 SSE 客户端时直接跳过格式化。

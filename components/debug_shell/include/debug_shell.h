@@ -59,6 +59,23 @@ extern "C" {
  */
 esp_err_t debug_shell_init(void);
 
+/**
+ * @brief Run one command and copy its plain-text output into a buffer.
+ *
+ * This is the same engine the HTTP route uses (`POST /api/v1/debug/exec`),
+ * exposed so that a command can also come from somewhere else - today: the
+ * serial console (debug_shell_serial.c), which lets the web console drive the
+ * device over a USB serial cable even when its HTTP server is not answering.
+ *
+ * @param line      The command line.
+ * @param out       Buffer for the output text.
+ * @param out_len   In: the size of @p out. Out: the number of bytes written.
+ * @return ESP_OK on success (also when the command itself failed - the
+ *         failure is in the text), ESP_ERR_NO_MEM when the output did not
+ *         fit.
+ */
+esp_err_t debug_shell_run(const char *line, char *out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

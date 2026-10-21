@@ -236,6 +236,29 @@
   .ota-bar-fill{height:100%;width:0;background:var(--primary);transition:width .2s}
   .wifi-warn{border-left:4px solid var(--warning)}
 
+  /* ---------- 设备控制台 ---------- */
+  #shell>summary{list-style:none;cursor:pointer}
+  #shell>summary::-webkit-details-marker{display:none}
+  #shell>summary::marker{content:""}
+  /* 预置指令：按用途分组，鼠标悬停有一句话说明 */
+  .shell-groups{display:flex;flex-direction:column;gap:8px;margin:10px 0}
+  .shell-group{border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+  .shell-group h3{font-size:12px;color:var(--muted);margin:0 0 6px;font-weight:600}
+  .shell-btns{display:flex;flex-wrap:wrap;gap:6px}
+  .shell-btns .btn{font-size:12px;padding:5px 9px}
+  .shell-btns .btn.danger{color:var(--danger);border-color:var(--danger)}
+  /* 「上膛」状态：第一次点之后的样子 */
+  .shell-btns .btn.armed{background:var(--danger);color:#fff;border-color:var(--danger)}
+  /* 终端：等宽字体，固定高度，自动滚到底 */
+  .shell-term{margin-top:10px;height:300px;overflow:auto;background:#11161c;color:#d7e0e8;
+              border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+              font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+              font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+  .shell-term .cmd{color:#7fd1ff}
+  .shell-term .err{color:#ff8a80}
+  .shell-term .hint{color:#7c8794}
+  .shell-term .row{display:block}
+
   /* ---------- 墨墨背单词 ---------- */
   #maimemo>summary{list-style:none;cursor:pointer}
   #maimemo>summary::-webkit-details-marker{display:none}
@@ -540,6 +563,33 @@
           <p class="small muted" id="ota-progress">0%</p>
         </div>
         <p class="small muted" id="ota-result"></p>
+      </div>
+    </details>
+
+    <!-- 设备控制台：设备自带的调试 shell（和串口上是同一套命令），交互式地用 -->
+    <details class="card" id="shell">
+      <summary class="card-head" style="cursor:pointer;list-style:none;margin:0">
+        <h2>设备控制台</h2>
+        <span class="spacer"></span>
+        <span class="stamp" id="shell-state">就绪</span>
+      </summary>
+      <div class="fields" style="padding-top:10px">
+        <p class="small muted">
+          这是设备自带的<strong>调试 shell</strong>：下面敲的命令和在串口上敲的是同一套，
+          走的是设备的 <code>/api/v1/debug/exec</code>。
+          常用命令已经<strong>预置成按钮</strong>了，也可以自己敲（<code>Enter</code> 执行，
+          <code>↑</code>/<code>↓</code> 翻历史）。<br>
+          <strong>这个接口能重启设备、动界面</strong>，所以它和网页别处一样需要令牌
+          （设备没开鉴权时不用填）。
+        </p>
+        <div class="shell-groups" id="shell-groups"></div>
+        <div class="shell-term" id="shell-term"></div>
+        <div class="row-actions" style="margin-top:8px">
+          <input type="text" id="shell-input" autocomplete="off" spellcheck="false"
+                 placeholder="输入命令，Enter 执行" style="flex:1 1 240px;min-width:0">
+          <button class="btn primary" type="button" id="shell-send">执行</button>
+          <button class="btn small" type="button" id="shell-clear">清屏</button>
+        </div>
       </div>
     </details>
 
@@ -2599,6 +2649,210 @@ $("ota").addEventListener("toggle", function (event) {
     loadOta();
   }
 });
+
+/* ========================================================================
+   设备控制台 —— 设备自带的 debug shell，交互式地用
+   ======================================================================== */
+
+/*
+ * 预置指令。label 是按钮上的字，cmd 是发给设备的命令，desc 是鼠标悬停时
+ * 的一句话说明，danger 的要先确认再发。
+ *
+ * 挑它们的规矩：**看状态 / 看界面 / 量一量 / 动一动 / 危险的** ——
+ * 前四组都是只读或者可逆的，最后一组才需要确认。
+ * 命令名和设备端 shell 一一对应（help 能看到全部）。
+ */
+var SHELL_PRESETS = [
+  {
+    title: "看一眼设备",
+    items: [
+      { label: "版本", cmd: "version", desc: "固件版本、编译时间、芯片型号" },
+      { label: "内存", cmd: "heap", desc: "内部堆 / PSRAM 剩余与历史最低点" },
+      { label: "任务", cmd: "tasks", desc: "FreeRTOS 任务列表与栈水位" },
+      { label: "接口", cmd: "routes", desc: "已注册的 HTTP 接口" },
+      { label: "存储", cmd: "storage", desc: "存储后端与剩余空间" },
+      { label: "时间", cmd: "time", desc: "墙钟时间与运行时长" }
+    ]
+  },
+  {
+    title: "看一眼界面",
+    items: [
+      { label: "当前页", cmd: "pages", desc: "页面注册表与当前所在页" },
+      { label: "界面结构", cmd: "ui", desc: "当前页与顶层对象概览" },
+      { label: "控件树", cmd: "widgets", desc: "整棵控件树（能到每个标签的文字）" },
+      { label: "字形缓存", cmd: "ftstats", desc: "FreeType 字形缓存（四个字号共用一份）" },
+      { label: "全部命令", cmd: "help", desc: "设备支持的全部命令" }
+    ]
+  },
+  {
+    title: "量一量",
+    items: [
+      { label: "整屏重绘", cmd: "bench-screen 3", desc: "整屏重画三次的耗时（一个滚动帧的代价）" },
+      { label: "冷字耗时", cmd: "bench label 秦时明月 0 1", desc: "画四个没进缓存的字要多久" }
+    ]
+  },
+  {
+    title: "动一动",
+    items: [
+      { label: "回首页", cmd: "page home", desc: "切到首页" },
+      { label: "亮度 60", cmd: "bright 60", desc: "背光调到 60%" },
+      { label: "退出待机", cmd: "idle exit", desc: "退出待机画面，回到正常界面" },
+      { label: "说一句话", cmd: "speak 你好", desc: "让设备用语音合成说一句话" },
+      { label: "麦克风自检", cmd: "audio 1000", desc: "录一秒，报采到多少毫秒、峰值多少" }
+    ]
+  },
+  {
+    title: "危险的",
+    items: [
+      { label: "重启设备", cmd: "reboot", desc: "立刻重启设备", danger: true }
+    ]
+  }
+];
+
+var shellHistory = [];
+var shellHistoryPos = 0;
+
+/*
+ * 危险指令要**点两次**才执行。
+ *
+ * 原来用的是 window.confirm() —— 实测在嵌入式浏览器里它会被**自动接受**
+ * （点一下「重启设备」，设备真的就重启了），换成原生对话框靠不住。
+ * 现在改成按钮自己「上膛」：第一次点变成「再点一次确认」，五秒内再点才真执行；
+ * 超时或者点了别的按钮就自动取消。
+ */
+var shellArmed = null;
+
+function shellDisarm() {
+  if (!shellArmed) { return; }
+  clearTimeout(shellArmed.timer);
+  shellArmed.btn.textContent = shellArmed.item.label;
+  shellArmed.btn.classList.remove("armed");
+  shellArmed = null;
+}
+
+/** 往终端里写一行。设备输出**一律当纯文本**，不拼进 HTML。 */
+function shellAppend(text, cls) {
+  var term = $("shell-term");
+  if (!term) { return; }
+  var row = document.createElement("span");
+  row.className = "row" + (cls ? " " + cls : "");
+  row.textContent = text;
+  term.appendChild(row);
+  /* 行数上限：不然页面越用越卡。丢最老的。 */
+  while (term.childElementCount > 400) { term.removeChild(term.firstChild); }
+  term.scrollTop = term.scrollHeight;
+}
+
+function shellRun(cmd) {
+  cmd = (cmd || "").trim();
+  if (!cmd) { return; }
+  shellHistory.push(cmd);
+  if (shellHistory.length > 50) { shellHistory.shift(); }
+  shellHistoryPos = shellHistory.length;
+  shellAppend("$ " + cmd, "cmd");
+  setText($("shell-state"), "执行中…");
+
+  api("/api/v1/debug/exec", {
+    method: "POST",
+    body: JSON.stringify({ cmd: cmd }),
+    timeoutMs: 30000
+  }).then(function (data) {
+    var out = (data && data.out) ? data.out : "";
+    if (data && data.truncated) { out += "\n（输出太长，设备那边截断了）"; }
+    if (out) {
+      out.replace(/\n+$/, "").split("\n").forEach(function (line) { shellAppend(line); });
+    } else {
+      shellAppend("（没有输出）", "hint");
+    }
+    setText($("shell-state"), "就绪");
+  }).catch(function (err) {
+    shellAppend("出错了：" + (err && err.message ? err.message : String(err)), "err");
+    setText($("shell-state"), "出错了");
+    if (err && err.kind === "auth") { reachableWithProblem(err); }
+  });
+}
+
+function shellRenderPresets() {
+  var host = $("shell-groups");
+  if (!host) { return; }
+  host.textContent = "";
+  SHELL_PRESETS.forEach(function (group) {
+    var box = document.createElement("div");
+    box.className = "shell-group";
+    var title = document.createElement("h3");
+    title.textContent = group.title;
+    box.appendChild(title);
+    var btns = document.createElement("div");
+    btns.className = "shell-btns";
+    group.items.forEach(function (item) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "btn small" + (item.danger ? " danger" : "");
+      b.textContent = item.label;
+      b.title = item.desc + "　——　" + item.cmd;
+      b.addEventListener("click", function () {
+        if (!item.danger) {
+          shellDisarm();
+          shellRun(item.cmd);
+          return;
+        }
+        if (shellArmed && shellArmed.item === item) {
+          shellDisarm();
+          shellRun(item.cmd);
+          return;
+        }
+        shellDisarm();
+        shellArmed = { item: item, btn: b, timer: 0 };
+        b.textContent = "再点一次确认";
+        b.classList.add("armed");
+        shellArmed.timer = setTimeout(shellDisarm, 5000);
+      });
+      btns.appendChild(b);
+    });
+    box.appendChild(btns);
+    host.appendChild(box);
+  });
+}
+
+$("shell-send").addEventListener("click", function () {
+  var input = $("shell-input");
+  var cmd = input.value;
+  input.value = "";
+  shellRun(cmd);
+});
+
+$("shell-input").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    $("shell-send").click();
+  } else if (e.key === "ArrowUp") {
+    if (shellHistoryPos > 0) {
+      e.preventDefault();
+      shellHistoryPos -= 1;
+      e.target.value = shellHistory[shellHistoryPos];
+    }
+  } else if (e.key === "ArrowDown") {
+    if (shellHistoryPos < shellHistory.length) {
+      e.preventDefault();
+      shellHistoryPos += 1;
+      e.target.value = shellHistoryPos < shellHistory.length ? shellHistory[shellHistoryPos] : "";
+    }
+  }
+});
+
+$("shell-clear").addEventListener("click", function () {
+  var term = $("shell-term");
+  if (term) { term.textContent = ""; }
+});
+
+/* 折叠时不打扰设备：展开时才打一声招呼。 */
+$("shell").addEventListener("toggle", function (event) {
+  if (event.currentTarget.open && !$("shell-term").childElementCount) {
+    shellAppend("设备控制台就绪。输入 help 看全部命令，或者点上面的预置按钮。", "hint");
+  }
+});
+
+shellRenderPresets();
 
 
 /* 折叠时不打扰设备：展开才拉状态。 */
