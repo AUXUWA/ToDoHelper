@@ -59,6 +59,7 @@
 #include "freertos/task.h"
 
 #include "ai_service.h"
+#include "calendar_service.h"
 #include "http_router.h"
 #include "sys_keys.h"
 #include "sys_status.h"
@@ -334,6 +335,7 @@ static void cmd_help(dbg_out_t *o)
         "  nvs <erase-key>          erase one NVS key\n"
         "  http-auth [set <hex>]    read/replace the HTTP auth token (debug only)\n"
         "  time                     wall clock / uptime\n"
+        "  ntp                      ask for an NTP sync right now\n"
         "  log <tag> [level]        set a tag's log level (0-5)\n"
         "  storage                  storage backend + free space\n"
         "  ftstats                  glyph cache (one cache shared by all sizes)\n"
@@ -594,6 +596,23 @@ static void cmd_time(dbg_out_t *o)
     out_printf(o, "uptime    %lld s\n", (long long)(esp_timer_get_time() / 1000000));
     out_printf(o, "wall ts   %lld\n", (long long)sys_time_ts());
     out_printf(o, "timezone  %s\n", tz);
+    out_printf(o, "synced    %s\n", sys_time_synced() ? "yes" : "no");
+    if (!sys_time_synced()) {
+        out_printf(o, "hint      the NTP server is a *name* - if the device cannot\n"
+                      "           resolve names (no DNS server, e.g. after switching\n"
+                      "           to a static address), the clock never syncs.\n");
+    }
+}
+
+/** Ask the calendar service for an NTP sync right now. */
+static void cmd_ntp(dbg_out_t *o)
+{
+    const esp_err_t err = calendar_sync_ntp_async();
+    if (err == ESP_OK) {
+        out_printf(o, "NTP sync requested (the clock is set when the answer lands)\n");
+    } else {
+        out_printf(o, "NTP sync could not start: %s\n", esp_err_to_name(err));
+    }
 }
 
 static void cmd_storage(dbg_out_t *o)
@@ -1308,6 +1327,8 @@ static void dbg_exec(char *line, dbg_out_t *out)
         cmd_routes(out);
     } else if (strcmp(cmd, "time") == 0) {
         cmd_time(out);
+    } else if (strcmp(cmd, "ntp") == 0) {
+        cmd_ntp(out);
     } else if (strcmp(cmd, "storage") == 0) {
         cmd_storage(out);
     } else if (strcmp(cmd, "log") == 0) {

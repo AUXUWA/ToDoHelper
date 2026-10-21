@@ -27,7 +27,8 @@
     GET    /api/v1/wifi/scan          上次扫描的缓存结果 {count,items:[{ssid,rssi,channel,authmode,open}]}
     POST   /api/v1/wifi/connect       {ssid,password} 发起连接（异步，凭据会写入 NVS）
     POST   /api/v1/wifi/disconnect    断开并停止自动重连
-    POST   /api/v1/wifi/config        {ssid,password[,auto_connect]} 只保存凭据，不连接
+    POST   /api/v1/wifi/config        {ssid,password[,auto_connect][,ip][,dns]} 只保存凭据，不连接
+                                  （ip = 固定地址，dns = 解析器；固定地址不带 DNS 会导致时间同步不了）
     POST   /api/v1/wifi/forget        清除 NVS 里保存的 SSID / 密码（不会主动断开）
     路由定义见 components/wifi_manager/src/wifi_manager_http.c（7 条，均已注册）
     GET    /api/v1/device/info        芯片、固件、IP、主机名、MAC、WiFi、存储、鉴权开关
@@ -370,12 +371,17 @@
           <summary>把地址固定下来（不再每次重连都变）</summary>
           <div class="addr-row">
             <input type="text" id="dev-static-ip" placeholder="例如 192.168.1.50" aria-label="固定 IP 地址">
+            <input type="text" id="dev-static-dns" placeholder="DNS（留空 = 用网关）" aria-label="DNS 服务器" style="flex:0 1 200px">
             <button class="btn" type="button" id="dev-static-ip-set">固定</button>
             <button class="btn danger" type="button" id="dev-static-ip-clear">改回 DHCP</button>
           </div>
           <p class="small muted">
             固定之后，网页端的地址永远是这一个，网关和子网掩码用设备上次拿到的租约。
-            换一个地址就意味着设备要重新连一次 WiFi。
+            换一个地址就意味着设备要重新连一次 WiFi。<br>
+            <strong>DNS 留空就用网关</strong>（家里路由器和 Windows 热点都是这样）。
+            固定地址会让 DHCP 停掉，设备就再没人告诉它「域名该问谁」——
+            域名解析不了，NTP 服务器也连不上，<strong>时间就永远同步不了</strong>。
+            你的网络里 DNS 不在网关上时，把它填进来。
           </p>
         </details>
       </div>
@@ -1245,13 +1251,17 @@ $("dev-static-ip-set").addEventListener("click", function () {
     toast("请先填一个地址", "warn");
     return;
   }
+  /* DNS 一起发：留空 = 用网关（有解析器，NTP 才连得上，时间才同步得了）。 */
+  var dns = $("dev-static-dns").value.trim();
   api("/api/v1/wifi/config", {
     method: "POST",
-    body: JSON.stringify({ ip: value }),
+    body: JSON.stringify({ ip: value, dns: dns }),
     timeoutMs: 10000
   }).then(function () {
     $("dev-static-ip").value = "";
-    toast("已固定为 " + value + "，设备正在重新连接", "ok");
+    $("dev-static-dns").value = "";
+    toast("已固定为 " + value + (dns ? "（DNS " + dns + "）" : "（DNS 用网关）") +
+          "，设备正在重新连接", "ok");
     setTimeout(function () { loadDevice(); }, 4000);
   }).catch(function (err) {
     reportError(err, "固定地址");
@@ -2697,6 +2707,7 @@ var SHELL_PRESETS = [
       { label: "回首页", cmd: "page home", desc: "切到首页" },
       { label: "亮度 60", cmd: "bright 60", desc: "背光调到 60%" },
       { label: "退出待机", cmd: "idle exit", desc: "退出待机画面，回到正常界面" },
+      { label: "校时", cmd: "ntp", desc: "立刻向 NTP 服务器要一次时间（时间不同步时用）" },
       { label: "说一句话", cmd: "speak 你好", desc: "让设备用语音合成说一句话" },
       { label: "麦克风自检", cmd: "audio 1000", desc: "录一秒，报采到多少毫秒、峰值多少" }
     ]

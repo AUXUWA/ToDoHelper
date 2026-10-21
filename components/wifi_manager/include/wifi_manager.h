@@ -135,6 +135,21 @@ esp_err_t wifi_manager_set_static_ip(const char *ip);
 /** @brief The configured static address ("" = DHCP). */
 const char *wifi_manager_get_static_ip(void);
 
+/**
+ * @brief The DNS server to use with a static address (empty = use the gateway).
+ *
+ * With DHCP the name server arrives with the lease. A static address stops the
+ * DHCP client, and then lwIP is left with **no resolver at all** - every name
+ * lookup fails, including the NTP server's, so the clock never syncs.
+ * The gateway is the usual place for a resolver (home router, Windows
+ * hotspot), so that is the fallback; this setter is the escape hatch for the
+ * networks where it is somewhere else.
+ */
+esp_err_t wifi_manager_set_static_dns(const char *dns);
+
+/** @brief The configured DNS server ("" = none set, the gateway is used). */
+const char *wifi_manager_get_static_dns(void);
+
 /** @brief Forget the stored credentials. */
 esp_err_t wifi_manager_clear_config(void);
 

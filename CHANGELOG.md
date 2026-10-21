@@ -12,6 +12,61 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.13.2] — 2026-10-21
+
+**修：固定地址之后 DNS 没了，时间永远同步不上。** 修 bug（按 `AGENT.md §8.1`
+的判据是 **PATCH**：存储格式 / HTTP API 的语义 / NVS 键语义都没变，也没有新页面；
+下面那个 DNS 输入框是这次修复的**退路**，不是独立功能）。
+
+### 症状
+
+设备上永远显示「时间未同步」，`GET /api/v1/device/status` 的 `time_synced` 一直是
+`false`、`server_ts` 一直是 0；天气、墨墨这类要访问外网的接口也全部失败。
+
+### 根因
+
+**固定地址时只固定了 IP、网关和子网掩码，忘了 DNS。**
+
+DHCP 租约里带着 DNS 服务器，一 DHCP，lwIP 就知道「域名该问谁」。
+一旦设成固定地址，`esp_netif_dhcpc_stop()` 把 DHCP 客户端停了 ——
+**lwIP 就一个解析器都没有了**，于是所有域名解析失败
+（`getaddrinfo()` 返回 202）。
+
+而 NTP 服务器写的是**域名**（`ntp.aliyun.com`），域名解析不了 →
+SNTP 查询发不出去 → **时钟永远同步不上**。
+所以这个毛病的表面是「时间不对」，根子在「DNS 没配」。
+
+### 改了什么
+
+* `wifi_manager`：设固定地址时**一并设 DNS**，取用顺序
+  ①用户填的 → ②上次租约里学到的 DNS（新增 NVS 键 `wifi_dns`，和网关/掩码一样记住）
+  → ③**网关**（家里路由器和 Windows 热点都是把 DNS 放在网关上）。
+  哪个是哪个，日志里会写清楚。
+* `POST /api/v1/wifi/config` 多收一个可选的 `"dns"`；`GET /api/v1/wifi/status`
+  多回 `static_dns`。
+* 网页端「把地址固定下来」那一栏多一个 **DNS 输入框**（留空 = 用网关），
+  并写清楚为什么不能留空。
+* **lwIP 的 SNTP 重试间隔从 1 小时改成 5 分钟**
+  （`CONFIG_LWIP_SNTP_UPDATE_DELAY=300000`）：第一次查询失败之后，
+  原先要等一小时才再试 —— 用户改好设置也得等一小时才看得到时间同步。
+* 调试 shell 新增 **`ntp`** 命令（立刻要一次时间），
+  网页端「设备控制台」的预置指令里也加了一个「校时」按钮；
+  `time` 命令现在会报告 `synced yes/no`，没同步时给出「DNS 没了」的提示。
+
+### 真机验证
+
+```
+TH:wifi: static address 192.168.137.138 (gw 192.168.137.1, mask 255.255.255.0)
+TH:wifi: DNS server 192.168.137.1
+TH:calendar: SNTP started (ntp.aliyun.com)
+TH:calendar: time synchronised: 1792562190
+```
+
+* `GET /api/v1/device/status` → `time_synced: true`、`server_ts: 1792562253`；
+* `GET /api/v1/calendar/now` → `synced: true`、`datetime: 2026-10-21 13:58:36`；
+* `GET /api/v1/weather` → **修好之前一直是坏的**（域名解析不了），
+  现在正常返回「南昌, 江西 / 22.9 °C / 阴」。
+
 ## [1.13.1] — 2026-10-21
 
 **发布前的脱敏自查**（文档/杂项，按 `AGENT.md §8.1` 的判据是 **PATCH**）。

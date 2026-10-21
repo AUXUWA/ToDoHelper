@@ -11,4 +11,6 @@ idf_component_register(
     ai_service
     # voice_service: the audio hardware probe (debug shell `audio` command)
     voice_service
+    # calendar_service: the `ntp` command (ask for a time sync right now)
+    calendar_service
 )

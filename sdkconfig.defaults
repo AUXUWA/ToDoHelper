@@ -202,3 +202,8 @@ CONFIG_TODOHELPER_DEBUG_SHELL=y
 # 不认（崩了/卡死了）bootloader 就退回上一个版本 —— 一次坏升级不会变砖。
 # 见 components/ota_service/README.md。
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# SNTP 重试间隔：lwIP 默认 1 小时（3600000 ms）太长。
+# 第一次查询失败（DNS 还没起来、或刚改完设置）之后，用户改好了也得等一小时
+# 才看得到时间同步。5 分钟一次只有一个很小的 UDP 包，可以接受。
+CONFIG_LWIP_SNTP_UPDATE_DELAY=300000

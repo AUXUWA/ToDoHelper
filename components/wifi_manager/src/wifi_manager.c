@@ -88,6 +88,7 @@ static char s_ssid[WIFI_MANAGER_SSID_MAX + 1];
 static char s_static_ip[16];
 static char s_static_gw[16];
 static char s_static_mask[16];
+static char s_static_dns[16];
 static char s_ip[16] = "0.0.0.0";
 static int8_t s_rssi;
 static uint8_t s_last_reason;
@@ -370,6 +371,43 @@ static void apply_address_config(void)
                  s_static_gw[0] ? s_static_gw : "192.168.1.1",
                  s_static_mask[0] ? s_static_mask : "255.255.255.0");
     }
+
+    /*
+     * The DNS server has to be set by hand once the address is static.
+     *
+     * With DHCP the name server comes with the lease; stop the client and
+     * lwIP is left with **no resolver at all** - every name lookup fails
+     * (getaddrinfo returns 202) and the device cannot reach anything that is
+     * not an IP address. That is not just "the weather API stops working":
+     * the NTP server is a *name* ("ntp.aliyun.com"), so the clock never
+     * syncs either, and the calendar shows "时间未同步" forever.
+     *
+     * The order of preference:
+     *   1. what the user typed (POST /api/v1/wifi/config {"dns":...});
+     *   2. the DNS of the last DHCP lease (remembered like the gateway);
+     *   3. the gateway - that is where the resolver usually lives
+     *      (a home router, or the Windows hotspot's DNS proxy).
+     */
+    const char *dns_text = s_static_dns[0] ? s_static_dns : (s_static_gw[0] ? s_static_gw : "");
+    if (dns_text[0] != 0) {
+        const uint32_t parsed = ipaddr_addr(dns_text);
+        if (parsed != 0 && parsed != IPADDR_NONE) {
+            esp_netif_dns_info_t dns = { 0 };
+            dns.ip.type = ESP_IPADDR_TYPE_V4;
+            dns.ip.u_addr.ip4.addr = parsed;
+            const esp_err_t dns_err = esp_netif_set_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &dns);
+            if (dns_err == ESP_OK) {
+                SYS_LOGI(TAG, "DNS server %s%s", dns_text,
+                         s_static_dns[0] ? "" : " (from the gateway)");
+            } else {
+                SYS_LOGW(TAG, "DNS server %s refused: %s", dns_text,
+                         esp_err_to_name(dns_err));
+            }
+        }
+    } else {
+        SYS_LOGW(TAG, "no DNS server known - names will not resolve "
+                      "(the clock cannot sync without it)");
+    }
 }
 
 static esp_err_t connect_with(const char *ssid, const char *password, bool remember)
@@ -496,6 +534,26 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         if (strcmp(buf, s_static_mask) != 0) {
             strlcpy(s_static_mask, buf, sizeof(s_static_mask));
             (void)sys_config_set_str(SYS_KEY_WIFI_MASK, s_static_mask);
+        }
+    }
+    /*
+     * Remember the DNS server as well - it is the third thing a static
+     * address needs, and the one that is easiest to forget: without a
+     * resolver the device cannot even look up an NTP server, so its clock
+     * would never sync (this is what v1.13.2 fixed).
+     */
+    if (s_static_dns[0] == 0) {
+        esp_netif_dns_info_t dns_info = { 0 };
+        if (esp_netif_get_dns_info(s_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK &&
+            dns_info.ip.type == ESP_IPADDR_TYPE_V4 &&
+            dns_info.ip.u_addr.ip4.addr != 0) {
+            char buf[16] = { 0 };
+            snprintf(buf, sizeof(buf), IPSTR, IP2STR(&dns_info.ip.u_addr.ip4));
+            if (strcmp(buf, s_static_dns) != 0) {
+                strlcpy(s_static_dns, buf, sizeof(s_static_dns));
+                (void)sys_config_set_str(SYS_KEY_WIFI_DNS, s_static_dns);
+                SYS_LOGI(TAG, "DNS server learned: %s", s_static_dns);
+            }
         }
     }
     update_rssi();
@@ -697,6 +755,7 @@ esp_err_t wifi_manager_init(void)
     (void)sys_config_get_str_or(SYS_KEY_WIFI_IP, s_static_ip, sizeof(s_static_ip), "");
     (void)sys_config_get_str_or(SYS_KEY_WIFI_GW, s_static_gw, sizeof(s_static_gw), "");
     (void)sys_config_get_str_or(SYS_KEY_WIFI_MASK, s_static_mask, sizeof(s_static_mask), "");
+    (void)sys_config_get_str_or(SYS_KEY_WIFI_DNS, s_static_dns, sizeof(s_static_dns), "");
 
     s_initialized = true;
     s_allow_reconnect = false;
@@ -936,6 +995,34 @@ esp_err_t wifi_manager_set_static_ip(const char *ip)
 const char *wifi_manager_get_static_ip(void)
 {
     return s_static_ip;
+}
+
+esp_err_t wifi_manager_set_static_dns(const char *dns)
+{
+    if (dns != NULL && dns[0] != 0) {
+        const uint32_t parsed = ipaddr_addr(dns);
+        if (parsed == 0 || parsed == IPADDR_NONE) {
+            SYS_LOGW(TAG, "DNS '%s' is not a valid IPv4 address", dns);
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(s_static_dns, dns, sizeof(s_static_dns));
+        (void)sys_config_set_str(SYS_KEY_WIFI_DNS, s_static_dns);
+        SYS_LOGI(TAG, "DNS server set to %s", s_static_dns);
+    } else {
+        s_static_dns[0] = 0;
+        (void)sys_config_erase(SYS_KEY_WIFI_DNS);
+        SYS_LOGI(TAG, "DNS server cleared (fall back to the gateway)");
+    }
+
+    /* Take effect now, not at the next association: the user is usually
+     * staring at a broken clock and wants it fixed without a reboot. */
+    apply_address_config();
+    return ESP_OK;
+}
+
+const char *wifi_manager_get_static_dns(void)
+{
+    return s_static_dns;
 }
 
 esp_err_t wifi_manager_save_config(const char *ssid, const char *password)

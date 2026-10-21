@@ -38,6 +38,11 @@ extern "C" {
  * the same network parameters without asking the user for all three. */
 #define SYS_KEY_WIFI_GW        "wifi_gw"
 #define SYS_KEY_WIFI_MASK      "wifi_mask"
+/* The DNS server of the last DHCP lease. With a static address the DHCP
+ * client is stopped, so nothing else would tell lwIP where to resolve names
+ * - and a device that cannot resolve names cannot reach an NTP server,
+ * so its clock would never sync. */
+#define SYS_KEY_WIFI_DNS       "wifi_dns"
 
 /* ---- Locale / time (FR3, FR4) ---- */
 #define SYS_KEY_TZ             "tz"

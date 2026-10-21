@@ -1438,12 +1438,12 @@ I (xxx) TH:app: ready (storage=/sdcard)
 | GET | `/api/v1/words/history` | word_service | **1.4.0** 设备端学习记录；`?today=1&limit=N`（≤200，默认 50）。**无记录返回空数组而非错误** | ✅ 200 |
 | POST | `/api/v1/words/history` | word_service | **1.4.0** body `{"clear":true}` 清空记录；缺该字段 → 400 | ✅ 200/400 |
 | POST | `/api/v1/words/export` | word_service | **1.4.0** 把当前云端队列写成 `words/maimemo.json`；无云端队列 → 400 | ✅ 200/400 |
-| GET | `/api/v1/wifi/status` | wifi_manager | `state`/`connected`/`ssid`/`ip`/`rssi`/`mac`/`hostname`。**1.0.0 实测 200** | ✅ 200 |
+| GET | `/api/v1/wifi/status` | wifi_manager | `state`/`connected`/`ssid`/`ip`/`rssi`/`mac`/`hostname`。**v1.13.2 追加 `static_ip`/`static_dns`**：固定地址与它的解析器（空串 = 用网关）。**1.0.0 实测 200** | ✅ 200 |
 | GET | `/api/v1/wifi/scan` | wifi_manager | **上一次**扫描的缓存结果 `{count,items[]}`；刚开机未扫过时 `count:0`（要新结果先 POST） | ✅ 200 |
 | POST | `/api/v1/wifi/scan` | wifi_manager | 触发异步扫描，立即返回 `{"scanning":true}`；结果靠随后 GET 轮询 | ✅ 200 |
 | POST | `/api/v1/wifi/connect` | wifi_manager | body `{"ssid","password"}`，异步发起；凭据写 NVS | ✅ 200 |
 | POST | `/api/v1/wifi/disconnect` | wifi_manager | 断开并停止自动重连 | ✅ 200 |
-| POST | `/api/v1/wifi/config` | wifi_manager | body `{"ssid","password","auto_connect"}`：只存凭据不连接。**v1.10.0 追加 `ip`**：固定地址（空串 = 改回 DHCP）；网关和子网掩码用设备上次租约里的值 | ✅ 200 |
+| POST | `/api/v1/wifi/config` | wifi_manager | body `{"ssid","password","auto_connect"}`：只存凭据不连接。**v1.10.0 追加 `ip`**：固定地址（空串 = 改回 DHCP）；网关和子网掩码用设备上次租约里的值。**v1.13.2 追加 `dns`**：固定地址时的解析器（空串 = 用网关）。**固定地址必须带 DNS**：DHCP 一停 lwIP 就一个解析器都没有，域名解析不了 → NTP 服务器（`ntp.aliyun.com` 是域名）连不上 → **时间永远同步不上** | ✅ 200 |
 | POST | `/api/v1/wifi/forget` | wifi_manager | 清除 NVS 里的 SSID/密码（不主动断开） | ✅ 200 |
 | POST | `/api/v1/ai/chat` | ai_service | **v1.5.0 起异步**：handler 立刻把会话交给自有任务，AI 请求期间**设备其它 HTTP 接口照常可用**；对外响应格式不变 | ✅ 200 |
 | POST | `/api/v1/ai/chat/stream` | ai_service | **v1.5.0 起异步**（`text/event-stream`，异步 handler + 自有任务）；chunk/done/error 事件格式不变 | ✅ 200 |

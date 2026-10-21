@@ -60,6 +60,10 @@ static char *status_json(void)
     cJSON_AddNumberToObject(root, "rssi", wifi_manager_get_rssi());
     cJSON_AddStringToObject(root, "mac", mac);
     cJSON_AddStringToObject(root, "hostname", WIFI_MANAGER_HOSTNAME);
+    /* The static address and the DNS that goes with it: without a resolver
+     * the device cannot look up an NTP server, so its clock never syncs. */
+    cJSON_AddStringToObject(root, "static_ip", wifi_manager_get_static_ip());
+    cJSON_AddStringToObject(root, "static_dns", wifi_manager_get_static_dns());
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -223,6 +227,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     const cJSON *password = cJSON_GetObjectItemCaseSensitive(root, "password");
     const cJSON *auto_connect = cJSON_GetObjectItemCaseSensitive(root, "auto_connect");
     const cJSON *ip = cJSON_GetObjectItemCaseSensitive(root, "ip");
+    const cJSON *dns = cJSON_GetObjectItemCaseSensitive(root, "dns");
 
     esp_err_t err = ESP_OK;
     if (cJSON_IsString(ssid)) {
@@ -235,15 +240,23 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     if (cJSON_IsString(ip) && err == ESP_OK) {
         err = wifi_manager_set_static_ip(ip->valuestring);
     }
+    /* The DNS goes with the address: a static address stops the DHCP client,
+     * and without a resolver the device cannot even look up an NTP server
+     * (the clock would never sync). Empty = fall back to the gateway. */
+    if (cJSON_IsString(dns) && err == ESP_OK) {
+        err = wifi_manager_set_static_dns(dns->valuestring);
+    }
     cJSON_Delete(root);
 
     if (err != ESP_OK) {
         return http_reply_esp_error(req, err, "wifi config");
     }
 
-    char data[64];
-    snprintf(data, sizeof(data), "{\"auto_connect\":%s}",
-             sys_config_get_bool_or(SYS_KEY_WIFI_AUTO, true) ? "true" : "false");
+    char data[128];
+    snprintf(data, sizeof(data),
+             "{\"auto_connect\":%s,\"static_ip\":\"%s\",\"static_dns\":\"%s\"}",
+             sys_config_get_bool_or(SYS_KEY_WIFI_AUTO, true) ? "true" : "false",
+             wifi_manager_get_static_ip(), wifi_manager_get_static_dns());
     return http_reply_ok(req, data);
 }
 
