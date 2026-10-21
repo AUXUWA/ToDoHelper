@@ -405,6 +405,23 @@ static void stream_chunk(const char *chunk)
 /** End the current streamed bubble (reply finished, failed, or a new question). */
 static void stream_finish(void)
 {
+    /*
+     * Freeze the text into the label before the buffer is cleared.
+     *
+     * The streamed bubble's label **borrows** s_stream_text (set_text_static:
+     * no copy, so a growing answer does not re-allocate on every chunk).
+     * Clearing that buffer leaves the bubble on screen **empty** - and the
+     * next answer overwrites it, because the next stream writes into the same
+     * buffer. (真机实测 v1.13.2：回答完成后气泡变空白。)
+     *
+     * lv_label_set_text() copies, so the bubble keeps the text it showed and
+     * the buffer is free to be reused. When the widgets are gone (the page was
+     * hidden and its bubbles deleted) s_stream_label is NULL here.
+     */
+    if (s_stream_label != NULL && s_stream_len > 0u) {
+        lv_label_set_text(s_stream_label, s_stream_text);
+    }
+
     s_stream_bubble = NULL;
     s_stream_label = NULL;
     s_stream_len = 0;

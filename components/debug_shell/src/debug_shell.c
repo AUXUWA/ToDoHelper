@@ -298,11 +298,36 @@ static void label_excerpt(const lv_obj_t *obj, char *out, size_t len)
     if (text == NULL || text[0] == '\0') {
         return;
     }
-    size_t i = 0;
-    for (; text[i] != '\0' && text[i] != '\n' && i + 1 < len; i++) {
-        out[i] = text[i];
+
+    /*
+     * Copy whole characters only.
+     *
+     * The excerpt ends up in a JSON string, and **half a UTF-8 character makes
+     * the whole response invalid JSON** - the browser's JSON.parse throws and
+     * the console shows nothing at all. A Chinese character is 3 bytes, so
+     * cutting at a byte boundary is likely, not unlikely.
+     */
+    const size_t total = strlen(text);
+    size_t i = 0;   /* read position  */
+    size_t o = 0;   /* write position */
+    while (text[i] != '\0' && text[i] != '\n' && o + 1 < len) {
+        const unsigned char c = (unsigned char)text[i];
+        size_t need = 1;
+        if (c >= 0xF0u) {
+            need = 4;
+        } else if (c >= 0xE0u) {
+            need = 3;
+        } else if (c >= 0xC0u) {
+            need = 2;
+        }
+        if (i + need > total || o + need + 1 > len) {
+            break;   /* the character is cut off by the source or by the buffer */
+        }
+        memcpy(out + o, text + i, need);
+        o += need;
+        i += need;
     }
-    out[i] = '\0';
+    out[o] = '\0';
 }
 
 /* ------------------------------------------------------------------------ */
@@ -342,7 +367,7 @@ static void cmd_help(dbg_out_t *o)
         "  ui                       current page + top-layer overview\n"
         "  widgets [filter] [depth] dump the object tree under the screen\n"
         "  click <target>           press a widget (by label text or index)\n"
-        "  text <target> <value>    set a label's text\n"
+        "  text <target> <value>    set a label's (or a text area's) text\n"
         "  slider <target> <value>  move a slider (fires VALUE_CHANGED, like a tap)\n"
         "  scroll <target> <dy>     scroll a scrollable object by dy pixels\n"
         "  bench <target> <text>    time a redraw (index, repeats optional)\n"
@@ -857,13 +882,24 @@ static void ui_click_cb(void *arg)
         return;
     }
     if (c->do_text) {
-        if (!lv_obj_check_type(obj, &lv_label_class)) {
-            out_printf(c->out, "'%s' is a %s, not a label\n", c->target,
-                       class_name_of(obj));
+        /*
+         * Labels and text areas both take text; the difference matters because
+         * the on-screen keyboard path (the device's own way of asking a
+         * question) can only be scripted if the shell can type into the
+         * textarea that the keyboard writes into.
+         */
+        if (lv_obj_check_type(obj, &lv_label_class)) {
+            lv_label_set_text(obj, c->value);
+            out_printf(c->out, "set %s text to '%s'\n", class_name_of(obj), c->value);
             return;
         }
-        lv_label_set_text(obj, c->value);
-        out_printf(c->out, "set %s text to '%s'\n", class_name_of(obj), c->value);
+        if (lv_obj_check_type(obj, &lv_textarea_class)) {
+            lv_textarea_set_text(obj, c->value);
+            out_printf(c->out, "set %s text to '%s'\n", class_name_of(obj), c->value);
+            return;
+        }
+        out_printf(c->out, "'%s' is a %s, not a label or a text area\n", c->target,
+                   class_name_of(obj));
         return;
     }
 

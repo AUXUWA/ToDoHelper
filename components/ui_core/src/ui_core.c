@@ -129,13 +129,33 @@ void ui_unlock(void)
  * busy event loop would in turn stall rendering.
  *
  * Now the publisher only appends to a singly linked list under a short spinlock
- * and wakes the drainer. The list is LIFO so a flood of notifications cannot
- * starve the newest one, and it is bounded so a stalled UI cannot exhaust the
+ * and wakes the drainer. The list is bounded so a stalled UI cannot exhaust the
  * heap (dropping a notification is acceptable, blocking the publisher is not).
+ *
+ * **The list is FIFO, and it has to be** (v1.13.3): it used to be LIFO, on the
+ * theory that "a flood of notifications cannot starve the newest one". That is
+ * true for a *repaint trigger* (every one of them just means "redraw me", and
+ * the end state is the same either way) but **dead wrong for an event that
+ * carries ordered content**:
+ *
+ *   - the AI's streamed answer arrives as dozens of REPLY_CHUNK events, and
+ *     LIFO handed them to the page **backwards** - the text on the screen came
+ *     out as a scrambled permutation of the answer (真机实测，v1.13.2 的固件上
+ *     就能看到「做智能家居、传感器节点等小项目。」被显示成
+ *     「。项目小等节点传感器、家居智能做」);
+ *   - a todo update carries the whole new list, so LIFO could paint an **older**
+ *     list after a newer one;
+ *   - the "reply done" event is the newest of a burst, so under LIFO it was the
+ *     first to be dropped when the queue was full - the page would then wait for
+ *     an answer that had already arrived.
+ *
+ * So: FIFO, and when the queue is full the **oldest** goes (the newest is the
+ * one most likely to still matter).
  */
-#define UI_EVENT_QUEUE_MAX 64
-/** Depth of the pending queue; guarded by s_event_lock. */
+#define UI_EVENT_QUEUE_MAX 128
+/** Oldest pending event (drained first) and newest (appended last). */
 static ui_async_event_t *s_event_head;
+static ui_async_event_t *s_event_tail;
 static size_t s_event_depth;
 static portMUX_TYPE s_event_lock = portMUX_INITIALIZER_UNLOCKED;
 /** LVGL timer that drains the queue inside the LVGL task. */
@@ -221,6 +241,9 @@ static void ui_event_drain_cb(lv_timer_t *timer)
         ui_async_event_t *ev = s_event_head;
         if (ev != NULL) {
             s_event_head = ev->next;
+            if (s_event_head == NULL) {
+                s_event_tail = NULL;
+            }
             s_event_depth--;
         }
         taskEXIT_CRITICAL(&s_event_lock);
@@ -301,22 +324,39 @@ static void ui_post_event(int32_t event_id, ui_page_id_t page, ui_event_fn_t han
     ev->payload[data_size] = '\0';
 
     taskENTER_CRITICAL(&s_event_lock);
-    const bool full = (s_event_depth >= UI_EVENT_QUEUE_MAX);
-    if (!full) {
-        ev->next = s_event_head;
+    if (s_event_depth >= UI_EVENT_QUEUE_MAX) {
+        /*
+         * The queue is full: the UI is not draining (still booting, or wedged).
+         * Shed the **oldest** event, not the newest: the newest is the one most
+         * likely to still matter (it may be the "reply done" that ends a wait,
+         * and for a stream it is the tail of the text).
+         */
+        ui_async_event_t *oldest = s_event_head;
+        if (oldest != NULL) {
+            s_event_head = oldest->next;
+            if (s_event_head == NULL) {
+                s_event_tail = NULL;
+            }
+            s_event_depth--;
+            taskEXIT_CRITICAL(&s_event_lock);
+            SYS_LOGW(TAG, "event queue full, dropping the oldest event %ld",
+                     (long)oldest->event_id);
+            free(oldest);
+            taskENTER_CRITICAL(&s_event_lock);
+        }
+    }
+    /* Append at the tail: the events must reach the page in publication order
+     * (the AI's streamed answer is a dozen of them in a row). */
+    ev->next = NULL;
+    if (s_event_tail != NULL) {
+        s_event_tail->next = ev;
+    } else {
         s_event_head = ev;
-        s_event_depth++;
-        s_event_pending = true;
     }
+    s_event_tail = ev;
+    s_event_depth++;
+    s_event_pending = true;
     taskEXIT_CRITICAL(&s_event_lock);
-
-    if (full) {
-        /* The UI is not draining (still booting, or wedged). Shedding the event
-         * keeps a burst from growing without bound; the log is emitted outside
-         * the critical section because it takes the console lock. */
-        SYS_LOGW(TAG, "event queue full, dropping event %ld", (long)event_id);
-        free(ev);
-    }
 }
 
 /** Runs in the shared event loop task: must not touch LVGL directly. */
