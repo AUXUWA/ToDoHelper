@@ -147,7 +147,7 @@
   I (6018) module 'weather_service' ready
   E (6018) esp-tls: couldn't get hostname for :api.open-meteo.com: getaddrinfo() returns 202
   W (6042) TH:weather: refresh failed: ESP_ERR_HTTP_CONNECT
-  I (7032) TH:wifi: got ip 192.168.137.95      ← IP 在这之后才有
+  I (7032) TH:wifi: got ip 192.168.1.50      ← IP 在这之后才有
   ```
   天气在 init 里就刷，**必然失败**（DNS 都解析不出来），
   而这一次失败 = 一次 DNS 查询 + 一次连接尝试的电台与 CPU 开销。

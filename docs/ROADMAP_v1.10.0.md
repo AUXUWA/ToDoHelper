@@ -2,7 +2,7 @@
 
 > 需求：优化上位机（网页端）的访问网址。
 > 起因：这一轮做 AI 的时候，设备在同一个下午换了三次地址
-> （192.168.137.232 → .119 → .138），每次都要去翻串口日志才知道网址；
+> （192.168.1.50 → .119 → .138），每次都要去翻串口日志才知道网址；
 > 而文档里写的 `http://todohelper.local` **在 Windows 上根本打不开**。
 
 ## 1. 先量：两个地址，一个能开一个不能
@@ -10,7 +10,7 @@
 | 地址 | 形式 | 实测 |
 |---|---|---|
 | `http://todohelper.local` | mDNS 名字 | 设备确实在发布（开机日志「mDNS published as todohelper.local」），但**这台 Windows 上解析不了**：`nslookup` 查不到（走的是公共 DNS），`ping` 无应答，**浏览器里也是一页空白** |
-| `http://192.168.137.x` | DHCP 分配的 IP | 一定能开，但**每次重连都可能变** |
+| `http://192.168.1.x` | DHCP 分配的 IP | 一定能开，但**每次重连都可能变** |
 
 mDNS 在 Windows 上要靠 Bonjour 才能解析 `.local`，有些路由器还会把组播丢掉 ——
 所以「友好的那个名字」并不可靠，「难记的那个 IP」才是每次都能用的。
@@ -33,7 +33,7 @@ mDNS 在 Windows 上要靠 Bonjour 才能解析 `.local`，有些路由器还会
 |---|---|
 | `url` | 友好的那个（mDNS 开着时是 `http://todohelper.local`） |
 | `url_ip` | **IP 那个，一定能开** |
-| `ip` | 纯 IP（`192.168.137.138`） |
+| `ip` | 纯 IP（`192.168.1.50`） |
 | `static_ip` | 固定地址（没固定就是空串） |
 
 设备自己的设置页也把 **IP 放前面**（原来 mDNS 名字在前，而它恰恰是打不开的那个）。
@@ -43,7 +43,7 @@ mDNS 在 Windows 上要靠 Bonjour 才能解析 `.local`，有些路由器还会
 `POST /api/v1/wifi/config` 多认一个字段 `ip`：
 
 ```bash
-curl -X POST http://192.168.137.138/api/v1/wifi/config      -H "Content-Type: application/json" -d '{"ip":"192.168.137.50"}'
+curl -X POST http://192.168.1.50/api/v1/wifi/config      -H "Content-Type: application/json" -d '{"ip":"192.168.1.50"}'
 ```
 
 * 空串 = 改回 DHCP；
@@ -61,22 +61,22 @@ curl -X POST http://192.168.137.138/api/v1/wifi/config      -H "Content-Type: ap
 
 ```
 # 固定成当前这个地址（这样就算机制有问题也不会失联）
-POST /api/v1/wifi/config {"ip":"192.168.137.138"}
+POST /api/v1/wifi/config {"ip":"192.168.1.50"}
 → 设备重连，日志：
-     TH:wifi: static address 192.168.137.138 (gw 192.168.137.1, mask 255.255.255.0)
-     TH:wifi: got ip 192.168.137.138 (ssid 'xuaoxe_computer', -37 dBm)
+     TH:wifi: static address 192.168.1.50 (gw 192.168.1.1, mask 255.255.255.0)
+     TH:wifi: got ip 192.168.1.50 (ssid 'my-hotspot', -37 dBm)
 
 # 重启后再看：地址没变
-TH:wifi: static address 192.168.137.138 (gw 192.168.137.1, mask 255.255.255.0)
-TH:wifi: got ip 192.168.137.138
+TH:wifi: static address 192.168.1.50 (gw 192.168.1.1, mask 255.255.255.0)
+TH:wifi: got ip 192.168.1.50
 ```
 
 网页端（浏览器实测）：
 
 ```
-浏览器里打开  http://192.168.137.138  [复制]
+浏览器里打开  http://192.168.1.50  [复制]
 也可以试 http://todohelper.local（部分 Windows 解析不了 .local）。
-这个地址已经固定（192.168.137.138），重连也不会变。
+这个地址已经固定（192.168.1.50），重连也不会变。
 ```
 
 ## 4. 还没做的

@@ -58,3 +58,6 @@ nul
 %TEMP%cmd.txt
 cal_review.diff
 %TEMP%*.diff
+
+# 一次性排障脚本留下的日志（仓库根目录）
+build_queue_probemock.log

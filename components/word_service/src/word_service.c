@@ -1027,7 +1027,7 @@ static void on_maimemo_sync_done(void *arg, esp_event_base_t base,
  *
  *     I (6546) TH:mm: sync started
  *     E (6018) esp-tls: couldn't get hostname for ...: getaddrinfo() returns 202
- *     I (7032) TH:wifi: got ip 192.168.137.95
+ *     I (7032) TH:wifi: got ip 192.168.1.50
  *
  * The cloud queue was built **before** the DHCP lease existed, so the DNS lookup
  * could not even start: one useless DNS query plus one useless TLS attempt on

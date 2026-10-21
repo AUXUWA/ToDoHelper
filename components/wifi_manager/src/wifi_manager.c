@@ -82,7 +82,7 @@ static char s_ssid[WIFI_MANAGER_SSID_MAX + 1];
  *
  * Why: the address the user types into the browser is handed out by DHCP, and
  * it changes with every lease - on this bench it changed three times in one
- * afternoon (192.168.137.232 -> .119 -> .138). With a static address the web
+ * afternoon (192.168.1.50 -> .119 -> .138). With a static address the web
  * console's URL never changes.
  */
 static char s_static_ip[16];

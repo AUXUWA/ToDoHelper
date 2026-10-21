@@ -2,7 +2,9 @@
 """Walk every page on the device and print the heap after each one.
 
 Usage:
-    python tools/page_tour.py [--host 192.168.137.232] [--rounds 3]
+    python tools/page_tour.py [--host <设备IP>] [--rounds 3]
+
+设备地址的取法：--host > 环境变量 TODOHELPER_HOST > 下面的通用示例。
 
 The device must be reachable and the debug shell enabled.
 """
@@ -10,10 +12,16 @@ The device must be reachable and the debug shell enabled.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
 import urllib.request
+
+# The device's address: --host wins, then $TODOHELPER_HOST, then the generic
+# example below. The default is a placeholder on purpose - the repo is public,
+# so no real LAN address of the maintainer's is baked in.
+DEFAULT_HOST = os.environ.get("TODOHELPER_HOST", "192.168.1.50")
 
 PAGES = [
     "home", "todo", "todo_detail", "weather", "calendar",
@@ -48,7 +56,7 @@ def summarize(out: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="192.168.137.232")
+    ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--rounds", type=int, default=3)
     args = ap.parse_args()
 

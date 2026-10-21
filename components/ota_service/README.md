@@ -12,12 +12,12 @@
 **命令行**：
 
 ```bash
-curl -X POST http://192.168.137.138/api/v1/ota/upload \
+curl -X POST http://192.168.1.50/api/v1/ota/upload \
      -H "Content-Type: application/octet-stream" \
      --data-binary @build/todohelper.bin
 # → {"ok":true,"state":"ready","written":3284624,"total":3284624,"boot":"ota_0"}
 
-curl -X POST http://192.168.137.138/api/v1/ota/reboot
+curl -X POST http://192.168.1.50/api/v1/ota/reboot
 # → {"ok":true,"state":"rebooting"}
 ```
 

@@ -144,7 +144,7 @@ esp_err_t word_book_error(void);          /* 失败的具体原因（ESP_OK = �
 ```
 I (6546) TH:mm: sync started
 E (6018) esp-tls: couldn't get hostname for ...: getaddrinfo() returns 202
-I (7032) TH:wifi: got ip 192.168.137.95
+I (7032) TH:wifi: got ip 192.168.1.50
 ```
 
 云端队列在拿到 DHCP 地址**之前**就发起了，DNS 根本解析不出来：每次开机白跑一轮

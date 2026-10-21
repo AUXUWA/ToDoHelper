@@ -11,16 +11,24 @@ glyph cache is too small to hold what a screen shows, every frame has to
 rasterise the same characters again and the number stays high forever.
 
 Usage:
-    python tools/bench_glyphs.py [--host 192.168.137.232] [--page home]
+    python tools/bench_glyphs.py [--host <设备IP>] [--page home]
+
+设备地址的取法：--host > 环境变量 TODOHELPER_HOST > 下面的通用示例。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
 import urllib.request
+
+# The device's address: --host wins, then $TODOHELPER_HOST, then the generic
+# example below. The default is a placeholder on purpose - the repo is public,
+# so no real LAN address of the maintainer's is baked in.
+DEFAULT_HOST = os.environ.get("TODOHELPER_HOST", "192.168.1.50")
 
 
 def run(host: str, cmd: str, timeout: float = 60.0) -> str:
@@ -40,7 +48,7 @@ def run(host: str, cmd: str, timeout: float = 60.0) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="192.168.137.232")
+    ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--page", default="home")
     ap.add_argument("--repeats", type=int, default=6)
     args = ap.parse_args()

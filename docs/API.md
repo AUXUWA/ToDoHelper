@@ -1554,7 +1554,7 @@ POST /api/v1/ota/reboot                             → 200 {"ok":true,"state":"
 | 失败关闭 | 缓存里的令牌放不下（只可能发生在有人绕过本组件直接改 NVS 时）→ **鉴权按开启处理**，宁可谁也进不来，也不把设备敞开 |
 | hook 缺失 | `http_router_check_auth()` **fail-open 返回 `true`**（只在没装 `sync_server` 的测试环境出现） |
 | 失败响应 | HTTP **401** + `{"code":401,"msg":"unauthorized","data":null}`；同时发 `SYNC_EVENT_AUTH_FAILED`（payload = 路径）并打 `TH:sync: auth failed for <path>` |
-| 真机实测 | 2026-10-20 板子（`192.168.137.95`）：设令牌后 `GET /api/v1/todos` 无令牌 → **401**、错令牌 → **401**、正确令牌 → **200**；`GET /api/v1/ai/history` 无令牌 → **401**（这一条在 v1.4.0 是 200，**是本轮修掉的那个洞**） |
+| 真机实测 | 2026-10-20 板子（`192.168.1.50`）：设令牌后 `GET /api/v1/todos` 无令牌 → **401**、错令牌 → **401**、正确令牌 → **200**；`GET /api/v1/ai/history` 无令牌 → **401**（这一条在 v1.4.0 是 200，**是本轮修掉的那个洞**） |
 
 > **网页上位机**始终带 `X-Auth-Token`（用户在「连接设置」里填的那个），
 > 所以开了鉴权后网页照常可用；SSE 订阅也带同一个头。

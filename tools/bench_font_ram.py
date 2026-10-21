@@ -36,15 +36,23 @@ Everything else - layout, flush, panel - is in both measurements and
 cancels out.
 
 Usage:
-    python tools/bench_font_ram.py [--host 192.168.137.138]
+    python tools/bench_font_ram.py [--host <设备IP>]
+
+设备地址的取法：--host > 环境变量 TODOHELPER_HOST > 下面的通用示例。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import urllib.request
+
+# The device's address: --host wins, then $TODOHELPER_HOST, then the generic
+# example below. The default is a placeholder on purpose - the repo is public,
+# so no real LAN address of the maintainer's is baked in.
+DEFAULT_HOST = os.environ.get("TODOHELPER_HOST", "192.168.1.50")
 
 # Ordinary GB2312 hanzi that are not used anywhere in the UI, so they are
 # cold on a freshly booted device.
@@ -99,7 +107,7 @@ def bench_text(host: str, text: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="192.168.137.138")
+    parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--groups", action="store_true",
                         help="also print the per-group numbers (relative comparison)")
     args = parser.parse_args()
