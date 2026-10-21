@@ -12,6 +12,33 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.9.8] — 2026-10-21
+
+**给语音端点配一个能直接用的适配层。** 新增工具 + 一条调试命令（**PATCH**）。
+
+### Added
+
+- **`tools/voice_proxy.py`：语音适配层**（只用 Python 标准库）。
+  设备端的协议是**故意厂商中立**的（识别收裸 PCM 回 `{"text":...}`，
+  合成收 `{"text":...}` 回裸 PCM），而主流云服务一个都不是这个形状
+  （OpenAI/硅基流动要 multipart 文件、合成默认回 MP3；讯飞/阿里云要 base64
+  塞 JSON 里；Edge TTS 回 MP3，而设备没有 MP3 解码器）。
+  这个代理就是中间那层，**设备端一个字都不用改**，换一家服务只改个参数：
+  - `--asr-backend openai` —— OpenAI 兼容的 `/v1/audio/transcriptions`
+    （硅基流动的接口与 OpenAI 一样，`--base-url` 换一下就行）；
+  - `--tts-backend openai` —— `/v1/audio/speech` + `response_format: "pcm"`
+    （那份 PCM 是 24 kHz，代理按请求里的 `sample_rate` 重采样到 16 kHz）；
+  - `--tts-backend edge` —— Edge TTS（免费、音色自然；需要 edge-tts 和 ffmpeg）；
+  - `--mock` —— 假识别 + 一声测试音，不花钱不出网，用来验证设备这一侧。
+- **调试 shell 新增 `speak <text>`**：直接走 TTS 端点把一句话念出来 ——
+  「朗读」按钮要有一句回答才能念，而回答要 API Key；这条命令把
+  「TTS → codec → 喇叭」这半截单独测掉。
+
+真机复验：代理的 `/asr`、`/tts`、`/health` 三个接口都验过
+（假识别回 `{"text":...}`、假合成回 32000 字节的 16 kHz PCM）。
+
+---
+
 ## [1.9.7] — 2026-10-21
 
 **独立复核（第五轮）查出的两处。** 纯修 bug（**PATCH**）。

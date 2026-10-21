@@ -158,7 +158,53 @@ HTTP 服务器不受影响。`voice_service_ensure_audio()` 与调试 shell 的
 - [ ] **AI 端到端对话**（要一个真的 DeepSeek Key；本轮没有 Key，测不了）
 - [ ] **语音闭环**（要 ASR/TTS 端点 + 麦克风通路；两样都还没有）
 
-## 5. 待定
+## 5. 语音端点：推荐与做法
+
+设备端的协议是**故意厂商中立**的：
+
+| 方向 | 设备发出 | 设备期待收到 |
+|---|---|---|
+| 识别 | `POST`，body 是裸 PCM（16 kHz / 16 bit / 单声道） | `{"text": "识别结果"}` |
+| 合成 | `POST {"text": "...", "sample_rate": 16000}` | 裸 PCM 字节（16 kHz / 16 bit / 单声道） |
+
+而**主流云服务没有一个是这个形状**（OpenAI/硅基流动要 multipart 文件、
+合成默认回 MP3；讯飞/阿里云要 base64 塞 JSON 里；Edge TTS 回 MP3，
+而设备没有 MP3 解码器）。所以中间必须有薄薄一层适配 ——
+**`tools/voice_proxy.py` 就是它**（只用标准库，设备端一个字都不用改）：
+
+```bash
+# 假后端：先把设备这一侧的链路跑通，不花钱、不出网
+python tools/voice_proxy.py --mock
+
+# 接云服务（硅基流动的接口与 OpenAI 一样，都是 /v1 开头）
+python tools/voice_proxy.py --asr-backend openai --tts-backend openai     --base-url https://api.siliconflow.cn/v1 --api-key sk-xxx
+
+# 只接云识别，合成用 Edge TTS（免费、音色自然；要 edge-tts + ffmpeg）
+python tools/voice_proxy.py --asr-backend openai --tts-backend edge     --base-url https://api.siliconflow.cn/v1 --api-key sk-xxx
+```
+
+然后在**网页端 → AI 对话与语音**里把两个端点填成
+`http://<跑代理的那台机器>:8088/asr` 和 `.../tts`。
+
+**选谁？**
+
+| 用途 | 推荐 | 理由 |
+|---|---|---|
+| 识别（首选） | **硅基流动**（OpenAI 兼容的 `/v1/audio/transcriptions`） | 国内直连、有免费额度、中文模型好；接口与 OpenAI 完全一样，换一家只改 `--base-url` |
+| 识别（质量优先） | OpenAI Whisper | 识别最准；国内要代理 |
+| 识别（自建） | faster-whisper / whisper.cpp 服务端 | 暴露 OpenAI 兼容接口即可（同一套适配）；无按分钟费用，音频不出局域网 |
+| 合成（首选） | **硅基流动 / OpenAI 的 `/v1/audio/speech` + `response_format: "pcm"`** | 注意那份 PCM 是 **24 kHz**，适配层重采样到 16 kHz（代理里已经做了） |
+| 合成（免费） | Edge TTS | 音色自然、中文好；但回 MP3，要 ffmpeg 转成裸 PCM |
+| 合成（自建） | CosyVoice / Fish-Speech / Piper | 音质最好、音频不外传；Piper 直接给 WAV（去头即裸 PCM） |
+
+**两个要注意的点**：
+
+1. **设备是「录完再发」**（一次最长 10 s），所以识别是批量的，
+   典型延迟 1~3 秒。流式识别要改设备端的协议（另一件事）。
+2. **合成音频要 16 kHz 单声道 PCM** —— 设备按 16 kHz 播放，
+   别的采样率会变调（代理会按请求里的 `sample_rate` 重采样）。
+
+## 6. 待定
 
 1. ~~**麦克风采集通路**~~ —— 已撤销（v1.9.3：是本工程的 bug，硬件没问题）。
 2. **AI 的函数调用**（tools）：需求里写着「解析『帮我添加待办 XXX』联动
@@ -168,7 +214,7 @@ HTTP 服务器不受影响。`voice_service_ensure_audio()` 与调试 shell 的
 4. **提示音**：工程里一个 wav/mp3 都没有，ui_assets 只会加载图片。
 5. **TTS 缓存目录** `tts/` 预留了但没人写。
 
-## 6. 下一版可以做的
+## 7. 下一版可以做的
 
 1. **字库搬进内部 flash**（v1.8.5 留下的）：光栅化 10 ms → 0.2 ms。
 2. **页面控件常驻**：切页 11~222 ms → 几 ms（v1.8.5 留下的）。

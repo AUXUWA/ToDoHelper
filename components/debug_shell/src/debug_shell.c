@@ -345,6 +345,7 @@ static void cmd_help(dbg_out_t *o)
         "  scroll <target> <dy>     scroll a scrollable object by dy pixels\n"
         "  bench <target> <text>    time a redraw (index, repeats optional)\n"
         "  bench-screen [repeats]  time full-screen redraws (one scroll frame)\n"
+        "  speak <text>           speak a line through the TTS endpoint\n"
         "  page <id|name>           switch page (0..10 or splash/home/...)\n"
         "  tap <x> <y>              report which widget is at a screen point\n"
         "  idle <enter|exit>        force idle-face enter/leave\n"
@@ -504,6 +505,28 @@ static void cmd_audio(dbg_out_t *o, const char *arg)
     out_printf(o, "internal free %u B, largest %u B\n",
                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                (unsigned)sys_heap_largest_internal());
+}
+
+/**
+ * Speak a piece of text through the configured TTS endpoint.
+ *
+ * The AI page's "read it out" button needs an answer to read, which needs an
+ * API key. This command tests the other half of the path (TTS -> codec ->
+ * speaker) on its own.
+ */
+static void cmd_speak(dbg_out_t *o, const char *text)
+{
+    if (text == NULL || text[0] == 0) {
+        out_printf(o, "usage: speak <text>\n");
+        return;
+    }
+    if (!voice_service_tts_configured()) {
+        out_printf(o, "no TTS endpoint configured (POST /api/v1/voice/config)\n");
+        return;
+    }
+    const esp_err_t err = voice_service_speak_async(text);
+    out_printf(o, "speak -> %s (the result arrives as an event)\n",
+               esp_err_to_name(err));
 }
 
 static void cmd_tasks(dbg_out_t *o)
@@ -1275,6 +1298,8 @@ static void dbg_exec(char *line, dbg_out_t *out)
         cmd_heap(out);
     } else if (strcmp(cmd, "audio") == 0) {
         cmd_audio(out, a1);
+    } else if (strcmp(cmd, "speak") == 0) {
+        cmd_speak(out, a1);
     } else if (strcmp(cmd, "ftstats") == 0) {
         cmd_ftstats(out);
     } else if (strcmp(cmd, "tasks") == 0) {
