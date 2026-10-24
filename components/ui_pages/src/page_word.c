@@ -677,19 +677,31 @@ static void weak_clicked_cb(lv_event_t *e)
         return;
     }
 
-    /* Words joined with spaces; ui_dialog_confirm clamps and scrolls the body. */
-    char text[512];
+    /*
+     * Body text: three words per line, centred by LVGL's text-align of the
+     * dialog body. A single space-joined line was unreadable with ten words
+     * (the first real-device screenshot read as one blur), and one word per
+     * line wastes the dialog's width on short spellings.
+     */
+    char text[640];
     size_t used = 0;
+    size_t column = 0;
     text[0] = '\0';
-    for (size_t i = 0; i < s_weak_count && used + WORD_SPELLING_MAX + 2 < sizeof(text); i++) {
-        if (i > 0) {
+    for (size_t i = 0; i < s_weak_count && used + WORD_SPELLING_MAX + 4 < sizeof(text); i++) {
+        const size_t len = strlen(s_weak_words[i]);
+        if (column == 3) {
+            text[used++] = '\n';
+            column = 0;
+        } else if (i > 0) {
+            text[used++] = ' ';
             text[used++] = ' ';
         }
-        const size_t len = strlen(s_weak_words[i]);
         memcpy(text + used, s_weak_words[i], len);
         used += len;
         text[used] = '\0';
+        column++;
     }
+    snprintf(text + used, sizeof(text) - used, "\n\n共 %u 个", (unsigned)s_weak_count);
 
     (void)ui_dialog_confirm("今日易忘词", text,
                             "存入云生词本", "关闭", weak_save_cb, NULL);

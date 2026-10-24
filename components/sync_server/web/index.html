@@ -60,7 +60,7 @@
   code{font-family:ui-monospace,Consolas,"Courier New",monospace;background:var(--surface-alt);padding:1px 5px;border-radius:5px;font-size:12px}
   .muted{color:var(--muted)}
   .small{font-size:13px}
-  .wrap{max-width:1360px;margin:0 auto;padding:0 20px}
+  .wrap{max-width:1480px;margin:0 auto;padding:0 20px}
   .stack{display:flex;flex-direction:column;gap:12px;padding-top:16px;padding-bottom:28px}
   /* 宽屏双栏（v1.15.0）：待办列表是主角占左栏（宽），配置/墨墨/OTA 等卡片流到右栏。
      窄屏维持单列且顺序不变 —— 待办紧跟设备状态。 */
@@ -294,7 +294,7 @@
   #toast.err{border-color:var(--danger)}
   #toast.warn{border-color:var(--warning)}
 
-  footer{color:var(--muted);font-size:12px;padding:0 20px 28px;max-width:1360px;margin:0 auto}
+  footer{color:var(--muted);font-size:12px;padding:0 20px 28px;max-width:1480px;margin:0 auto}
 
   @media (max-width:600px){
     .wrap{padding:0 12px}
@@ -518,17 +518,23 @@
               <h3 class="mm-sub">路径二：电脑命令行（官方 CLI，推荐）</h3>
               <p class="small" style="margin:4px 0 6px">
                 电脑装了 <a href="https://nodejs.org" target="_blank" rel="noreferrer">Node.js</a>
-                的话，一条命令，浏览器里登录墨墨账号即可：
+                的话，选你系统的那条命令复制到终端运行：浏览器登录墨墨账号后，
+                <strong>令牌直接放进剪贴板</strong>——回到本页粘贴即可，不用去翻配置文件。
               </p>
               <div class="add-row">
-                <code id="mm-cli-cmd" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;overflow:auto;white-space:nowrap">npx @maimemo/memo-api auth login</code>
-                <button class="btn small" type="button" id="mm-cli-copy">复制命令</button>
+                <code id="mm-cli-cmd-win" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;overflow:auto;white-space:nowrap;font-size:11px">npx @maimemo/memo-api auth login; Get-Content "$env:USERPROFILE\.config\memo-api.json" | ConvertFrom-Json | Select-Object -ExpandProperty apiToken | Set-Clipboard</code>
+                <button class="btn small" type="button" id="mm-cli-copy-win">复制</button>
+              </div>
+              <div class="add-row" style="margin-top:6px">
+                <code id="mm-cli-cmd-unix" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;overflow:auto;white-space:nowrap;font-size:11px">npx @maimemo/memo-api auth login &amp;&amp; node -e "console.log(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.config/memo-api.json','utf8')).apiToken)" | pbcopy</code>
+                <button class="btn small" type="button" id="mm-cli-copy-unix">复制</button>
               </div>
               <p class="small muted" style="margin:6px 0 0">
-                登录成功后令牌自动存到 <code>~/.config/memo-api.json</code>（Windows 在
-                <code>%USERPROFILE%\.config\memo-api.json</code>）的 <code>apiToken</code> 字段，
-                复制那串字符粘贴到下面即可。CLI 来自
-                <a href="https://github.com/maimemo/memo-api-cli" target="_blank" rel="noreferrer">墨墨官方仓库</a>。
+                上：Windows PowerShell（Set-Clipboard 系统自带）；
+                下：macOS（pbcopy 内置；Linux 把 pbcopy 换成 xclip -sel clip）。
+                令牌同时仍保存在 <code>~/.config/memo-api.json</code>。CLI 来自
+                <a href="https://github.com/maimemo/memo-api-cli" target="_blank" rel="noreferrer">墨墨官方仓库</a>；
+                登录状态可用 <code>npx @maimemo/memo-api auth whoami</code> 随时核对。
               </p>
             </div>
           </div>
@@ -576,16 +582,19 @@
           <p class="small muted" id="mm-today-note"></p>
         </div>
 
-        <!-- 设备端学习记录：progress.json 只存每词最新状态，这里才能看到"今天背了什么" -->
-        <div id="mm-history-box">
-          <h3 class="mm-sub">设备端学习记录</h3>
-          <div class="row-actions">
-            <button class="btn small" type="button" id="mm-hist-refresh">刷新记录</button>
-            <button class="btn small" type="button" id="mm-hist-clear">清空记录</button>
+        <!-- 设备端学习记录：progress.json 只存每词最新状态，这里才能看到"今天背了什么"。
+             默认收起：右栏卡片多，让打开页面时的默认长度留给状态与令牌。 -->
+        <details id="mm-history-box" class="more">
+          <summary>设备端学习记录（今天背了什么）</summary>
+          <div style="padding-top:6px">
+            <div class="row-actions">
+              <button class="btn small" type="button" id="mm-hist-refresh">刷新记录</button>
+              <button class="btn small" type="button" id="mm-hist-clear">清空记录</button>
+            </div>
+            <ul class="mm-list" id="mm-hist-list"></ul>
+            <p class="small muted" id="mm-hist-note"></p>
           </div>
-          <ul class="mm-list" id="mm-hist-list"></ul>
-          <p class="small muted" id="mm-hist-note"></p>
-        </div>
+        </details>
       </div>
     </details>
 
@@ -1292,18 +1301,20 @@ $("dev-addr-copy").addEventListener("click", function () {
   }
 });
 
-$("mm-cli-copy").addEventListener("click", function () {
-  var text = $("mm-cli-cmd").textContent || "";
+function mmCliCopy(codeId) {
+  var text = $(codeId).textContent || "";
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(function () {
-      toast("命令已复制，去终端粘贴运行", "ok");
+      toast("命令已复制，去终端粘贴运行；完成后令牌在剪贴板里", "ok");
     }).catch(function () {
       toast("复制失败，请手动选中", "warn");
     });
   } else {
     toast("这个浏览器不让脚本复制，请手动选中", "warn");
   }
-});
+}
+$("mm-cli-copy-win").addEventListener("click", function () { mmCliCopy("mm-cli-cmd-win"); });
+$("mm-cli-copy-unix").addEventListener("click", function () { mmCliCopy("mm-cli-cmd-unix"); });
 
 $("dev-static-ip-set").addEventListener("click", function () {
   var value = $("dev-static-ip").value.trim();

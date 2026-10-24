@@ -12,6 +12,40 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.15.1] — 2026-10-24
+
+**修/调：三处 UI 打磨（真机实拍反馈）。** 无新功能新页面（PATCH）。
+用户发来两张实拍截图后逐条落实：
+
+### 设备端：易忘词对话框排版
+
+首张实拍暴露的问题：10 个词用空格连成**一行**，读起来是一团。
+现在正文按 **3 词/行** 换行（LVGL label 原生多行），末尾加
+「共 N 个」计数行。真机复核：对话框正文首行
+`questionable  information  technique`，body 高度从 150 涨到 246，
+msgbox 尺寸随内容自适应。
+
+### 上位机：令牌向导升级 + 布局微调
+
+- **一键命令**：原来只给 `npx @maimemo/memo-api auth login`，用户还得
+  自己去 `~/.config/memo-api.json` 里翻 `apiToken` 字段。现在分系统给
+  两条「登录 + 令牌直接进剪贴板」的完整命令（各自带复制按钮）：
+  - Windows PowerShell：`... ; Get-Content "$env:USERPROFILE\.config\memo-api.json" | ConvertFrom-Json | Select-Object -ExpandProperty apiToken | Set-Clipboard`
+  - macOS / Linux：`... && node -e "...apiToken..." | pbcopy`（Linux 换
+    `xclip -sel clip`），node 来自 CLI 自身的依赖（Node ≥ 18），无需另装解析器。
+  - 附 `auth whoami` 核对登录状态的提示。
+- **布局**：容器 1360 → 1480px（超宽屏两侧仍显空）；墨墨面板的
+  「设备端学习记录」改为默认收起的 `<details>`——右栏默认长度让给
+  状态/令牌/向导，想看记录一键展开。
+
+### Verified（真机 + 页面）
+
+- 烧录 stub 快路径，`Hash of data verified.`；对话框实测见上。
+- `GET /` 148,312 B：两条一键命令与复制按钮、1480px 容器、学习记录
+  details 均已上线（grep 计数确认）。
+
+---
+
 ## [1.15.0] — 2026-10-24
 
 **主题：墨墨与背单词增强 + 上位机改进。** 一轮五个新功能（MINOR）。
