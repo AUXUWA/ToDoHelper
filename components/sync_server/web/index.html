@@ -143,6 +143,12 @@
   .btn:disabled{opacity:.55;cursor:default}
   .row-actions{display:flex;gap:8px;flex-wrap:wrap}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  /* grid/flex 子项默认 min-width:auto，长内容（一行长命令）会把列撑爆、
+     把文字挤成一字一行 —— 全局放开收缩限制（v1.16.0 右栏实拍暴露）。 */
+  .grid2>*{min-width:0}
+  /* 令牌向导在右栏的窄容器里：路径说明上下堆叠，长命令允许换行。 */
+  #mm-token-guide .grid2{grid-template-columns:1fr}
+  #mm-token-guide code{white-space:normal;word-break:break-all;min-width:0}
   .inline-check{display:flex;align-items:center;gap:10px;min-height:var(--touch)}
   .inline-check input{width:20px;height:20px;accent-color:var(--success)}
 
@@ -557,11 +563,11 @@
                 <strong>令牌直接放进剪贴板</strong>——回到本页粘贴即可，不用去翻配置文件。
               </p>
               <div class="add-row">
-                <code id="mm-cli-cmd-win" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;overflow:auto;white-space:nowrap;font-size:11px">npx @maimemo/memo-api auth login; Get-Content "$env:USERPROFILE\.config\memo-api.json" | ConvertFrom-Json | Select-Object -ExpandProperty apiToken | Set-Clipboard</code>
+                <code id="mm-cli-cmd-win" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:11px">npx @maimemo/memo-api auth login; Get-Content "$env:USERPROFILE\.config\memo-api.json" | ConvertFrom-Json | Select-Object -ExpandProperty apiToken | Set-Clipboard</code>
                 <button class="btn small" type="button" id="mm-cli-copy-win">复制</button>
               </div>
               <div class="add-row" style="margin-top:6px">
-                <code id="mm-cli-cmd-unix" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;overflow:auto;white-space:nowrap;font-size:11px">npx @maimemo/memo-api auth login &amp;&amp; node -e "console.log(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.config/memo-api.json','utf8')).apiToken)" | pbcopy</code>
+                <code id="mm-cli-cmd-unix" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:11px">npx @maimemo/memo-api auth login &amp;&amp; node -e "console.log(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.config/memo-api.json','utf8')).apiToken)" | pbcopy</code>
                 <button class="btn small" type="button" id="mm-cli-copy-unix">复制</button>
               </div>
               <p class="small muted" style="margin:6px 0 0">
