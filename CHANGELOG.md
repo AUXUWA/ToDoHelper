@@ -12,7 +12,67 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
-## [1.16.1] — 2026-10-24
+## [2.0.0] — 2026-10-24
+
+**新功能：本地关键词唤醒（esp-sr WakeNet10，离线）。** 「你好小智」喊一嗓子
+即唤醒进入 AI 对话。**分区表变更 → 与 v1.16.x 的 OTA 不兼容，本次必须 USB
+擦烧**（按 `AGENT.md §8.1` 判据取 **MAJOR**）。方案依据见
+`docs/LOCAL_VOICE_PLAN.md`。
+
+### 为什么能做到本地（推翻一个旧结论）
+
+AGENT.md 曾写「esp-sr 不可用（本地镜像没有）」——那是组件镜像的局限。
+实测 esp-sr **2.6.0 官方支持 esp32s31**（预编译库齐全，官方基准：
+WakeNet10 内部 RAM 16 KB / PSRAM 523 KB / 19.9% 单核），直接从组件
+registry 拉取全家（esp-sr 2.6.0 + esp-dl 3.3.14 + dl_fft 0.8.0 +
+esp_new_jpeg 1.0.2）。**诚实的边界**：本地能做的是唤醒（WakeNet）与
+命令词（MultiNet，未启用）；自由语音转文本仍需云端 ASR——
+xiaozhi-esp32 也是这个分工（本地只有唤醒+前端，ASR/LLM/TTS 全云端）。
+
+### 实现
+
+- **模型**：`wn10_nihaoxiaozhi`（你好小智，与 xiaozhi 同款）打包进新
+  **model 分区**（partitions.csv：0xA10000 / 4 MB，从 assets 划出，
+  assets 缩到 1.9 MB——里面只有 9 KB PNG）。构建时 esp-sr 按 Kconfig
+  自动打包 `srmodels.bin`（实测 826 KB）并在烧录时写入。
+- **`voice_wake.c`**（voice_service 内新模块）：AFE
+  （AFE_TYPE_SR / LOW_COST，管线 `[input] → |VAD(WebRTC)| → |WakeNet|`，
+  分配走 `MORE_PSRAM`）+ 单任务 feed/fetch 循环。采集与录音路径同格式
+  （48 kHz 立体声 → 降混 + 1/3 抽取 → 16 kHz mono），批式工作：
+  每批约 1 s，**批内每个 chunk 检查录音/播放标志**——按下录音或开始
+  播放的瞬间监听立刻交出 codec（TTS 一句话都不用等）。
+- **唤醒后联动**：`VOICE_EVENT_WAKE`（事件早预留了）→ voice_wake 亮屏 →
+  AI 对话页（全局订阅，任何页面都接得住）→ 自动开始录音 → 说完 2.5 s
+  静音自动截断（**录音新增静音截断**：只在听到过声音后计时，按钮路径
+  同样受益）→ 识别 → DeepSeek → 回复。
+- **配置**：唤醒模式沿用 AI 面板/上位机既有的 `wake_mode` 设置
+  （none/button/keyword 三选，keyword 持久化到 NVS，开机自动恢复）。
+
+### Verified（真机 COM34，2026-10-24）
+
+- 烧录 `Hash of data verified.`（含 model 分区）；bootloader 正确识别
+  `model 00a10000 00400000`；`device/info` 报 **2.0.0**。
+- 开机自动进入 keyword 模式：`AFE_CONFIG: Set WakeNet Model:
+  wn10_nihaoxiaozhi` → `AFE Pipeline: [input] -> |VAD(WebRTC)| ->
+  |WakeNet(wn10_nihaoxiaozhi,)| -> [output]` → `AFE ready, feed chunk
+  512 samples`；0 panic / 0 watchdog，静默监听稳定。
+- **内存水位**（唤醒开启的常态）：after voice_service internal 131 KB
+  (largest **48 KB**) / int-low 79 KB——最大连续块被 AFE 压到 48 KB，
+  WiFi PHY 需要的 ~30 KB 仍满足，但这是**新常态**，后续功能要盯着。
+- **调试中修掉的两个真 bug**：
+  1. `esp_afe_handle_from_config(NULL)` —— 签名像可空其实不可空，
+     真机 panic（Load access fault，config+0x60），addr2line 十分钟定位；
+     修正为「先 `afe_config_init` 再取 handle」（xiaozhi 的顺序）；
+  2. `voice_wake_start` 没触发 audio bring-up，监听永远等不到麦克风
+     —— 补 `voice_service_ensure_audio_async()`（异步：调用方可能是
+     httpd 任务，codec 的 I2C 初始化决不能内联跑）。
+- **真唤醒（人对设备喊「你好小智」）待用户确认**——检测管线就绪已验证，
+  命中后的亮屏/切页/自动录音链路在代码上与按钮路径共用。
+- **固件体积**：3.95 MB / 槽位 3.97 MB，**只剩 3%** —— esp-sr 预编译库
+  的链接体积所致。后续加 MultiNet 或新功能前必须先瘦身（assets 已无
+  可让空间，得动 LVGL 字体或关 unused 组件）。
+
+
 
 **修：右栏令牌向导被压成一字一行。** 用户实拍暴露（PATCH）。
 

@@ -4,13 +4,22 @@
 # 升级时把新固件写进另一个槽位 —— 所以 app 的空间是「一个槽位的大小」，
 # 不是两个。（v1.11.0 之前是单个 8 MB 的 factory 分区。）
 #
-# **storage 与 assets 的偏移量刻意没动**（0x810000 / 0xA10000）：
-# storage 里是设备本地的数据（待办、单词进度、AI 历史），动了偏移量
-# 那些数据就找不到了。
+# **storage 的偏移量刻意没动**（0x810000）：storage 里是设备本地的数据
+# （待办、单词进度、AI 历史），动了偏移量那些数据就找不到了。
+#
+# v2.0.0（本地关键词唤醒）：在 storage 与 assets 之间新增 **model** 分区
+# （esp-sr 的 srmodels.bin，构建时按 Kconfig 打包、烧录时自动写入）。
+# assets 顺延到 0xC10000，缩到 0x1F0000 —— assets 里只有 8 个 PNG
+# （约 9 KB），1.9 MB 绰绰有余；model 的 4 MB 是为 Phase 2 的 MultiNet
+# 命令词模型（约 2.6 MB）与 Phase 1 的 WakeNet 模型（约 1.6 MB）一次留足，
+# 以后不再动分区表。
+#
+# ⚠️ 布局变更 = 与 v1.16.x 的 OTA 不兼容：升到 2.0.0 必须一次 USB 擦烧。
 nvs,      data, nvs,      0x9000,   0x6000,
 otadata,  data, ota,      0xF000,   0x2000,
 phy_init, data, phy,      0x11000,  0x1000,
 ota_0,    app,  ota_0,    0x20000,  0x3E0000,
 ota_1,    app,  ota_1,    0x400000, 0x410000,
 storage,  data, littlefs, 0x810000, 0x200000,
-assets,   data, spiffs,   0xA10000, 0x5F0000,
+model,    data, spiffs,   0xA10000, 0x400000,
+assets,   data, spiffs,   0xE10000, 0x1F0000,

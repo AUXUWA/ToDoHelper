@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS "src/voice_service.c"
+         "src/voice_wake.c"
     INCLUDE_DIRS "include"
+    PRIV_INCLUDE_DIRS "src"
     REQUIRES
         sys_utils
         storage_manager
@@ -12,4 +14,5 @@ idf_component_register(
         mbedtls
         esp_codec_dev
         esp_timer
+        esp-sr
 )

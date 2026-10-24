@@ -207,3 +207,14 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # 第一次查询失败（DNS 还没起来、或刚改完设置）之后，用户改好了也得等一小时
 # 才看得到时间同步。5 分钟一次只有一个很小的 UDP 包，可以接受。
 CONFIG_LWIP_SNTP_UPDATE_DELAY=300000
+
+# 本地关键词唤醒（v2.0.0）：esp-sr（托管组件，从 registry 拉取）。
+# 只打包选中的模型进 model 分区（构建时自动生成 srmodels.bin）。
+# 唤醒词：你好小智（wn10_nihaoxiaozhi，与 xiaozhi-esp32 同款，约 1.6 MB）。
+# VAD（vadnet）跟随 AFE 的 LOW_COST 配置启用，帮助降低误触发。
+CONFIG_SR_WN_WN10_NIHAOXIAOZHI=y
+# 其余模型（其它唤醒词 / MultiNet 命令词 / NS）不选：每个模型都进 srmodels.bin，
+# model 分区 4 MB 放不下「什么都选」。
+# CONFIG_SR_MN_EN_MULTINET7 is not set
+# CONFIG_SR_MN_CN_MULTINET7_QUANT is not set
+

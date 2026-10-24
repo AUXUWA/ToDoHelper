@@ -8,3 +8,11 @@ dependencies:
   espressif/esp_lv_decoder:
     version: "0.4.0"
     public: true
+  # 本地关键词唤醒（v2.0.0）：esp-sr 官方支持 esp32s31（预编译库齐全，
+  # 官方基准：WakeNet10 内部 16 KB / PSRAM 523 KB / 19.9% 单核）。
+  # 级联拉取 esp-dl 3.3.x 与 dl_fft；模型走 model 分区（partitions.csv，
+  # 构建时按 Kconfig 自动打包 srmodels.bin 并在烧录时写入）。
+  espressif/esp-sr:
+    version: "==2.6.0"
+    rules:
+      - if: "target in [esp32s31]"

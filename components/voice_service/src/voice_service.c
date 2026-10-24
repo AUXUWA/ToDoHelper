@@ -25,6 +25,7 @@
 #include "http_router.h"
 #include "storage_manager.h"
 #include "th_bsp.h"
+#include "voice_wake.h"
 
 static const char *TAG = "voice";
 
@@ -270,6 +271,27 @@ static esp_codec_dev_handle_t speaker_handle(void)
     return (esp_codec_dev_handle_t)th_bsp_audio_speaker();
 }
 
+/* ---- Accessors the wake listener (voice_wake.c) shares ------------------- */
+/* The wake listener runs the same capture path as record_task, so it must see
+ * the codec lock, the busy flags and the audio state without owning either. */
+
+esp_codec_dev_handle_t voice_wake_mic_handle(void)
+{
+    return mic_handle();
+}
+
+SemaphoreHandle_t voice_wake_codec_lock(void)
+{
+    return s_codec_lock;
+}
+
+bool voice_wake_codec_busy(void)
+{
+    /* Both flags are set at the *entry* of start_record / playback, so the
+     * listener yields the moment either path wants the codec. */
+    return s_recording || s_playing || !s_audio_ready || !s_mic_ok;
+}
+
 static void ensure_audio(void)
 {
     if (s_audio_ready) {
@@ -433,6 +455,20 @@ static void record_task(void *arg)
     int32_t peak = 0;
     int read_error_logged = 0;
 
+    /*
+     * Silence truncation (v2.0.0): the button path ends on the second press,
+     * but the *wake-word* path has no second press - the recording must end
+     * by itself or the user waits out the full 10 s before the reply starts.
+     * The timer only starts after speech was actually heard, so leading
+     * silence never truncates anything, and a threshold of 800 (out of 32767)
+     * is far below speech but above the idle mic noise floor measured by the
+     * audio probe (peak readings in the thousands when spoken to).
+     */
+    const int32_t silence_threshold = 800;
+    const size_t silence_limit = (size_t)VOICE_SAMPLE_RATE * 2500 / 1000;
+    size_t silence_samples = 0;
+    bool heard_speech = false;
+
     while (!s_stop_requested && produced < VOICE_MAX_SAMPLES) {
         /*
          * esp_codec_dev_read() returns an **error code**, not a byte count:
@@ -478,6 +514,16 @@ static void record_task(void *arg)
                 const int32_t magnitude = (sample < 0) ? -sample : sample;
                 if (magnitude > peak) {
                     peak = magnitude;
+                }
+                /* Silence truncation, after speech was heard (see above). */
+                if (magnitude > silence_threshold) {
+                    heard_speech = true;
+                    silence_samples = 0;
+                } else if (heard_speech) {
+                    if (++silence_samples >= silence_limit) {
+                        SYS_LOGI(TAG, "silence truncation after speech (2.5 s)");
+                        break;
+                    }
                 }
                 if (produced >= VOICE_MAX_SAMPLES) {
                     break;
@@ -1034,6 +1080,18 @@ esp_err_t voice_service_set_wake_mode(voice_wake_mode_t mode)
     s_wake_mode = mode;
     esp_err_t err = sys_config_set_i32(SYS_KEY_VOICE_WAKE, (int32_t)mode);
     SYS_LOGI(TAG, "wake mode set to '%s'", voice_service_wake_mode_name(mode));
+
+    /* Keyword wake is the only mode with a running pipeline: start it right
+     * away (its AFE/memory cost is the point) and stop it when leaving the
+     * mode, so "none"/"button" cost nothing again. */
+    if (mode == VOICE_WAKE_KEYWORD) {
+        const esp_err_t wake_err = voice_wake_start();
+        if (wake_err != ESP_OK) {
+            SYS_LOGW(TAG, "keyword wake did not start: %s", esp_err_to_name(wake_err));
+        }
+    } else {
+        voice_wake_stop();
+    }
     return err;
 }
 
@@ -1184,6 +1242,18 @@ esp_err_t voice_service_init(void)
     esp_err_t http_err = voice_service_register_http();
     if (http_err != ESP_OK) {
         SYS_LOGW(TAG, "HTTP routes unavailable: %s", esp_err_to_name(http_err));
+    }
+
+    /* Restored keyword wake: the mode was persisted by a previous session and
+     * the user expects to just say the wake word. voice_wake_start() brings
+     * the audio up on its own (async) - the "no codec at boot" rule above is
+     * about not paying the ~20 KB *before anyone asks*, and this is the user
+     * having asked, at boot, by configuration. */
+    if (s_wake_mode == VOICE_WAKE_KEYWORD) {
+        const esp_err_t wake_err = voice_wake_start();
+        if (wake_err != ESP_OK) {
+            SYS_LOGW(TAG, "keyword wake did not start: %s", esp_err_to_name(wake_err));
+        }
     }
 
     SYS_LOGI(TAG, "ready (wake '%s', asr=%d tts=%d, audio opened on first use)",

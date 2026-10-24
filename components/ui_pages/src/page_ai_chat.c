@@ -693,6 +693,18 @@ static void speak_clicked_cb(lv_event_t *e)
 static esp_err_t voice_event_cb(int32_t event_id, void *data)
 {
     switch (event_id) {
+    case VOICE_EVENT_WAKE: {
+        /* 唤醒词命中（voice_wake 已做过亮屏）：带用户进对话页并自动开口。
+         * 录音标志在 start_record 入口即置位，唤醒监听随即让出 codec。 */
+        if (ui_page_current() != UI_PAGE_AI_CHAT) {
+            (void)ui_page_switch(UI_PAGE_AI_CHAT);
+        }
+        const esp_err_t err = voice_service_start_record();
+        if (err != ESP_OK) {
+            SYS_LOGW(TAG, "auto record after wake failed: %s", esp_err_to_name(err));
+        }
+        break;
+    }
     case VOICE_EVENT_RECORD_DONE: {
         const voice_recording_t *rec = (const voice_recording_t *)data;
         if (rec == NULL) {
@@ -832,6 +844,10 @@ static esp_err_t ai_chat_create(lv_obj_t *parent)
                              voice_event_cb);
     (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_PLAY_DONE, sizeof(esp_err_t),
                              voice_event_cb);
+    /* 本地关键词唤醒（v2.0.0）：订阅是全局的（不随页面隐藏失效），所以
+     * 喊「你好小智」时无论设备停在哪个页面都会被带到这里：亮屏 + 切本页 +
+     * 自动开始录音 —— 说完话静音截断，识别后直接提问。 */
+    (void)ui_event_subscribe(VOICE_EVENT, VOICE_EVENT_WAKE, 0, voice_event_cb);
 
     SYS_LOGD(TAG, "ai chat page built");
     return ESP_OK;

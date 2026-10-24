@@ -10,7 +10,7 @@
 > 变更历史见 `CHANGELOG.md`。
 > 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
 >
-> **当前版本 `1.16.1`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
+> **当前版本 `2.0.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
 
 ---
 
@@ -36,7 +36,7 @@
 | 待机小眼睛：纯程序化绘制，11 种表情 | ✅ |
 | 设置页：亮度/待机/时区/单词数/HTTP token/设备信息 | ✅ |
 | AI 对话（DeepSeek，流式）+ 小眼睛联动 | ✅ |
-| 语音：录音回放真实可用；ASR/TTS 走**可配置 HTTP 端点**（选型未定） | ⚠️ 半成品 |
+| 语音：录音回放真实可用；ASR/TTS 走**可配置 HTTP 端点**；**本地关键词唤醒（你好小智，esp-sr）** | ✅ |
 
 ---
 
@@ -110,7 +110,12 @@ L0 sys_utils
 | 组件源 | `IDF_COMPONENT_LOCAL_STORAGE_URL=file://C:\Espressif\tools`（本地镜像，部分组件不可得） |
 
 **本地镜像里没有的组件**（决定了技术选型，见 §9）：
-`esp_websocket_client`（→ 用 SSE 代替 WebSocket）、`esp-sr` / `esp_tts`（→ 离线 ASR/TTS 不可用）。
+`esp_websocket_client`（→ 用 SSE 代替 WebSocket）。
+~~`esp-sr` / `esp_tts` 不可用~~ **v2.0.0 更正：esp-sr 官方支持 esp32s31**
+（预编译库齐全，WakeNet10 基准：内部 16 KB / PSRAM 523 KB / 19.9% 单核），
+从组件 registry 拉取即可（`main/idf_component.yml`），本地关键词唤醒已落地
+（`components/voice_service/src/voice_wake.c`、`docs/LOCAL_VOICE_PLAN.md`）。
+`esp_tts` 仍不可用（TTS 继续走云端端点）。
 可用的有：`joltwallet/littlefs`、`espressif/mdns`、`espressif/cjson`、`espressif/mqtt`。
 
 `idf.py` **不在 Git Bash 的 PATH 里**；IDF v6.1 在 Git Bash 下会打印
@@ -383,6 +388,11 @@ Project build complete.
 > **v1.2.0 现行基线**（2026-09 流畅度优化后实测，同一张卡）：`boot complete`
 > **internal 66 KB / largest 22 KB / int-low 54 KB**，`storage=/sdcard`。与上表基本一致，
 > 说明「异步化 + 脏检查」没有吃掉内部 RAM（新增任务都是按需创建、平时不占栈）。
+>
+> **v2.0.0 基线**（本地关键词唤醒开启，2026-10-24 实测）：`boot complete`
+> **internal 120 KB / largest 48 KB / int-low 79 KB**（voice_service 后
+> internal 131 KB / largest 48 KB）。唤醒把最大连续块从 80 KB 级压到
+> 48 KB 级——WiFi PHY 的 ~30 KB 仍满足，但这是带唤醒的新常态（§9.0.1.16 第 50 条）。
 
 > 每一行由 `sys_heap_log()` 在 `app_main` 里输出。**排障时看「最大连续块」而不是总空闲量**：
 > 首轮上机出现的全部 `ESP_ERR_NO_MEM` 都是内部 RAM 碎片化造成的——总空闲看着还有十几 KB，
@@ -409,7 +419,7 @@ Project build complete.
 **不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
 改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
 
-- **当前版本：`1.16.1`**
+- **当前版本：`2.0.0`**
 - 版本进 `esp_app_desc_t`，于是**三处可见**：
   设备「设置」页顶部与开机页「固件 1.3.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
   以及 `build/todohelper.bin` 的 app descriptor（离线核对：
@@ -1042,6 +1052,30 @@ git ls-files | grep -iE "\.(log|bak|tmp|bin|elf)$"
     → 摘要只切**完整字符**。
     → 教训：**「看起来是编码问题」和「JSON 整个坏了」是同一件事** ——
     凡是往 JSON 里塞设备上的中文，都要保证它一定是合法 UTF-8。
+
+### 9.0.1.16 v2.0.0（本地关键词唤醒）补进来的三条实测结论
+
+48. **`esp_afe_handle_from_config()` 的签名像可空，其实不可空。**
+    真机 panic（Load access fault，MTVAL = 0x60 = config 指针 + 0x60 字段），
+    addr2line 直指预编译库 `esp_afe_sr_models.c:10`。
+    → 正确顺序是**先 `afe_config_init()` 再 `esp_afe_handle_from_config(cfg)`
+    再 `create_from_config(cfg)`**（xiaozhi-esp32 也是这个顺序）。
+    → 教训：**预编译库的「空指针防御」不能靠猜签名** —— 崩了先 addr2line，
+    十分钟就有答案，比对着头文件猜快得多。
+49. **唤醒监听与录音/播放共用一个 ES8389，靠「标志入口置位 + 让路」分时。**
+    `s_recording` / `s_playing` 在 `start_record` / 播放入口**置位**，唤醒任务的
+    采集循环每个 chunk 检查它们，看到就立即中断本批、交出 codec ——
+    所以 TTS 播放永远不用等监听批次结束。反过来，监听恢复只靠这两个标志
+    清零，不需要显式的 resume 通知。
+    → 教训：**共享外设的「低优先级占用者」要在最细的粒度上看路**，
+    批式持锁 + chunk 级让路，比「锁粒度放大」和「抢占式打断」都便宜。
+50. **语音唤醒开启后的新内存常态：internal largest 48 KB / int-low 79 KB。**
+    （after voice_service internal 131 KB / largest 48 KB；boot complete
+    internal 120 KB / largest 48 KB。）AFE 的分配显式走了
+    `AFE_MEMORY_ALLOC_MORE_PSRAM`，剩下的 16 KB 级内部占用是任务栈和
+    不可挪的缓冲。WiFi PHY 要的 ~30 KB 连续块仍然满足，**但余量从
+    「80 KB 级」掉到「48 KB 级」** —— 后续任何功能加内部 RAM 负担前
+    先跑一遍开机看这个数。
 
 ### 9.0.1.14 v1.13.2 补进来的两条实测结论
 
