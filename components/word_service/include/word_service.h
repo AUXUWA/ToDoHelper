@@ -187,6 +187,18 @@ esp_err_t word_cloud_refresh(void);
 size_t word_cloud_count(void);
 
 /**
+ * @brief Today's weak cloud words: MaiMemo answered FORGET/FAMILIAR (v1.15.0).
+ *
+ * The first_response flags arrive with the daily queue at no extra cost, so
+ * this is a pure in-memory copy (safe to call from an LVGL callback).
+ *
+ * @param out Array of at least @p max entries, or NULL to only count.
+ * @return ESP_OK when at least one weak word exists, ESP_ERR_NOT_FOUND when
+ *         none (or no cloud queue), ESP_ERR_INVALID_STATE before init.
+ */
+esp_err_t word_cloud_weak(word_item_t *out, size_t max, size_t *count);
+
+/**
  * @brief Total number of words loaded from the book (v1.4.0).
  *
  * Used by the console to show which book is backing the cards.

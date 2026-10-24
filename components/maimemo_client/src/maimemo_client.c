@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "cJSON.h"
@@ -1780,6 +1781,92 @@ static bool mm_resolve_voc_id(const char *spelling, char *out, size_t len)
 }
 
 /**
+ * Resolve many spellings with ONE `POST /vocabulary/query` (v1.15.0).
+ *
+ * The endpoint takes `{"spellings":[...]}` (up to 1000 on the server side; the
+ * device never asks for more than MAIMEMO_MAX_TODAY) and answers
+ * `{"data":{"voc":[{"id","spelling"},...]}}` - the batch sibling of the
+ * single-word GET above, confirmed against the official CLI
+ * (memo-api-cli src/commands/voc.ts).
+ *
+ * Why it matters here: the advance path used to resolve one GET per word, and
+ * every GET is a full TLS round trip on a board where handshakes serialise on
+ * the network lock and eat the internal heap (AGENT.md 9.0). One request for
+ * the whole batch removes N-1 of them.
+ *
+ * @return How many of the inputs were resolved (ids written into @p out rows;
+ *         unresolved rows are left empty). 0 also when the call itself failed,
+ *         in which case the caller should fall back to the serial resolver.
+ */
+static size_t mm_resolve_voc_ids_batch(const char *const *spellings, size_t count,
+                                       char (*out)[MAIMEMO_VOC_ID_MAX])
+{
+    for (size_t i = 0; i < count; i++) {
+        out[i][0] = '\0';
+    }
+    if (mm_state_token_rejected()) {
+        return 0;
+    }
+
+    cJSON *body = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(body, "spellings");
+    if (body == NULL || arr == NULL) {
+        cJSON_Delete(body);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (spellings[i] == NULL || spellings[i][0] == '\0') {
+            continue;
+        }
+        cJSON *item = cJSON_CreateString(spellings[i]);
+        if (item == NULL || cJSON_AddItemToArray(arr, item) != true) {
+            cJSON_Delete(item);
+            break;
+        }
+    }
+    char *payload = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (payload == NULL) {
+        return 0;
+    }
+
+    cJSON *root = NULL;
+    const esp_err_t err = mm_post("vocabulary/query", payload, &root);
+    cJSON_free(payload);
+    if (err != ESP_OK) {
+        SYS_LOGD(TAG, "batch resolve unavailable (%s) - caller should go serial",
+                 esp_err_to_name(err));
+        return 0;
+    }
+
+    size_t resolved = 0;
+    const cJSON *data = mm_data(root);
+    const cJSON *voc = data ? cJSON_GetObjectItemCaseSensitive(data, "voc") : NULL;
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, voc) {
+        if (!cJSON_IsObject(entry)) {
+            continue;
+        }
+        const cJSON *spelling = cJSON_GetObjectItemCaseSensitive(entry, "spelling");
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(entry, "id");
+        if (!cJSON_IsString(spelling) || !cJSON_IsString(id) ||
+            spelling->valuestring[0] == '\0' || id->valuestring[0] == '\0') {
+            continue;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (out[i][0] == '\0' && spellings[i] != NULL &&
+                strcasecmp(spelling->valuestring, spellings[i]) == 0) {
+                strlcpy(out[i], id->valuestring, MAIMEMO_VOC_ID_MAX);
+                resolved++;
+                break;
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return resolved;
+}
+
+/**
  * Read one field of the enrichment (`/notes` or `/phrases`).
  *
  * Both are **GET with `?voc_id=`**, not POST - see mm_get() for why that
@@ -2376,8 +2463,12 @@ esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *a
 
     /*
      * Resolve first: advance_study takes voc_ids, and a spelling MaiMemo does
-     * not know cannot be advanced. Resolution is one GET per word, so the caller
-     * should batch - which the sync path does.
+     * not know cannot be advanced.
+     *
+     * v1.15.0: one POST /vocabulary/query resolves the whole batch. The serial
+     * one-GET-per-word loop survives only as the fallback for a token whose
+     * scope excludes the batch endpoint - and for the days when it is simply
+     * unavailable.
      *
      * The id buffer is **on the heap, not the stack**. A `char[64][80]` local is
      * 5 KB, and this function is called from a 5 KB worker task (and from the
@@ -2397,17 +2488,26 @@ esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *a
         return ESP_ERR_NO_MEM;
     }
 
+    /* Batch first: one request for everything (rows indexed by input). */
+    const size_t batch_ok = mm_resolve_voc_ids_batch(spellings, limit, storage);
+    if (batch_ok == 0) {
+        /* Fallback: the serial one-GET-per-word path, writing row i for input i. */
+        for (size_t i = 0; i < limit; i++) {
+            if (spellings[i] == NULL || spellings[i][0] == '\0') {
+                continue;
+            }
+            if (!mm_resolve_voc_id(spellings[i], storage[i], sizeof(storage[0]))) {
+                SYS_LOGD(TAG, "advance: '%s' unknown to MaiMemo, skipped", spellings[i]);
+            }
+        }
+    }
+
+    /* Compact the non-empty rows into the id list advance_study takes. */
     size_t resolved = 0;
     for (size_t i = 0; i < limit; i++) {
-        if (spellings[i] == NULL || spellings[i][0] == '\0') {
-            continue;
+        if (storage[i][0] != '\0') {
+            ids[resolved++] = storage[i];
         }
-        if (!mm_resolve_voc_id(spellings[i], storage[resolved], sizeof(storage[0]))) {
-            SYS_LOGD(TAG, "advance: '%s' unknown to MaiMemo, skipped", spellings[i]);
-            continue;
-        }
-        ids[resolved] = storage[resolved];
-        resolved++;
     }
 
     esp_err_t err;
@@ -2423,11 +2523,300 @@ esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *a
     return err;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Cloud notepad (云生词本, v1.15.0)                                          */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * `memo/notepads` CRUD, shape confirmed against memo-api-cli
+ * (src/commands/notepad.ts + src/types/notepad.ts, types from
+ * openapi/notepad/v1/notepad.proto):
+ *
+ *   GET  memo/notepads?limit&offset      -> data.notepads[{id,title,brief,...}]
+ *   GET  memo/notepads/{id}              -> data.notepad{status,content,...}
+ *   POST memo/notepads                   {"notepad":{status,content,title,brief,tags}}
+ *   POST memo/notepads/{id}              same body (full replace of content)
+ *
+ * The device keeps to a deliberately small slice: list, and "add these words
+ * to the notepad called X (create it when missing)". Content is one word per
+ * line; the merge re-writes the whole content, so the existing words are read
+ * back first to avoid clobbering what other devices put there.
+ */
+
+/** Hard cap on the merged content so one bad merge cannot blow MM_MAX_RESPONSE. */
+#define MM_NOTEPAD_MAX_WORDS 300
+#define MM_NOTEPAD_MAX_CONTENT (MM_NOTEPAD_MAX_WORDS * (MAIMEMO_SPELLING_MAX + 1))
+
+/** Case-insensitive "is this word already a line of @p content?" */
+static bool notepad_content_has(const char *content, const char *word)
+{
+    const size_t len = strlen(word);
+    const char *line = content;
+    while (line != NULL && line[0] != '\0') {
+        const char *nl = strchr(line, '\n');
+        const size_t line_len = (nl != NULL) ? (size_t)(nl - line) : strlen(line);
+        if (line_len == len && strncasecmp(line, word, len) == 0) {
+            return true;
+        }
+        line = (nl != NULL) ? nl + 1 : NULL;
+    }
+    return false;
+}
+
+esp_err_t maimemo_notepad_list(maimemo_notepad_t *out, size_t max, size_t *count)
+{
+    if (count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+
+    cJSON *root = NULL;
+    /* limit=10 is the CLI's default and known-good; the server answers
+     * `common_invalid_param` for limit=50 (verified on a live account). */
+    const esp_err_t err = mm_get("memo/notepads", "limit=10&offset=0", &root);
+    if (err != ESP_OK) {
+        /* Propagate the classified cause (permission / auth / transport) - the
+         * console shows it, and a blanket INVALID_STATE hid exactly that. */
+        return err;
+    }
+
+    const cJSON *data = mm_data(root);
+    const cJSON *notepads = data ? cJSON_GetObjectItemCaseSensitive(data, "notepads") : NULL;
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, notepads) {
+        if (!cJSON_IsObject(entry)) {
+            continue;
+        }
+        if (out != NULL && *count < max) {
+            maimemo_notepad_t *dst = &out[*count];
+            memset(dst, 0, sizeof(*dst));
+            mm_copy(dst->id, sizeof(dst->id), entry, "id");
+            mm_copy(dst->title, sizeof(dst->title), entry, "title");
+            mm_copy(dst->brief, sizeof(dst->brief), entry, "brief");
+            mm_copy(dst->updated, sizeof(dst->updated), entry, "updated_time");
+        }
+        (*count)++;
+    }
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/**
+ * Append @p spellings to the notepad named @p title, creating it on first use.
+ *
+ * Blocking HTTPS (1-3 round trips); UI callers go through
+ * maimemo_notepad_add_words_async().
+ */
+esp_err_t maimemo_notepad_add_words(const char *title, const char *const *spellings,
+                                    size_t count, int *added)
+{
+    if (title == NULL || title[0] == '\0' || spellings == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!maimemo_has_token()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (added != NULL) {
+        *added = 0;
+    }
+
+    char notepad_id[80] = { 0 };
+    char status[24] = "UNPUBLISHED";
+    char brief[64] = "ToDoHelper 设备生词";
+    /* Existing + new content. PSRAM: this is bulk string data (AGENT.md 9.0.5). */
+    char *content = heap_caps_calloc_prefer(1, MM_NOTEPAD_MAX_CONTENT + 1, 2,
+                                            MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (content == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 1. Find the notepad by title. The list lives in PSRAM: it is ~2.8 KB and
+     * this function runs on 6 KB workers that also pay for a TLS handshake. */
+    maimemo_notepad_t *list = heap_caps_calloc_prefer(
+        16, sizeof(maimemo_notepad_t), 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (list == NULL) {
+        heap_caps_free(content);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t list_count = 0;
+    if (maimemo_notepad_list(list, 16, &list_count) == ESP_OK) {
+        for (size_t i = 0; i < list_count; i++) {
+            if (strcmp(list[i].title, title) == 0) {
+                strlcpy(notepad_id, list[i].id, sizeof(notepad_id));
+                break;
+            }
+        }
+    }
+    heap_caps_free(list);
+
+    esp_err_t err = ESP_OK;
+
+    /* 2. Existing notepad: read the content back so the merge appends instead
+     *    of replacing (update is a full-content replace server-side). */
+    if (notepad_id[0] != '\0') {
+        char path[112];
+        snprintf(path, sizeof(path), "memo/notepads/%s", notepad_id);
+        cJSON *root = NULL;
+        if (mm_get(path, NULL, &root) == ESP_OK) {
+            const cJSON *data = mm_data(root);
+            const cJSON *notepad =
+                data ? cJSON_GetObjectItemCaseSensitive(data, "notepad") : NULL;
+            const cJSON *cur = cJSON_GetObjectItemCaseSensitive(notepad, "content");
+            if (cJSON_IsString(cur) && cur->valuestring != NULL) {
+                strlcpy(content, cur->valuestring, MM_NOTEPAD_MAX_CONTENT + 1);
+            }
+            mm_copy(status, sizeof(status), notepad, "status");
+            mm_copy(brief, sizeof(brief), notepad, "brief");
+            cJSON_Delete(root);
+        } else {
+            SYS_LOGW(TAG, "notepad read-back failed; refusing a blind overwrite");
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+
+    /* 3. Merge: append the words that are not already lines. */
+    size_t used = strlen(content);
+    if (err == ESP_OK) {
+        int appended = 0;
+        for (size_t i = 0; i < count && appended < 64; i++) {
+            if (spellings[i] == NULL || spellings[i][0] == '\0') {
+                continue;
+            }
+            if (notepad_content_has(content, spellings[i])) {
+                continue;
+            }
+            const size_t len = strlen(spellings[i]);
+            if (used + len + 2 > MM_NOTEPAD_MAX_CONTENT) {
+                SYS_LOGW(TAG, "notepad content cap reached (%d words)", MM_NOTEPAD_MAX_WORDS);
+                break;
+            }
+            if (used > 0 && content[used - 1] != '\n') {
+                content[used++] = '\n';
+            }
+            memcpy(content + used, spellings[i], len);
+            used += len;
+            content[used] = '\0';
+            appended++;
+        }
+        if (added != NULL) {
+            *added = appended;
+        }
+        if (appended == 0) {
+            heap_caps_free(content);
+            return ESP_OK;   /* nothing new: no request, no flash of state */
+        }
+    }
+
+    /* 4. Write it back (create or update). */
+    if (err == ESP_OK) {
+        cJSON *note = cJSON_CreateObject();
+        cJSON *body = cJSON_CreateObject();
+        char *payload = NULL;
+        if (note != NULL && body != NULL) {
+            cJSON_AddStringToObject(note, "status", status);
+            cJSON_AddStringToObject(note, "content", content);
+            cJSON_AddStringToObject(note, "title", title);
+            cJSON_AddStringToObject(note, "brief", brief);
+            (void)cJSON_AddArrayToObject(note, "tags");
+            cJSON_AddItemToObject(body, "notepad", note);
+            payload = cJSON_PrintUnformatted(body);
+        }
+        cJSON_Delete(body);
+        if (payload == NULL) {
+            err = ESP_ERR_NO_MEM;
+        } else {
+            char path[112];
+            if (notepad_id[0] != '\0') {
+                snprintf(path, sizeof(path), "memo/notepads/%s", notepad_id);
+            } else {
+                strlcpy(path, "memo/notepads", sizeof(path));
+            }
+            cJSON *reply = NULL;
+            err = mm_post(path, payload, &reply);
+            cJSON_Delete(reply);
+            cJSON_free(payload);
+        }
+    }
+
+    heap_caps_free(content);
+    if (err == ESP_OK) {
+        SYS_LOGI(TAG, "notepad '%s': %d word(s) added", title,
+                 (added != NULL) ? *added : -1);
+    }
+    return err;
+}
+
+/** Job for the one-shot notepad worker; owns strdup'd copies of the words. */
+typedef struct {
+    char title[64];
+    size_t count;
+    char *spellings[];
+} mm_notepad_job_t;
+
+/** One-shot worker for maimemo_notepad_add_words_async(). */
+static void mm_notepad_worker(void *arg)
+{
+    mm_notepad_job_t *job = (mm_notepad_job_t *)arg;
+    int added = 0;
+    const esp_err_t err =
+        maimemo_notepad_add_words(job->title, (const char *const *)job->spellings,
+                                  job->count, &added);
+    if (err != ESP_OK) {
+        SYS_LOGW(TAG, "notepad add failed: %s", esp_err_to_name(err));
+    }
+    for (size_t i = 0; i < job->count; i++) {
+        free(job->spellings[i]);
+    }
+    heap_caps_free(job);
+    vTaskDelete(NULL);
+}
+
+/** UI-safe wrapper: the blocking HTTPS runs on its own 6 KB task (TLS needs it). */
+esp_err_t maimemo_notepad_add_words_async(const char *title,
+                                          const char *const *spellings, size_t count)
+{
+    if (title == NULL || title[0] == '\0' || spellings == NULL || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!maimemo_has_token()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (count > 64) {
+        count = 64;
+    }
+
+    mm_notepad_job_t *job = heap_caps_calloc_prefer(
+        1, sizeof(*job) + count * sizeof(char *), 2,
+        MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (job == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    job->count = count;
+    strlcpy(job->title, title, sizeof(job->title));
+    for (size_t i = 0; i < count; i++) {
+        job->spellings[i] = strdup(spellings[i] != NULL ? spellings[i] : "");
+        if (job->spellings[i] == NULL) {
+            job->count = i;
+            break;
+        }
+    }
+
+    if (xTaskCreate(mm_notepad_worker, "th_mm_note", 6144, job, 3, NULL) != pdPASS) {
+        for (size_t i = 0; i < job->count; i++) {
+            free(job->spellings[i]);
+        }
+        heap_caps_free(job);
+        SYS_LOGW(TAG, "cannot start the notepad worker");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 /*
  * Probe table. Ordered by how much each endpoint matters to the study flow:
  * the first two decide whether the queue works at all, `/interpretations` and
- * the note pair decide whether a card can show content for a word the local book
- * does not have.
+ * the note pair decide whether a card can show content for a word the local
+ * book does not have.
  */
 static const struct {
     const char *path;      /**< endpoint to exercise */
@@ -2439,6 +2828,7 @@ static const struct {
     { "interpretations",          "释义" },
     { "notes",                    "助记" },
     { "phrases",                  "例句" },
+    { "memo/notepads",            "云生词本" },
 };
 
 /** Resolve one spelling to a voc_id, for the probe's per-word endpoints.

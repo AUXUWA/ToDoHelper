@@ -142,7 +142,7 @@ typedef struct {
 } maimemo_probe_result_t;
 
 /** How many endpoints maimemo_probe() reports on. */
-#define MAIMEMO_PROBE_MAX 6
+#define MAIMEMO_PROBE_MAX 7
 
 /**
  * @brief Is a token configured?
@@ -359,6 +359,43 @@ esp_err_t maimemo_advance_words(const char **voc_ids, size_t count, int *advance
  * @warning **Blocking TLS.** Worker/HTTP context only.
  */
 esp_err_t maimemo_advance_spellings(const char **spellings, size_t count, int *advanced);
+
+/* ------------------------------------------------------------------------ */
+/* Cloud notepad (云生词本, v1.15.0)                                          */
+/* ------------------------------------------------------------------------ */
+
+/** One cloud notepad as returned by maimemo_notepad_list(). */
+typedef struct {
+    /** Server-side id: ~65 chars ("np-" + base62). 80 with room, like voc ids. */
+    char id[80];
+    char title[64];
+    char brief[64];
+    char updated[24];   /**< ISO time string, may be empty */
+} maimemo_notepad_t;
+
+/**
+ * @brief List the account's cloud notepads. Blocking TLS.
+ *
+ * @param out Array of at least @p max entries (NULL to only count).
+ */
+esp_err_t maimemo_notepad_list(maimemo_notepad_t *out, size_t max, size_t *count);
+
+/**
+ * @brief Append words to the cloud notepad named @p title, creating it on
+ *        first use. Blocking TLS (1-3 round trips).
+ *
+ * The existing content is read back first, so words other devices put into the
+ * notepad survive; already-present words are skipped (case-insensitive).
+ *
+ * @param added Optional; receives how many words were actually appended
+ *              (0 with ESP_OK = everything was already in the notepad).
+ */
+esp_err_t maimemo_notepad_add_words(const char *title, const char *const *spellings,
+                                    size_t count, int *added);
+
+/** @brief maimemo_notepad_add_words() on a one-shot worker - safe from LVGL. */
+esp_err_t maimemo_notepad_add_words_async(const char *title,
+                                          const char *const *spellings, size_t count);
 
 /**
  * @brief Probe which endpoints the configured token may use. Blocking.

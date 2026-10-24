@@ -60,8 +60,15 @@
   code{font-family:ui-monospace,Consolas,"Courier New",monospace;background:var(--surface-alt);padding:1px 5px;border-radius:5px;font-size:12px}
   .muted{color:var(--muted)}
   .small{font-size:13px}
-  .wrap{max-width:960px;margin:0 auto;padding:0 16px}
+  .wrap{max-width:1360px;margin:0 auto;padding:0 20px}
   .stack{display:flex;flex-direction:column;gap:12px;padding-top:16px;padding-bottom:28px}
+  /* 宽屏双栏（v1.15.0）：待办列表是主角占左栏（宽），配置/墨墨/OTA 等卡片流到右栏。
+     窄屏维持单列且顺序不变 —— 待办紧跟设备状态。 */
+  .cols{display:flex;flex-direction:column;gap:12px}
+  .col{display:flex;flex-direction:column;gap:12px;min-width:0}
+  @media (min-width:1080px){
+    .cols{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);gap:12px;align-items:start}
+  }
 
   /* ---------- 顶栏 ---------- */
   .topbar{position:sticky;top:0;z-index:6;background:rgba(22,28,36,.97);border-bottom:1px solid var(--line)}
@@ -287,7 +294,7 @@
   #toast.err{border-color:var(--danger)}
   #toast.warn{border-color:var(--warning)}
 
-  footer{color:var(--muted);font-size:12px;padding:0 16px 28px;max-width:960px;margin:0 auto}
+  footer{color:var(--muted);font-size:12px;padding:0 20px 28px;max-width:1360px;margin:0 auto}
 
   @media (max-width:600px){
     .wrap{padding:0 12px}
@@ -387,6 +394,10 @@
       </div>
     </section>
 
+    <!-- 双栏容器（宽屏）：左栏 = 添加表单 + 待办列表（主角），右栏 = 配置类卡片 -->
+    <div class="cols">
+    <div class="col">
+
     <!-- 新增 -->
     <form class="card" id="add-form" autocomplete="off">
       <div class="add-row">
@@ -448,6 +459,9 @@
       </div>
     </section>
 
+    </div><!-- /col 待办 -->
+    <div class="col">
+
     <!-- 连接设置 -->
     <details class="card" id="settings">
       <summary class="card-head" style="cursor:pointer;list-style:none;margin:0">
@@ -484,11 +498,41 @@
       </summary>
       <div class="fields" style="padding-top:10px">
         <p class="small muted" id="mm-help">
-          墨墨没有公开的第三方登录，需要在手机上取一个 <strong>开放 API 令牌</strong>：
-          「墨墨背单词 App → 我的 → 设置 → 开放 API」生成后填到下面即可。<br>
           令牌是<strong>只写</strong>的 —— 填进来之后设备只会回一个打码的提示（如 <code>g_zV****</code>），
           本页永远不会把完整令牌显示出来，也不写进 localStorage。
         </p>
+
+        <!-- 获取令牌向导（v1.15.0）：两条官方路径，都不用找客服 -->
+        <details class="more" id="mm-token-guide">
+          <summary>怎么获取令牌？两条路（手机 App / 电脑命令行）</summary>
+          <div class="grid2" style="margin-top:8px">
+            <div class="field">
+              <h3 class="mm-sub">路径一：手机 App</h3>
+              <ol class="small" style="padding-left:18px;margin:4px 0 0">
+                <li>打开「墨墨背单词」App → <strong>我的 → 设置 → 开放 API</strong></li>
+                <li>生成 <strong>开放 API 令牌</strong>（一串 <code>g_</code> 开头的字符）</li>
+                <li>复制后粘贴到下面的输入框，点「保存并校验」</li>
+              </ol>
+            </div>
+            <div class="field">
+              <h3 class="mm-sub">路径二：电脑命令行（官方 CLI，推荐）</h3>
+              <p class="small" style="margin:4px 0 6px">
+                电脑装了 <a href="https://nodejs.org" target="_blank" rel="noreferrer">Node.js</a>
+                的话，一条命令，浏览器里登录墨墨账号即可：
+              </p>
+              <div class="add-row">
+                <code id="mm-cli-cmd" style="flex:1;padding:6px 8px;border:1px solid var(--line);border-radius:6px;overflow:auto;white-space:nowrap">npx @maimemo/memo-api auth login</code>
+                <button class="btn small" type="button" id="mm-cli-copy">复制命令</button>
+              </div>
+              <p class="small muted" style="margin:6px 0 0">
+                登录成功后令牌自动存到 <code>~/.config/memo-api.json</code>（Windows 在
+                <code>%USERPROFILE%\.config\memo-api.json</code>）的 <code>apiToken</code> 字段，
+                复制那串字符粘贴到下面即可。CLI 来自
+                <a href="https://github.com/maimemo/memo-api-cli" target="_blank" rel="noreferrer">墨墨官方仓库</a>。
+              </p>
+            </div>
+          </div>
+        </details>
 
         <div class="kv-grid" id="mm-rows"></div>
 
@@ -672,6 +716,9 @@
         <p class="small muted" id="ai-voice-state">语音状态未知</p>
       </div>
     </details>
+
+    </div><!-- /col 配置 -->
+    </div><!-- /cols -->
 
   </div>
 </div>
@@ -1237,6 +1284,19 @@ $("dev-addr-copy").addEventListener("click", function () {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(function () {
       toast("已复制 " + text, "ok");
+    }).catch(function () {
+      toast("复制失败，请手动选中", "warn");
+    });
+  } else {
+    toast("这个浏览器不让脚本复制，请手动选中", "warn");
+  }
+});
+
+$("mm-cli-copy").addEventListener("click", function () {
+  var text = $("mm-cli-cmd").textContent || "";
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () {
+      toast("命令已复制，去终端粘贴运行", "ok");
     }).catch(function () {
       toast("复制失败，请手动选中", "warn");
     });

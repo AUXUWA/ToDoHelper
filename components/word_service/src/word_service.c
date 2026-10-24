@@ -19,6 +19,7 @@
 
 #include "storage_manager.h"
 #include "word_default_book.h"
+#include "word_ssp.h"
 
 #include "maimemo_client.h"
 #include "sys_keys.h"
@@ -40,11 +41,15 @@ ESP_EVENT_DEFINE_BASE(WORD_EVENT);
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-    uint8_t level;           /**< 0 = new, up to 5 */
+    uint8_t level;           /**< 0 = new, up to 5 (display only since v1.15.0) */
     uint8_t last_result;
     uint16_t review_count;
     int64_t next_review_ts;
     int64_t reviewed_at;
+    /* SSP-MMC memory state (v1.15.0). halflife 0 = not yet reviewed by the
+     * model; difficulty starts at WORD_SSP_D_DEFAULT and grows on lapses. */
+    uint8_t difficulty;
+    float halflife;
 } word_progress_t;
 
 static bool s_initialized;
@@ -101,6 +106,12 @@ static size_t s_cloud_count;
 /** Book indices for the cloud queue: UINT16_MAX means "no local entry". */
 static uint16_t *s_cloud_map;
 static bool s_cloud_active;
+/**
+ * MaiMemo's first_response per cloud word (v1.15.0): 0 none/unknown,
+ * 1 FORGET, 2 FAMILIAR. This is the "今日易忘词" data - already fetched with
+ * the queue, kept so the weak-word list costs no extra request.
+ */
+static uint8_t *s_cloud_first;
 
 /*
  * ## The card currently on screen (v1.5.0 fix for the wrong spelling in the log)
@@ -295,13 +306,21 @@ static int64_t day_start_stamp(void)
 }
 
 /**
- * Spaced repetition, deliberately simple but not ad hoc:
- *   known   -> level+1 (<=5), revisit after 2^level days
- *   fuzzy   -> level unchanged, revisit tomorrow
- *   unknown -> back to level 0, revisit in 10 minutes
+ * Spaced repetition (v1.15.0: SSP-MMC).
+ *
+ * The interval comes from the SSP-MMC optimal policy (word_ssp.c): the memory
+ * state (difficulty, halflife) is updated with the review outcome, then the
+ * policy table says the next interval in whole days. The old 2^level heuristic
+ * and the 10-minute re-quiz are gone; level is still bumped for display, but
+ * nothing schedules off it any more.
+ *
+ * 模糊/不认识 both count as a lapse - that is SSP-MMC's own three-way mapping
+ * (responses_dict '2' -> 0), fitted on their 220M review logs, not a local
+ * invention.
  */
 static void schedule(word_progress_t *progress, word_review_result_t result, int64_t now)
 {
+    const int64_t previous_at = progress->reviewed_at;
     progress->last_result = (uint8_t)result;
     progress->review_count++;
     progress->reviewed_at = now;
@@ -311,20 +330,31 @@ static void schedule(word_progress_t *progress, word_review_result_t result, int
         if (progress->level < 5) {
             progress->level++;
         }
-        progress->next_review_ts = now + (int64_t)(1u << progress->level) * 86400;
         s_known_total++;
         break;
     case WORD_REVIEW_FUZZY:
-        progress->next_review_ts = now + 86400;
         s_fuzzy_total++;
         break;
     case WORD_REVIEW_UNKNOWN:
     default:
         progress->level = 0;
-        progress->next_review_ts = now + 600;
         s_unknown_total++;
         break;
     }
+
+    float elapsed_days = 0.0f;
+    if (previous_at > 0 && now > previous_at) {
+        elapsed_days = (float)(now - previous_at) / 86400.0f;
+    }
+
+    if (progress->difficulty < WORD_SSP_D_MIN || progress->difficulty > WORD_SSP_D_MAX) {
+        progress->difficulty = WORD_SSP_D_DEFAULT;
+    }
+    word_ssp_review(&progress->difficulty, &progress->halflife,
+                    result == WORD_REVIEW_KNOWN, elapsed_days);
+    const int32_t days =
+        word_ssp_next_interval_days(progress->difficulty, progress->halflife);
+    progress->next_review_ts = now + (int64_t)days * 86400;
 }
 
 static void free_buffers(void)
@@ -535,6 +565,8 @@ esp_err_t word_save_progress(void)
         cJSON_AddNumberToObject(entry, "last", p->last_result);
         cJSON_AddNumberToObject(entry, "next", (double)p->next_review_ts);
         cJSON_AddNumberToObject(entry, "at", (double)p->reviewed_at);
+        cJSON_AddNumberToObject(entry, "d", p->difficulty);
+        cJSON_AddNumberToObject(entry, "h", (double)p->halflife);
         cJSON_AddItemToObject(items, key, entry);
     }
     xSemaphoreGive(s_lock);
@@ -679,6 +711,27 @@ static esp_err_t load_progress(void)
             if ((field = cJSON_GetObjectItemCaseSensitive(entry, "at")) != NULL &&
                 cJSON_IsNumber(field)) {
                 p->reviewed_at = (int64_t)field->valuedouble;
+            }
+            if ((field = cJSON_GetObjectItemCaseSensitive(entry, "d")) != NULL &&
+                cJSON_IsNumber(field)) {
+                p->difficulty = (uint8_t)field->valuedouble;
+            }
+            if ((field = cJSON_GetObjectItemCaseSensitive(entry, "h")) != NULL &&
+                cJSON_IsNumber(field) && field->valuedouble > 0.0) {
+                p->halflife = (float)field->valuedouble;
+            }
+            /*
+             * Pre-v1.15.0 file: no SSP state. Migrate instead of dropping the
+             * progress: the old scheduler had last scheduled 2^level days for a
+             * word at level >= 1, so a halflife of exactly that many days puts
+             * the word in the right neighbourhood of the policy table (a word
+             * reviewed on schedule sits near p ~= 0.5, which is h == interval).
+             */
+            if (p->halflife == 0.0f && p->review_count > 0 && p->level > 0) {
+                p->halflife = (float)(1u << (p->level > 5 ? 5 : p->level));
+            }
+            if (p->difficulty < WORD_SSP_D_MIN || p->difficulty > WORD_SSP_D_MAX) {
+                p->difficulty = WORD_SSP_D_DEFAULT;
             }
             restored++;
         }
@@ -991,8 +1044,10 @@ static void free_cloud_queue(void)
 {
     heap_caps_free(s_cloud_words);
     heap_caps_free(s_cloud_map);
+    heap_caps_free(s_cloud_first);
     s_cloud_words = NULL;
     s_cloud_map = NULL;
+    s_cloud_first = NULL;
     s_cloud_count = 0;
     s_cloud_active = false;
 }
@@ -1406,13 +1461,16 @@ esp_err_t word_cloud_refresh(void)
                                                    MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     uint16_t *map = heap_caps_malloc_prefer(MAIMEMO_MAX_TODAY * sizeof(uint16_t), 2,
                                             MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    uint8_t *first = heap_caps_calloc_prefer(MAIMEMO_MAX_TODAY, 1, 2,
+                                             MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
     /* The resolved cards: full content, so the queue is display-ready. */
     word_item_t *cards = heap_caps_calloc_prefer(MAIMEMO_MAX_TODAY, sizeof(word_item_t), 2,
                                                  MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
-    if (items == NULL || map == NULL || cards == NULL) {
+    if (items == NULL || map == NULL || cards == NULL || first == NULL) {
         heap_caps_free(items);
         heap_caps_free(map);
         heap_caps_free(cards);
+        heap_caps_free(first);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1422,6 +1480,7 @@ esp_err_t word_cloud_refresh(void)
         heap_caps_free(items);
         heap_caps_free(map);
         heap_caps_free(cards);
+        heap_caps_free(first);
         return err;
     }
 
@@ -1449,12 +1508,22 @@ esp_err_t word_cloud_refresh(void)
         if (cards[i].meaning[0] != '\0') {
             with_content++;
         }
+        /* 今日易忘词 (v1.15.0): FORGET/VAGUE/FAMILIAR are the words worth a
+         * second pass, and they arrive with the queue for free. VAGUE is the
+         * API's 模糊 grade (seen live: FAMILIAR=6, VAGUE=1, FORGET=3 on a real
+         * queue) - it belongs with the weak words. */
+        if (strcmp(items[i].first_response, "FORGET") == 0 ||
+            strcmp(items[i].first_response, "VAGUE") == 0 ||
+            strcmp(items[i].first_response, "FAMILIAR") == 0) {
+            first[i] = 1;
+        }
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     free_cloud_queue();
     s_cloud_words = cards;
     s_cloud_map = map;
+    s_cloud_first = first;
     s_cloud_count = count;
     s_cloud_active = (count > 0);
     /* The local index queue is replaced by the cloud queue, so clear it. */
@@ -1466,8 +1535,14 @@ esp_err_t word_cloud_refresh(void)
 
     heap_caps_free(items);   /* the cards now own the content */
 
-    SYS_LOGI(TAG, "cloud queue: %u words (%u from the local book, %u with a meaning)",
-             (unsigned)count, (unsigned)mapped, (unsigned)with_content);
+    size_t weak_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (first[i] != 0) {
+            weak_count++;
+        }
+    }
+    SYS_LOGI(TAG, "cloud queue: %u words (%u from the local book, %u with a meaning, %u weak)",
+             (unsigned)count, (unsigned)mapped, (unsigned)with_content, (unsigned)weak_count);
 
     /* Keep a copy on the card so the queue survives a reboot and works offline,
      * and so the console can see what is being studied. Best effort: a storage
@@ -1563,6 +1638,33 @@ size_t word_cloud_count(void)
 size_t word_count(void)
 {
     return s_count;
+}
+
+esp_err_t word_cloud_weak(word_item_t *out, size_t max, size_t *count)
+{
+    if (count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Pure PSRAM read under the lock - no I/O, so the word page can call this
+     * straight from an LVGL callback (AGENT.md 9.0.1.1). */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (size_t i = 0; i < s_cloud_count; i++) {
+        if (s_cloud_first == NULL || s_cloud_first[i] == 0) {
+            continue;
+        }
+        if (out != NULL && *count < max) {
+            out[*count] = s_cloud_words[i];
+        }
+        (*count)++;
+    }
+    xSemaphoreGive(s_lock);
+
+    return (*count > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 static esp_err_t build_queue(void)

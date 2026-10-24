@@ -12,6 +12,110 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.15.0] — 2026-10-24
+
+**主题：墨墨与背单词增强 + 上位机改进。** 一轮五个新功能（MINOR）。
+灵感与依据来自墨墨官方 GitHub 组织（`github.com/orgs/maimemo`）的四个仓库：
+`memo-api-cli`（端点形状）、`memo-skills`（能力清单）、`SSP-MMC`（调度算法）、
+`kaishi-zh-cn`（词库，因无 License 未采用）。
+
+### 1. 回传提速：`/vocabulary/query` 批量解析
+
+`maimemo_advance_spellings()`（方案 D 回传）原来逐词 GET 解析拼写→voc_id，
+N 个词 N 次 TLS 握手；现在一次 `POST vocabulary/query`（CLI 证实支持
+`{"spellings":[...]}`，上限 1000）解析全部，串行路径降级为批量端点
+不可用时的兜底。握手次数 N → 1。
+
+### 2. 云生词本（`memo/notepads`）
+
+墨墨开放 API 的生词本 CRUD 一直没被本工程使用（能力表里标 ❌ 的那行）。
+现在：
+
+- 设备端 `maimemo_notepad_list()` / `maimemo_notepad_add_words(_async)()`：
+  按名字找生词本（没有就建，`UNPUBLISHED`），**先读回旧内容再合并**
+  （update 是整段替换，不读回会把别的设备存进去的词冲掉），
+  已存在的词跳过（大小写不敏感）；
+- HTTP：`GET /api/v1/maimemo/notepads`、`POST /api/v1/maimemo/notepad`
+  `{"title","words":[...]}`（异步 worker，与其它墨墨路由同一套模式）；
+- 单词页「今日易忘词」对话框里一键「存入云生词本」（见 3）；
+- 令牌能力探测新增「云生词本」一行。
+
+### 3. 单词页「今日易忘词」
+
+`get_today_items` 的 `first_response`（FORGET/FAMILIAR）本来就和队列一起
+拉回来了，只是一直没人用。现在 `word_service` 在构建云端队列时把它按词
+存下（`s_cloud_first`），`word_cloud_weak()` 纯内存读出（可从 LVGL 回调直接
+调），单词页底栏多一个「易忘 N」按钮：列出这些词，可翻着看，也可整批
+存入云生词本。本地词库模式（无墨墨队列）该按钮隐藏。
+
+### 4. 复习调度换 SSP-MMC（KDD 2022）
+
+`word_service` 原来的间隔启发式（认识 → 2^level 天、模糊 → 明天、
+不认识 → 10 分钟）换成墨墨自家的 **SSP-MMC** 最优策略（MIT，226 星）：
+
+- **DHP 记忆模型**：每词维护 (难度 d, 半衰期 h 天)，回忆概率
+  `p = 2^(-t/h)`；每次评分按他们的拟合公式更新 h（模糊/忘记都算一次
+  遗忘 —— 那是他们 2.2 亿条真实学习记录拟合出的三档映射，不是本地发明），
+  遗忘时 d+2（封顶 18）；
+- **最优间隔策略表**：他们的值迭代（`algo/main.cpp`）在 18×152 的
+  （难度×半衰期）网格上解出成本最优的下次间隔。原版 C++ 在本机 msys2
+  下段错误，`tools/gen_ssp_policy.py` 是它的忠实 numpy 移植（常量/网格/
+  收敛判据逐行对齐，含产物不变量校验），生成的表约 5.4 KB const 进固件，
+  运行期只是一次查表 + 半衰期更新；
+- **进度兼容**：`progress.json` 每词新增 `d`/`h` 两个可选字段，老文件
+  自动迁移（level ≥ 1 的词按旧调度最后用的间隔近似 h = 2^level 天），
+  `level` 字段照旧写（老固件读新文件不炸，新固件读老文件不丢进度）。
+  **行为变化**：「不认识」不再是 10 分钟后重见，而是按策略表
+  （小半衰期状态通常 1 天）—— 这是从真实数据得出的更优间隔。
+
+### 5. 上位机：获取令牌向导 + 宽屏双栏布局
+
+- **获取令牌向导**（墨墨面板内）：先说结论 —— 实测墨墨 OIDC 服务端
+  （`accounts.maimemo.com`）只接受 loopback 回调（设备 IP 回调 400，
+  设备码流程未开放），纯网页全自动取令牌做不了。向导给两条官方路径：
+  手机 App（我的 → 设置 → 开放 API）和**官方 CLI 一键登录**
+  （`npx @maimemo/memo-api auth login`，浏览器登录后令牌落在
+  `~/.config/memo-api.json`，命令可一键复制），终点都是现有的
+  「保存并校验」。
+- **布局**：原来整页 `max-width:960px` 居中，宽屏两侧全空。现在
+  ≥1080px 起双栏（左栏 7fr = 添加表单 + 待办列表，右栏 5fr =
+  连接设置/墨墨/OTA/设备控制台/AI 卡片流），容器放宽到 1360px；
+  窄屏单列、顺序与原来完全一致。
+
+### Verified（真机，COM34，2026-10-24）
+
+- **构建/烧录**：`Project build complete.`（0 错误）；stub 快路径烧录
+  `Hash of data verified.`；开机 0 panic / 0 watchdog；`App version: 1.15.0`；
+  老进度 14 词**自动迁移成功**（无字段丢失）。
+- **F1 批量解析**：直接对照官方 API，`POST vocabulary/query` 一次返回整批
+  voc_id（200）；设备端 advance 链路的唯一报错来自 `advance_study` 的
+  `common_permission_denied` —— **当前令牌是只读的**（写作用域没开），
+  非代码问题，换带写权限的令牌即可用。
+- **F2 云生词本**（真账号实测全流程）：list 200；创建 `{"added":2}`；
+  二次合并 `{"added":2}`（已有词正确去重）；再发重复词 `{"added":0}`。
+  三个服务端边界也如实上报：`limit=50 → common_invalid_param`（改用 CLI
+  默认的 10）、`notepad_invalid_notepad_count`（**免费账号云词本数量有
+  上限，本测试账号只有 1 个名额**）、`common_permission_denied`。
+  测试建的词本已用 API 删除，账号恢复原状。
+- **F3 易忘词**：队列实测含 FAMILIAR×6、VAGUE×1、FORGET×3（`VAGUE` 是
+  线上才见到的第三档「模糊」，已一并算易忘）；单词页按钮显示
+  **「易忘 10」**（数字与数据逐个对上）；点击弹出词表对话框；
+  「存入云生词本」链路触发正常（被上面的账号配额挡住，错误路径可见）。
+  本地词库模式下按钮按设计隐藏（控件树确认 `[hidden]`）。
+- **F4 SSP-MMC**：`accessory`（迁移词，level 1）评「认识」→ 下次
+  **5.00 天**（旧调度是 2^2=4 天）；评「不认识」→ **1.00 天**
+  （旧的是 10 分钟）——间隔由策略表驱动，非旧启发式。
+- **F5 上位机**：`GET /` 146,985 B，含获取令牌向导（`mm-cli-cmd` 可一键
+  复制）与 `class="cols"` 双栏容器；容器放宽到 1360px。
+- **调试中修掉的三个真 bug**：① `notepad_list_worker` 把 2.8 KB 数组放
+  6 KB 任务栈上，叠加 TLS 握手直接把板子干重启 —— 数组改 PSRAM；
+  ② 云词本 id 实测 64 字符，`char[24]` 截断后 GET 报
+  `common_invalid_res_id` —— 扩到 80；③ `maimemo_notepad_list` 把所有
+  错误吞成 INVALID_STATE —— 改为透传分类后的真实原因（正是它把
+  `limit=50` 参数错误暴露出来的）。
+
+---
+
 ## [1.14.0] — 2026-10-24
 
 **新功能：顶部状态栏显示城市、天气、温度和湿度。** 用户可见的新功能

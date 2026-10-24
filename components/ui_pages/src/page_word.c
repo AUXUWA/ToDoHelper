@@ -30,6 +30,8 @@ static lv_obj_t *s_card_label;
 static lv_obj_t *s_hint_label;
 static lv_obj_t *s_stats_label;
 static lv_obj_t *s_grade_bar;
+static lv_obj_t *s_weak_btn;
+static lv_obj_t *s_weak_btn_label;
 /** 助记/例句 fetched from MaiMemo (plan B); hidden when unavailable. */
 static lv_obj_t *s_enrich_label;
 
@@ -456,6 +458,21 @@ static void render_card(void)
 
 static void render_progress(void)
 {
+    /* 今日易忘词 button: visible only in cloud mode with at least one weak
+     * word. word_cloud_weak() is a locked PSRAM read with no I/O, so calling
+     * it from this render path is fine (AGENT.md 9.0.1.1). */
+    if (s_weak_btn != NULL) {
+        size_t weak = 0;
+        const bool have_weak =
+            word_cloud_mode() && word_cloud_weak(NULL, 0, &weak) == ESP_OK && weak > 0;
+        if (have_weak) {
+            lv_obj_remove_flag(s_weak_btn, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text_fmt(s_weak_btn_label, "易忘 %u", (unsigned)weak);
+        } else {
+            lv_obj_add_flag(s_weak_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     if (s_progress_label != NULL) {
         size_t position = 0;
         size_t total = 0;
@@ -587,6 +604,95 @@ static void restart_clicked_cb(lv_event_t *e)
     (void)word_restart_queue();
     next_word();
     ui_toast("已回到队列开头");
+}
+
+/* ------------------------------------------------------------------------ */
+/* Weak words (今日易忘词, v1.15.0)                                           */
+/* ------------------------------------------------------------------------ */
+
+/**
+ * The weak list the dialog is showing, and the pointer array handed to the
+ * notepad worker. Static + PSRAM because it must outlive the dialog (the
+ * worker reads it after the box is gone) and 4 KB has no business sitting in
+ * the internal heap. Refilled on every dialog open; never freed.
+ */
+static EXT_RAM_BSS_ATTR char s_weak_words[64][WORD_SPELLING_MAX];
+static EXT_RAM_BSS_ATTR const char *s_weak_list[64];
+static size_t s_weak_count;
+
+/** Confirm button of the weak-words dialog: hand the list to the cloud notepad. */
+static void weak_save_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!maimemo_has_token()) {
+        ui_toast("未配置墨墨令牌，先在上位机填入");
+        return;
+    }
+    const esp_err_t err = maimemo_notepad_add_words_async("ToDoHelper 易忘词",
+                                                          s_weak_list, s_weak_count);
+    if (err == ESP_OK) {
+        ui_toast("正在存入云生词本…");
+    } else {
+        ui_toast("云生词本不可用：%s", esp_err_to_name(err));
+    }
+}
+
+static void weak_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+
+    size_t total = 0;
+    if (word_cloud_weak(NULL, 0, &total) != ESP_OK || total == 0) {
+        ui_toast("今天没有标记为模糊/忘记的词");
+        return;
+    }
+    if (total > 64) {
+        total = 64;
+    }
+
+    /* Pure PSRAM read under the service lock - no I/O, so this is safe right
+     * here in the LVGL callback (AGENT.md 9.0.1.1). The card array (~40 KB for
+     * 64 words) is transient PSRAM; only the spellings are kept afterwards. */
+    word_item_t *cards = heap_caps_malloc_prefer(total * sizeof(word_item_t), 2,
+                                                 MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (cards == NULL) {
+        ui_toast("内存不足");
+        return;
+    }
+    size_t count = 0;
+    (void)word_cloud_weak(cards, total, &count);
+    s_weak_count = 0;
+    for (size_t i = 0; i < count && s_weak_count < 64; i++) {
+        if (cards[i].spelling[0] == '\0') {
+            continue;
+        }
+        strlcpy(s_weak_words[s_weak_count], cards[i].spelling, WORD_SPELLING_MAX);
+        s_weak_list[s_weak_count] = s_weak_words[s_weak_count];
+        s_weak_count++;
+    }
+    heap_caps_free(cards);
+
+    if (s_weak_count == 0) {
+        ui_toast("今天没有标记为模糊/忘记的词");
+        return;
+    }
+
+    /* Words joined with spaces; ui_dialog_confirm clamps and scrolls the body. */
+    char text[512];
+    size_t used = 0;
+    text[0] = '\0';
+    for (size_t i = 0; i < s_weak_count && used + WORD_SPELLING_MAX + 2 < sizeof(text); i++) {
+        if (i > 0) {
+            text[used++] = ' ';
+        }
+        const size_t len = strlen(s_weak_words[i]);
+        memcpy(text + used, s_weak_words[i], len);
+        used += len;
+        text[used] = '\0';
+    }
+
+    (void)ui_dialog_confirm("今日易忘词", text,
+                            "存入云生词本", "关闭", weak_save_cb, NULL);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -785,6 +891,17 @@ static esp_err_t word_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(restart_label, ui_font(UI_FONT_SMALL), 0);
     lv_obj_center(restart_label);
     lv_obj_add_event_cb(restart, restart_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    s_weak_btn = lv_button_create(bar);
+    lv_obj_set_height(s_weak_btn, UI_TOUCH_MIN);
+    lv_obj_set_style_bg_color(s_weak_btn, UI_COLOR_WARNING, 0);
+    s_weak_btn_label = lv_label_create(s_weak_btn);
+    lv_label_set_text(s_weak_btn_label, "易忘词");
+    lv_obj_set_style_text_font(s_weak_btn_label, ui_font(UI_FONT_SMALL), 0);
+    lv_obj_set_style_text_color(s_weak_btn_label, UI_COLOR_ON_PRIMARY, 0);
+    lv_obj_center(s_weak_btn_label);
+    lv_obj_add_flag(s_weak_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_weak_btn, weak_clicked_cb, LV_EVENT_CLICKED, NULL);
 
     next_word();
 

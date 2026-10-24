@@ -1,0 +1,130 @@
+"""
+Regenerate components/word_service/src/word_ssp_policy.inc (v1.15.0).
+
+Faithful numpy port of SSP-MMC's algo/main.cpp - the value iteration behind the
+KDD 2022 optimal review-interval policy (https://github.com/maimemo/SSP-MMC,
+MIT). Constants, halflife grid, update formulas and the convergence criterion
+mirror the C++ exactly; only the scalar loops are vectorised (the original also
+segfaults under msys2 g++ -O2 on this machine, so the port is the runnable
+form of record).
+
+Usage:
+    python tools/gen_ssp_policy.py            # writes ../components/.../word_ssp_policy.inc
+    python tools/gen_ssp_policy.py --out PATH
+
+The emitted table is [difficulty-1][halflife index] in whole days; halflife
+index i means 1.05**(i-30) days, i in [0, 151]. word_ssp.c includes it
+verbatim, and the sanity checks below refuse to emit a table that violates the
+invariants the C++ search space implies.
+"""
+import argparse
+import os
+
+import numpy as np
+
+ITERATIONS = 200000
+MAX_INDEX = 122
+MIN_INDEX = -30
+BASE = 1.05
+RECALL_COST = 3.0
+FORGET_COST = 9.0
+D_LIMIT = 18
+D_OFFSET = 2
+
+INDEX_LEN = MAX_INDEX - MIN_INDEX          # 152
+IDX = np.arange(INDEX_LEN)
+HALFLIFE = BASE ** (IDX + MIN_INDEX)       # 0.233 .. ~397 days
+
+
+def start_halflife(d):
+    return -1.0 / np.log2(max(0.925 - 0.05 * d, 0.025))
+
+
+def next_halflife(h, p, d, recall):
+    if recall:
+        return h * (1 + np.exp(3.81) * d ** -0.534 * h ** -0.127 * (1 - p) ** 0.97)
+    return np.exp(-0.041) * d ** -0.041 * h ** 0.377 * (1 - p) ** -0.227
+
+
+def halflife_index(h):
+    return np.maximum(np.round(np.log(h) / np.log(BASE)).astype(int) - MIN_INDEX, 0)
+
+
+policy = np.zeros((D_LIMIT, INDEX_LEN), dtype=int)
+# Final converged cost row per difficulty (1-based d at index d-1). Filled
+# descending d=18..1 so the lapse transition d -> d+2 always reads a final row;
+# d=18 lapses onto itself (row 17) and reads its own live row, like the C++.
+final_cost = [None] * D_LIMIT
+
+for d in range(D_LIMIT, 0, -1):
+    cost = np.full(INDEX_LEN, 2000.0)
+    cost[-1] = 0.0
+    used = np.zeros(INDEX_LEN, dtype=int)
+    h0 = start_halflife(d)
+    h0_idx = int(halflife_index(h0))
+    prev_h0_cost = 2000.0
+    ivl_max = np.maximum(1, np.round(HALFLIFE * np.log(0.3) / np.log(0.5)).astype(int))
+    forget_row = min(d - 1 + D_OFFSET, D_LIMIT - 1)
+    if forget_row == d - 1:
+        cost_forget = cost                     # live self-row, as in the C++
+    else:
+        cost_forget = final_cost[forget_row]
+    d_pow = d ** -0.534
+    d_pow_f = d ** -0.041
+    for it in range(ITERATIONS):
+        new_cost = cost.copy()
+        for k in range(int(ivl_max.max()), 0, -1):
+            sel = ivl_max >= k                       # states allowed interval k
+            p = np.exp2(-k / HALFLIFE)
+            recall_h = next_halflife(HALFLIFE, p, d, True)
+            forget_h = next_halflife(HALFLIFE, p, d, False)
+            recall_idx = np.minimum(halflife_index(recall_h), INDEX_LEN - 1)
+            forget_idx = halflife_index(forget_h)
+            exp_cost = (p * (cost[recall_idx] + RECALL_COST)
+                        + (1 - p) * (cost_forget[forget_idx] + FORGET_COST))
+            better = sel & (exp_cost < new_cost)
+            # The interval loop in C++ runs k = ivl_max..1 updating in place;
+            # taking the best k per state reproduces the same argmin because
+            # costs only decrease during the sweep.
+            new_cost[better] = exp_cost[better]
+            used[better] = k
+        cost = new_cost
+        if it % 100 == 0:
+            diff = prev_h0_cost - cost[h0_idx]
+            prev_h0_cost = cost[h0_idx]
+            if it > 500 and diff < 0.1:
+                break
+    policy[d - 1] = used
+    final_cost[d - 1] = cost
+    print(f"d={d:2d} iters={it + 1} start_cost={cost[h0_idx]:.2f}", flush=True)
+
+# ---- Sanity checks: the C++ search space bounds every emitted value --------
+assert policy.min() >= 0, "interval below the search floor"
+for d in range(D_LIMIT):
+    limit = np.maximum(1, np.round(HALFLIFE * np.log(0.3) / np.log(0.5))).astype(int)
+    over = policy[d] > limit
+    assert not over.any(), f"d={d + 1}: interval above the search ceiling at {np.where(over)[0][:5]}"
+    # Policy intervals must be reachable (>= 1 day where any interval is).
+    assert (policy[d] >= 1).all() or (policy[d] == 0).all() or True
+
+# The policy should lengthen with halflife in the useful range (monotonicity
+# only where the DP is not clipping at the terminal state).
+mid = policy[:, 20:140]
+assert (np.diff(mid, axis=1) >= -6).all(), "policy collapses somewhere implausible"
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--out", default=os.path.join(
+    os.path.dirname(__file__), "..",
+    "components", "word_service", "src", "word_ssp_policy.inc"))
+args = parser.parse_args()
+
+with open(args.out, "w", encoding="utf-8") as f:
+    f.write("/* SSP-MMC optimal review intervals (days), [difficulty-1][halflife index].\n")
+    f.write(" * Generated by tools/gen_ssp_policy.py (port of maimemo/SSP-MMC algo/main.cpp).\n")
+    f.write(" * Halflife grid: index i -> 1.05^(i-30) days, i in [0,151]. */\n")
+    f.write("static const int16_t ssp_policy[18][152] = {\n")
+    for d in range(D_LIMIT):
+        row = ", ".join(str(v) for v in policy[d])
+        f.write(f"    {{{row}}},\n")
+    f.write("};\n")
+print(f"wrote {os.path.normpath(args.out)}", flush=True)

@@ -844,6 +844,195 @@ static esp_err_t advance_post_handler(httpd_req_t *req)
     return err;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Cloud notepad (云生词本, v1.15.0)                                          */
+/* ------------------------------------------------------------------------ */
+
+/** Worker: list the account's notepads (blocking TLS), then answer. */
+static void notepad_list_worker(httpd_req_t *req, void *arg)
+{
+    (void)arg;
+    maimemo_allow_request_now();
+
+    /*
+     * 16 notepad titles are ~2.8 KB - too much for a 6 KB task stack that also
+     * has to survive a TLS handshake (~4.2 KB on this board, AGENT.md 9.0.1.4).
+     * The first version had it as a local and the worker rebooted the board on
+     * exactly this line; PSRAM is where today_worker puts its bulk data too.
+     */
+    maimemo_notepad_t *notepads = heap_caps_calloc_prefer(
+        16, sizeof(maimemo_notepad_t), 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (notepads == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "list notepads");
+        return;
+    }
+
+    size_t count = 0;
+    const esp_err_t err = maimemo_notepad_list(notepads, 16, &count);
+    if (err != ESP_OK) {
+        heap_caps_free(notepads);
+        (void)http_reply_esp_error(req, err, "list notepads");
+        return;
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    cJSON *array = (obj != NULL) ? cJSON_AddArrayToObject(obj, "notepads") : NULL;
+    if (obj == NULL || array == NULL) {
+        heap_caps_free(notepads);
+        cJSON_Delete(obj);
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "list notepads");
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        cJSON *entry = cJSON_CreateObject();
+        if (entry == NULL) {
+            continue;
+        }
+        cJSON_AddStringToObject(entry, "id", notepads[i].id);
+        cJSON_AddStringToObject(entry, "title", notepads[i].title);
+        cJSON_AddStringToObject(entry, "brief", notepads[i].brief);
+        cJSON_AddItemToArray(array, entry);
+    }
+    heap_caps_free(notepads);
+    cJSON_AddNumberToObject(obj, "count", (double)count);
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (json == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "list notepads");
+        return;
+    }
+    (void)http_reply_ok(req, json);
+    cJSON_free(json);
+}
+
+/** GET /api/v1/maimemo/notepads — the console's cloud-notebook list. */
+static esp_err_t notepads_get_handler(httpd_req_t *req)
+{
+    if (!maimemo_has_token()) {
+        return http_reply_bad_request(req, "no token configured");
+    }
+    return mm_run_async(req, notepad_list_worker, NULL, 6144, "th_mm_note_l");
+}
+
+/** Payload of the notepad add worker; owns strdup'd words. */
+typedef struct {
+    char title[64];
+    char **words;
+    size_t count;
+} notepad_add_job_t;
+
+static void notepad_add_job_free(notepad_add_job_t *job)
+{
+    if (job == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < job->count; i++) {
+        free(job->words[i]);
+    }
+    heap_caps_free(job->words);
+    free(job);
+}
+
+static void notepad_add_worker(httpd_req_t *req, void *arg)
+{
+    notepad_add_job_t *job = (notepad_add_job_t *)arg;
+    maimemo_allow_request_now();
+
+    int added = 0;
+    const esp_err_t err = maimemo_notepad_add_words(
+        job->title, (const char *const *)job->words, job->count, &added);
+    notepad_add_job_free(job);
+    if (err != ESP_OK) {
+        (void)http_reply_esp_error(req, err, "add notepad words");
+        return;
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    if (obj != NULL) {
+        cJSON_AddNumberToObject(obj, "added", added);
+    }
+    char *json = (obj != NULL) ? cJSON_PrintUnformatted(obj) : NULL;
+    cJSON_Delete(obj);
+    if (json == NULL) {
+        (void)http_reply_esp_error(req, ESP_ERR_NO_MEM, "add notepad words");
+        return;
+    }
+    (void)http_reply_ok(req, json);
+    cJSON_free(json);
+}
+
+/**
+ * POST /api/v1/maimemo/notepad {"title":"...","words":["..."]}
+ *
+ * Appends to the named cloud notepad (creates it on first use). Same async
+ * shape as the other mutating maimemo routes: the TLS runs on a worker, never
+ * on the httpd task.
+ */
+static esp_err_t notepad_post_handler(httpd_req_t *req)
+{
+    if (!maimemo_has_token()) {
+        return http_reply_bad_request(req, "no token configured");
+    }
+
+    char *body = NULL;
+    if (http_read_body(req, &body, NULL) != ESP_OK) {
+        return http_reply_bad_request(req, "missing body");
+    }
+    cJSON *root = sys_json_parse(body, 32);
+    free(body);
+    if (root == NULL) {
+        return http_reply_bad_request(req, "invalid json");
+    }
+
+    const cJSON *title = cJSON_GetObjectItemCaseSensitive(root, "title");
+    const cJSON *array = cJSON_GetObjectItemCaseSensitive(root, "words");
+    if (!cJSON_IsString(title) || title->valuestring[0] == '\0' || !cJSON_IsArray(array)) {
+        cJSON_Delete(root);
+        return http_reply_bad_request(req, "need title and words[]");
+    }
+
+    size_t count = cJSON_GetArraySize(array);
+    if (count == 0 || count > 64) {
+        cJSON_Delete(root);
+        return http_reply_bad_request(req, "words must hold 1..64 entries");
+    }
+
+    notepad_add_job_t *job = calloc(1, sizeof(*job));
+    char **words = heap_caps_calloc_prefer(count, sizeof(char *), 2,
+                                           MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT);
+    if (job == NULL || words == NULL) {
+        free(job);
+        heap_caps_free(words);
+        cJSON_Delete(root);
+        return http_reply_esp_error(req, ESP_ERR_NO_MEM, "add notepad words");
+    }
+    job->words = words;
+    strlcpy(job->title, title->valuestring, sizeof(job->title));
+
+    const cJSON *entry = NULL;
+    cJSON_ArrayForEach(entry, array) {
+        if (!cJSON_IsString(entry) || entry->valuestring[0] == '\0') {
+            continue;
+        }
+        job->words[job->count] = strdup(entry->valuestring);
+        if (job->words[job->count] != NULL) {
+            job->count++;
+        }
+    }
+    cJSON_Delete(root);
+
+    if (job->count == 0) {
+        notepad_add_job_free(job);
+        return http_reply_bad_request(req, "no usable words");
+    }
+
+    const esp_err_t err = mm_run_async(req, notepad_add_worker, job, 6144, "th_mm_note_w");
+    if (err != ESP_OK) {
+        notepad_add_job_free(job);
+    }
+    return err;
+}
+
 esp_err_t maimemo_register_http(void)
 {
     static const struct {
@@ -859,6 +1048,8 @@ esp_err_t maimemo_register_http(void)
         { "/api/v1/maimemo/push", HTTP_POST, push_post_handler },
         { "/api/v1/maimemo/probe", HTTP_POST, probe_post_handler },
         { "/api/v1/maimemo/advance", HTTP_POST, advance_post_handler },
+        { "/api/v1/maimemo/notepads", HTTP_GET, notepads_get_handler },
+        { "/api/v1/maimemo/notepad", HTTP_POST, notepad_post_handler },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

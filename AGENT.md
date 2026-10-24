@@ -10,7 +10,7 @@
 > 变更历史见 `CHANGELOG.md`。
 > 优先级：**代码实际行为 > 本文件 > 框架设计 > 需求文档**；发现不一致时以左侧为准并回改右侧。
 >
-> **当前版本 `1.14.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
+> **当前版本 `1.15.0`**（工程根目录 `version.txt`；规则与发布步骤见 §8.1）。
 
 ---
 
@@ -32,7 +32,7 @@
 | 局域网 HTTP Server + mDNS（`todohelper.local`）+ 内嵌浏览器待办页 + SSE 推送 | ✅ |
 | 天气（Open-Meteo，**免 API Key**）+ 城市地理编码 + IP 定位 + 定时刷新 + 缓存降级 + 状态栏城市/天气/温湿度 | ✅ |
 | 日历：SNTP 校时 + POSIX 时区 + 月历（**无 RTC，断电不保持**） | ✅ |
-| 单词：内置示例词库 + 翻卡 + 三档评分 + 间隔复习 + 进度持久化 | ✅ |
+| 单词：内置示例词库 + 翻卡 + 三档评分 + **SSP-MMC 最优间隔调度** + 进度持久化 | ✅ |
 | 待机小眼睛：纯程序化绘制，11 种表情 | ✅ |
 | 设置页：亮度/待机/时区/单词数/HTTP token/设备信息 | ✅ |
 | AI 对话（DeepSeek，流式）+ 小眼睛联动 | ✅ |
@@ -56,13 +56,14 @@ components/
   todo_manager/       L3  FR2（含 /api/v1/todos* 路由、JSON 导入导出）
   calendar_service/   L3  FR4（SNTP + 时区 + 月历）
   weather_service/    L3  FR3（可插拔 provider，默认 Open-Meteo + IP 定位）
-  word_service/       L3  FR5（词库装载 + 间隔复习）
+  word_service/       L3  FR5（词库装载 + SSP-MMC 调度 + 间隔复习）
   sync_server/        L4  httpd 生命周期 + 设备 API + SSE + 内嵌 Web 页 + mDNS + 鉴权
   idle_face/          L4  FR6 待机眼睛（自带 UI_PAGE_IDLE_FACE 注册 + 通知触发表情）
   ui_pages/           L4  11 个页面（组合层，可依赖任意非 UI 组件）
   ai_service/         L5  FR7 DeepSeek（阻塞/流式/历史/中断）
   voice_service/      L5  FR7 录音回放 + ASR/TTS 端点桥接
-  maimemo_client/     L5  墨墨背单词开放 API（方案 A 同步 / B 助记例句 / C 反向推词，可选降级）
+  maimemo_client/     L5  墨墨背单词开放 API（A 同步 / B 助记例句 / C 反向推词 /
+                          D advance 回传【vocabulary/query 批量解析】/ 云生词本，可选降级）
   debug_shell/        L4  **调试 shell**（`/api/v1/debug/exec`，默认关，见 §9.0.8）
   esp_cam_sensor/     —   本地组件，覆盖托管组件（BSP 需要）
 main/
@@ -408,7 +409,7 @@ Project build complete.
 **不写这个文件时 IDF 会退回 `git describe`**，设备就会自报 `cfdf817-dirty` 这类字符串 ——
 改一行代码就变，"板子上到底是哪个固件"完全看不出来（1.0.0 之前就是这样）。
 
-- **当前版本：`1.14.0`**
+- **当前版本：`1.15.0`**
 - 版本进 `esp_app_desc_t`，于是**三处可见**：
   设备「设置」页顶部与开机页「固件 1.3.0 · IDF v6.1」、`GET /api/v1/device/info` 的 `version`、
   以及 `build/todohelper.bin` 的 app descriptor（离线核对：
@@ -465,6 +466,18 @@ Project build complete.
 ```
 
 ### 8.3 烧录速度：用 `tools/flash.ps1`，别用 `idf.py flash`
+
+> **v1.14.0 实测追加：`idf.py flash` 现在不止慢，还会直接失败。** 它硬编码的
+> `--no-stub`（ROM 下载协议）在当前组合（esptool v5.4 + S31 预览硅）下把芯片
+> 误报成 `This chip is ESP32-S3, not ESP32-S31. Wrong chip argument?`；而
+> **stub loader 路径识别与烧录完全正常**（同一串口、同一根线）。所以烧录一律
+> 走 stub：`tools/flash.ps1`，或手工
+> `python -m esptool --chip esp32s31 -p COM34 -b 921600 --before default-reset
+>  --after hard-reset write-flash --flash-mode dio --flash-freq 80m
+>  --flash-size 16MB <build/flash_args 里的地址和文件>`（v1.14.0/v1.15.0
+> 均以此路径烧录成功）。注意 `flash.ps1` 在无 IDF profile 的裸 PowerShell 里
+> 会报 `Cannot bind argument to parameter 'Path'`（缺 `IDF_PYTHON_ENV_PATH`），
+> 先加载 profile 或用上面的手工命令。
 
 `idf.py flash` 在这个目标上比必要的**慢约 3.4 倍**。下表的耗时是当年 4.16 MB 镜像
 （字库还在 app 里）实测的；**当前 2.85 MB 镜像用 `tools/flash.ps1` 实测约 32 s**。
