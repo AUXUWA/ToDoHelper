@@ -48,13 +48,33 @@ WiFi -52 dBm  SD          12:34:56          南昌 多云 23°C 湿度60%  已�
 
 ### Verified
 
-- **离线构建**：`Project build complete.`，`build/todohelper.bin`（3,303,296 B，
-  2026-10-24 14:39）含新代码独有字符串（`湿度%d` 格式串在 ELF 里，防
-  「exit 0 但没构建」）；构建未改写 `dependencies.lock`。
-- **真机**：**本轮未做** —— 烧录时发现 COM34（CP210x，S31 板）已不在枚举里，
-  当前接的是 COM14（一块 ESP32-S3，非本板）与 COM26（CH340，非本板）。
-  板子接回后补：烧录 → 开机日志（0 panic/watchdog、天气模块 ready）→
-  `dsh.sh widgets` 查状态栏天气行 → `device/info` 版本号，然后打 `v1.14.0` tag。
+**离线**：`Project build complete.`（0 警告，`-Werror` 全开）；`build/todohelper.bin`
+3,303,296 B，ELF 含新代码独有字符串（`湿度%d` 格式串，防「exit 0 但没构建」）；
+构建未改写 `dependencies.lock`。
+
+**真机（COM34，ESP32-S31-Korvo，2026-10-24）**：
+
+- 烧录走 esptool **stub 快路径**（921600 + 压缩，3.3 MB 镜像 27 s，
+  `Hash of data verified.`）。注意：`idf.py flash` 对 esp32s31 硬编码的
+  `--no-stub`（ROM 下载协议）在这片预览版硅上**误报**
+  `This chip is ESP32-S3, not ESP32-S31`（手动 stub 探测则正确识别 S31），
+  烧录请走 `tools/flash.ps1` 同款参数（§8.3 本来就推荐它）。
+- 开机日志 0 panic / 0 watchdog（75 s + 70 s 两份抓取）；
+  `App version: 1.14.0`；天气模块 ready，**缓存先上屏**（`南昌, 江西 23.7 C '晴'`），
+  联网后**新读数顶上**（`22.4 C, 71%, '晴' (code 0)`）。
+- **状态栏实测**（debug shell `widgets` 导出的控件树）：
+  ```
+  label 568,10 199x19   南昌, 江西 晴 22°C 湿度71%
+  ```
+  城市居右、时钟居中（321,8 `16:06:45`）、WiFi 居左（14,10 `-40 dBm`），
+  布局与设计一致；显示的温湿度是**新拉取的值**（22/71%，非缓存 23.7），
+  「刷新成功 → `weather_publish_status()` → `SYS_EVENT_STATUS_CHANGED` →
+  状态栏重绘」全链路真机打通。
+- HTTP 佐证：`device/info` `version: 1.14.0`、`wifi_state: connected`；
+  `/api/v1/weather` `valid:true, 南昌, 江西, 22.4°C, 湿度 71, 晴, stale:false`，
+  与屏幕逐字一致。
+- 离线分支顺带验过：断网开机时天气走缓存，状态栏显示缓存读数，刷新报
+  `ESP_ERR_INVALID_STATE` 但界面不空 —— 缓存降级对状态栏同样生效。
 
 ---
 
