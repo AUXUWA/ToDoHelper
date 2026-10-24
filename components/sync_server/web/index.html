@@ -62,12 +62,22 @@
   .small{font-size:13px}
   .wrap{max-width:1480px;margin:0 auto;padding:0 20px}
   .stack{display:flex;flex-direction:column;gap:12px;padding-top:16px;padding-bottom:28px}
-  /* 宽屏双栏（v1.15.0）：待办列表是主角占左栏（宽），配置/墨墨/OTA 等卡片流到右栏。
-     窄屏维持单列且顺序不变 —— 待办紧跟设备状态。 */
+  /* 三栏布局（v1.16.0）：状态 | 待办（主角）| 配置。
+     ≥1280px 三栏并行；1080–1279px 状态横贯顶部、下方待办/配置双栏；
+     <1080px 单列顺排（状态→待办→配置），与旧版手机视图一致。 */
   .cols{display:flex;flex-direction:column;gap:12px}
   .col{display:flex;flex-direction:column;gap:12px;min-width:0}
   @media (min-width:1080px){
-    .cols{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);gap:12px;align-items:start}
+    .cols{display:grid;gap:12px;align-items:start;
+      grid-template-columns:minmax(0,7fr) minmax(0,5fr);
+      grid-template-areas:"status status" "todo conf"}
+    .col-status{grid-area:status}
+    .col-todo{grid-area:todo}
+    .col-conf{grid-area:conf}
+  }
+  @media (min-width:1280px){
+    .cols{grid-template-columns:minmax(0,3fr) minmax(0,4.6fr) minmax(0,3.4fr);
+      grid-template-areas:"status todo conf"}
   }
 
   /* ---------- 顶栏 ---------- */
@@ -351,6 +361,11 @@
       <button class="btn small" type="button" id="banner-retry">立即重试</button>
     </div>
 
+    <!-- 三栏容器（v1.16.0）：状态 | 待办（主角）| 配置。
+         ≥1280px 三栏并行；1080–1279px 状态横贯顶部、下方双栏；窄屏单列顺排。 -->
+    <div class="cols">
+
+    <div class="col col-status">
     <!-- 设备状态面板 -->
     <section class="card" aria-labelledby="dev-title">
       <div class="card-head">
@@ -393,10 +408,9 @@
         </details>
       </div>
     </section>
+    </div><!-- /col-status -->
 
-    <!-- 双栏容器（宽屏）：左栏 = 添加表单 + 待办列表（主角），右栏 = 配置类卡片 -->
-    <div class="cols">
-    <div class="col">
+    <div class="col col-todo">
 
     <!-- 新增 -->
     <form class="card" id="add-form" autocomplete="off">
@@ -459,8 +473,8 @@
       </div>
     </section>
 
-    </div><!-- /col 待办 -->
-    <div class="col">
+    </div><!-- /col-todo -->
+    <div class="col col-conf">
 
     <!-- 连接设置 -->
     <details class="card" id="settings">
@@ -502,9 +516,30 @@
           本页永远不会把完整令牌显示出来，也不写进 localStorage。
         </p>
 
-        <!-- 获取令牌向导（v1.15.0）：两条官方路径，都不用找客服 -->
+        <!-- 获取令牌向导（v1.15.0；v1.16.0 加一键浏览器流程） -->
         <details class="more" id="mm-token-guide">
-          <summary>怎么获取令牌？两条路（手机 App / 电脑命令行）</summary>
+          <summary>怎么获取令牌？（一键 / 手机 App / 电脑命令行）</summary>
+
+          <!-- 路径〇：一键获取。浏览器直接完成 OIDC 授权码 + PKCE，
+               令牌不经第三方，全程在本页与墨墨之间。 -->
+          <div class="field" style="margin-top:8px">
+            <h3 class="mm-sub">一键获取（推荐，全程在本页完成）</h3>
+            <div class="row-actions" style="margin-top:4px">
+              <button class="btn primary" type="button" id="mm-oidc-start">一键获取令牌（浏览器登录）</button>
+            </div>
+            <p class="small muted" id="mm-oidc-hint" style="margin:6px 0 0">
+              点击后弹出墨墨官方登录页，登录并授权即可，本页自动完成其余步骤。<br>
+              若登录后浏览器跳到一个<strong>「打不开的页面」</strong>——那是预期行为
+              （授权结果落在你本机的回环地址上），把<strong>地址栏整条复制</strong>粘贴到下面：
+            </p>
+            <div class="add-row" id="mm-oidc-paste-row" style="margin-top:6px" hidden>
+              <input type="text" id="mm-oidc-paste" placeholder="粘贴登录后跳转页的完整地址（http://127.0.0.1:…/callback?code=…）" aria-label="粘贴回调地址">
+              <button class="btn primary" type="button" id="mm-oidc-finish">解析并保存</button>
+            </div>
+            <p class="small muted" id="mm-oidc-state" style="margin:6px 0 0"></p>
+          </div>
+
+          <div class="grid2" style="margin-top:8px">
           <div class="grid2" style="margin-top:8px">
             <div class="field">
               <h3 class="mm-sub">路径一：手机 App</h3>
@@ -726,7 +761,7 @@
       </div>
     </details>
 
-    </div><!-- /col 配置 -->
+    </div><!-- /col-conf -->
     </div><!-- /cols -->
 
   </div>
@@ -1315,6 +1350,143 @@ function mmCliCopy(codeId) {
 }
 $("mm-cli-copy-win").addEventListener("click", function () { mmCliCopy("mm-cli-cmd-win"); });
 $("mm-cli-copy-unix").addEventListener("click", function () { mmCliCopy("mm-cli-cmd-unix"); });
+
+/* ---------- 一键获取令牌（v1.16.0）：浏览器内完成 OIDC 授权码 + PKCE ----------
+ *
+ * 依据（2026-10-24 实测）：墨墨的 token 端点对任意来源回 CORS 头（预检 204），
+ * 所以浏览器可以直接换令牌，不需要本地 CLI/回环服务。授权端点只接受
+ * loopback 的 redirect_uri（设备 IP 一律 400、无设备码流程），但端口任意放行
+ * ——所以用 47096（避开官方 CLI 的 18884）：CLI 没跑时浏览器显示"打不开"，
+ * 地址栏却带着 code，粘回来即可。
+ *
+ * 换到的是 access_token（约 1 小时）+ refresh_token（90 天）。access_token
+ * 直接保存到设备；refresh_token 留在本机 localStorage，下次打开本页时静默
+ * 续期并同步到设备 —— 仅当设备当前用的就是 OIDC 令牌时才自动同步
+ * （localStorage.mm_oidc_on_device 标记），不会覆盖手动配置的长期 g_ 令牌。
+ */
+var MM_OIDC_AUTH = "https://accounts.maimemo.com/oidc/auth";
+var MM_OIDC_TOKEN = "https://accounts.maimemo.com/oidc/token";
+var MM_OIDC_CLIENT = "6a2157c1fa31b7c875a8e4ba";   /* 官方 CLI 的公开 client_id */
+var MM_OIDC_REDIRECT = "http://127.0.0.1:47096/callback";
+var MM_OIDC_SCOPE = "openid profile offline_access open.memo.content open.memo.study";
+var MM_OIDC_KEY = "mm_oidc_flow";
+
+function mmB64Url(bytes) {
+  var s = btoa(String.fromCharCode.apply(null, bytes));
+  return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function mmSetOidcState(text, cls) {
+  var el = $("mm-oidc-state");
+  el.textContent = text;
+  el.style.color = cls === "err" ? "var(--danger,#e5484d)" : "";
+}
+
+$("mm-oidc-start").addEventListener("click", function () {
+  var bytes = new Uint8Array(48);
+  crypto.getRandomValues(bytes);
+  var verifier = mmB64Url(bytes);
+  var state = mmB64Url(crypto.getRandomValues(new Uint8Array(16)));
+  crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)).then(function (hash) {
+    sessionStorage.setItem(MM_OIDC_KEY, JSON.stringify({
+      verifier: verifier, state: state, at: Date.now()
+    }));
+    var url = MM_OIDC_AUTH +
+      "?client_id=" + encodeURIComponent(MM_OIDC_CLIENT) +
+      "&response_type=code" +
+      "&scope=" + encodeURIComponent(MM_OIDC_SCOPE) +
+      "&redirect_uri=" + encodeURIComponent(MM_OIDC_REDIRECT) +
+      "&state=" + encodeURIComponent(state) +
+      "&code_challenge=" + encodeURIComponent(mmB64Url(new Uint8Array(hash))) +
+      "&code_challenge_method=S256" +
+      "&prompt=consent";
+    var win = window.open(url, "_blank");
+    $("mm-oidc-paste-row").hidden = false;
+    $("mm-oidc-paste").value = "";
+    if (!win) {
+      mmSetOidcState("浏览器拦下了弹窗：请允许本站弹窗，或把上面流程改为手动复制授权链接。", "err");
+    } else {
+      mmSetOidcState("已打开墨墨登录页。登录授权后，浏览器会跳到一个打不开的页面 —— 把地址栏整条复制粘贴到下面。");
+    }
+  });
+});
+
+$("mm-oidc-finish").addEventListener("click", function () {
+  var raw = $("mm-oidc-paste").value.trim();
+  var flow = null;
+  try { flow = JSON.parse(sessionStorage.getItem(MM_OIDC_KEY) || "null"); } catch (e) { flow = null; }
+  if (!flow) {
+    mmSetOidcState("没有进行中的登录流程，请先点「一键获取令牌」。", "err");
+    return;
+  }
+  var url = null;
+  try { url = new URL(raw); } catch (e) { url = null; }
+  if (!url || url.searchParams.get("code") === null) {
+    mmSetOidcState("这不是有效的回调地址：应形如 http://127.0.0.1:…/callback?code=…（复制地址栏全部内容）。", "err");
+    return;
+  }
+  if (url.searchParams.get("state") !== flow.state) {
+    mmSetOidcState("state 校验不匹配（可能是别的标签页的流程），请重新点「一键获取令牌」。", "err");
+    return;
+  }
+  if (url.searchParams.get("error")) {
+    mmSetOidcState("墨墨返回了错误：" + (url.searchParams.get("error_description") || url.searchParams.get("error")), "err");
+    return;
+  }
+  mmSetOidcState("正在换取令牌…");
+  var body = "grant_type=authorization_code" +
+    "&code=" + encodeURIComponent(url.searchParams.get("code")) +
+    "&redirect_uri=" + encodeURIComponent(MM_OIDC_REDIRECT) +
+    "&client_id=" + encodeURIComponent(MM_OIDC_CLIENT) +
+    "&code_verifier=" + encodeURIComponent(flow.verifier);
+  fetch(MM_OIDC_TOKEN, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body
+  }).then(function (r) { return r.json(); }).then(function (tok) {
+    if (!tok.access_token) {
+      mmSetOidcState("换令牌失败：" + ((tok.error_description || tok.error) || JSON.stringify(tok).slice(0, 120)), "err");
+      return;
+    }
+    if (tok.refresh_token) {
+      try { localStorage.setItem("mm_rt", tok.refresh_token); } catch (e) { /* 隐私模式等：仅失去自动续期 */ }
+    }
+    /* 填进输入框并触发既有的「保存并校验」（它自带异步校验与状态刷新）。 */
+    $("mm-token").value = tok.access_token;
+    try { localStorage.setItem("mm_oidc_on_device", "1"); } catch (e) { /* 同上 */ }
+    $("mm-save").click();
+    mmSetOidcState("令牌已换出并保存到设备（短期令牌，约 1 小时；本页会自动续期，详见下方说明）。");
+    $("mm-oidc-paste-row").hidden = true;
+    sessionStorage.removeItem(MM_OIDC_KEY);
+  }).catch(function (e) {
+    mmSetOidcState("换令牌请求失败：" + e + "（检查电脑能否访问 accounts.maimemo.com）", "err");
+  });
+});
+
+/* 页面打开时：若之前用一键流程配过设备令牌，用记住的 refresh_token 静默续期
+ * 并同步到设备。手动配置 g_ 长期令牌的用户不受影响（没有标记就不做任何事）。 */
+(function mmOidcRenew() {
+  var rt = null;
+  try {
+    rt = localStorage.getItem("mm_rt");
+    if (rt && localStorage.getItem("mm_oidc_on_device") !== "1") { rt = null; }
+  } catch (e) { rt = null; }
+  if (!rt) { return; }
+  fetch(MM_OIDC_TOKEN, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "grant_type=refresh_token&client_id=" + encodeURIComponent(MM_OIDC_CLIENT) +
+          "&refresh_token=" + encodeURIComponent(rt)
+  }).then(function (r) { return r.json(); }).then(function (tok) {
+    if (!tok.access_token) { return; }
+    if (tok.refresh_token) {
+      try { localStorage.setItem("mm_rt", tok.refresh_token); } catch (e) { /* 同上 */ }
+    }
+    $("mm-token").value = tok.access_token;
+    $("mm-save").click();
+    toast("墨墨令牌已自动续期并同步到设备", "ok");
+  }).catch(function () { /* 离线或墨墨不可达：下次打开再试 */ });
+})();
 
 $("dev-static-ip-set").addEventListener("click", function () {
   var value = $("dev-static-ip").value.trim();
@@ -2254,6 +2426,14 @@ $("mm-save").addEventListener("click", function () {
 
   var body = { verify: true };
   if (value) { body.token = value; }
+  /* 手动粘贴的是长期令牌（手机 App 的 g_…）：清掉一键流程的标记，防止
+   * 页面打开时的 OIDC 自动续期把长效令牌覆盖成 1 小时的短期令牌。 */
+  if (value) {
+    try {
+      localStorage.removeItem("mm_oidc_on_device");
+      localStorage.removeItem("mm_rt");
+    } catch (e) { /* 隐私模式：没有可清的 */ }
+  }
 
   mmSetBusy("mm-save", true, "校验中…（5–15 秒）", "保存并校验");
   apiSlow("/api/v1/maimemo/config", {
@@ -2289,6 +2469,10 @@ $("mm-clear").addEventListener("click", function () {
     mmRender(state, null);
     $("mm-today-box").hidden = true;   /* 令牌没了，旧词表就别留着了 */
     mmStopPoll();
+    try {
+      localStorage.removeItem("mm_oidc_on_device");
+      localStorage.removeItem("mm_rt");
+    } catch (e) { /* 同上 */ }
     toast("已清除设备上的墨墨令牌", "ok");
   }).catch(function (err) {
     reportError(err, "清除墨墨令牌");
