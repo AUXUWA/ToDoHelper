@@ -254,6 +254,55 @@ esp_err_t weather_read_api_key(char *out, size_t len)
 }
 
 /* ------------------------------------------------------------------------ */
+/* sys_status publication (status bar weather line)                          */
+/* ------------------------------------------------------------------------ */
+
+/** Snapshot handed to weather_status_mutator() through sys_status_update(). */
+typedef struct {
+    weather_data_t data;
+    char city[SYS_STATUS_CITY_LEN];
+} weather_status_pub_t;
+
+static void weather_status_mutator(sys_status_t *st, void *arg)
+{
+    const weather_status_pub_t *pub = (const weather_status_pub_t *)arg;
+    st->weather_valid = pub->data.valid;
+    if (!pub->data.valid) {
+        return;
+    }
+    /* The bar shows the configured city; fall back to the reading's own label. */
+    strlcpy(st->weather_city, pub->city[0] != '\0' ? pub->city : pub->data.city,
+            sizeof(st->weather_city));
+    strlcpy(st->weather_condition, pub->data.condition, sizeof(st->weather_condition));
+    st->weather_temp = pub->data.temp;
+    st->weather_humidity = pub->data.humidity;
+}
+
+/**
+ * @brief Publish the current reading (fresh or cached) into sys_status.
+ *
+ * sys_status is the only sanctioned path for an L3 service to hand state to the
+ * L2 status bar (sys_status.h), which is what puts the city / condition /
+ * temperature / humidity line at the top of every page. Posting here fires
+ * SYS_EVENT_STATUS_CHANGED, so the bar repaints without anyone calling into it.
+ *
+ * Called on every path that changes what that line should show: cache load at
+ * boot, a successful refresh, weather_set_location() and weather_set_city().
+ * Snapshot under s_lock, publish outside it - sys_status_update() takes its own
+ * lock and the mutator must not block.
+ */
+static void weather_publish_status(void)
+{
+    weather_status_pub_t pub = { 0 };
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    pub.data = s_data;
+    strlcpy(pub.city, s_city, sizeof(pub.city));
+    xSemaphoreGive(s_lock);
+
+    (void)sys_status_update(weather_status_mutator, &pub);
+}
+
+/* ------------------------------------------------------------------------ */
 /* NVS persistence                                                           */
 /* ------------------------------------------------------------------------ */
 
@@ -632,6 +681,8 @@ esp_err_t weather_load_cache(void)
     }
     xSemaphoreGive(s_lock);
 
+    weather_publish_status();
+
     SYS_LOGI(TAG, "cache loaded: %s %.1f C '%s'", loaded.city, (double)loaded.temp,
              loaded.condition);
     return ESP_OK;
@@ -672,6 +723,8 @@ esp_err_t weather_set_location(double lat, double lon, const char *label)
         strlcpy(s_city, label, sizeof(s_city));
     }
     xSemaphoreGive(s_lock);
+
+    weather_publish_status();
 
     if (label != NULL && label[0] != '\0') {
         (void)config_set_str_if_changed(SYS_KEY_CITY, s_city);
@@ -845,6 +898,8 @@ static esp_err_t weather_do_refresh(void)
     /* 锁内取一份快照，锁外再写 NVS：s_city 是别的任务也会动的全局缓冲。 */
     strlcpy(resolved, s_city, sizeof(resolved));
     xSemaphoreGive(s_lock);
+
+    weather_publish_status();
 
     /* Remember the resolved place so a later boot can show the right label, and
      * keep the coordinates in NVS for diagnostics/inspection.
@@ -1181,6 +1236,8 @@ esp_err_t weather_set_city(const char *city)
     s_data.lat = 0;
     s_data.lon = 0;
     xSemaphoreGive(s_lock);
+
+    weather_publish_status();
 
     esp_err_t err = config_set_str_if_changed(SYS_KEY_CITY, city);
     SYS_LOGI(TAG, "city set to '%s'", city);

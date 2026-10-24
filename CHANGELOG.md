@@ -12,6 +12,52 @@ NVS 键语义）；**MINOR** = 新增功能或页面；**PATCH** = 修 bug、调
 
 ---
 
+## [1.14.0] — 2026-10-24
+
+**新功能：顶部状态栏显示城市、天气、温度和湿度。** 用户可见的新功能
+（按 `AGENT.md §8.1` 的判据取 **MINOR**）。
+
+### 是什么
+
+状态栏原来是「WiFi + 存储 | 时钟 | 同步状态」三段。现在右侧多了一段：
+
+```
+WiFi -52 dBm  SD          12:34:56          南昌 多云 23°C 湿度60%  已同步
+```
+
+- 内容：**城市**（地理位置）、**天气现象**（晴/多云/雨…，与天气页同一套
+  WMO 代码映射）、**温度**（`%.0f°C`，与天气页同格式）、**湿度**（`湿度%d%%`）。
+- 数据源就是 FR3 的天气读数（Open-Meteo，含缓存降级）：开机先显示缓存值，
+  联网刷新后自动更新；没有读数时（首次开机且无缓存）该段为空，不占位。
+- 天气现象为空（provider 返回未映射代码）时自动省略中间那一段。
+
+### 怎么做的（分层合规）
+
+状态栏在 `ui_core`（L2），按分层规则不能依赖 `weather_service`（L3）。
+走的是工程里唯一认可的 L3→L2 通道（`sys_status.h` 自己写明的约定）：
+
+1. `sys_status_t` 新增 `weather_valid / weather_city / weather_condition /
+   weather_temp / weather_humidity` 五个字段；
+2. `weather_service` 在**四个数据变化点**把快照发布进 `sys_status`
+   （`weather_publish_status()`）：加载缓存、刷新成功、`weather_set_location()`、
+   `weather_set_city()`。锁内取快照、锁外发布，`sys_status_update()` 发出的
+   `SYS_EVENT_STATUS_CHANGED` 会让状态栏自动重绘，UI 侧零轮询；
+3. `ui_statusbar` 右侧改为「天气 + 同步」组合容器（与左 cluster 对称，
+   时钟保持视觉居中），渲染沿用状态栏既有的**脏检查**模式
+   （文本没变就不碰 label，流畅度铁律 AGENT.md §9.0.1.1 第 2 条）。
+
+### Verified
+
+- **离线构建**：`Project build complete.`，`build/todohelper.bin`（3,303,296 B，
+  2026-10-24 14:39）含新代码独有字符串（`湿度%d` 格式串在 ELF 里，防
+  「exit 0 但没构建」）；构建未改写 `dependencies.lock`。
+- **真机**：**本轮未做** —— 烧录时发现 COM34（CP210x，S31 板）已不在枚举里，
+  当前接的是 COM14（一块 ESP32-S3，非本板）与 COM26（CH340，非本板）。
+  板子接回后补：烧录 → 开机日志（0 panic/watchdog、天气模块 ready）→
+  `dsh.sh widgets` 查状态栏天气行 → `device/info` 版本号，然后打 `v1.14.0` tag。
+
+---
+
 ## [1.13.3] — 2026-10-21
 
 **修：AI 的流式回答在屏幕上乱序、回答完气泡变空白。** 修 bug（按 `AGENT.md §8.1`

@@ -6,7 +6,7 @@
 
 /**
  * @file ui_statusbar.c
- * @brief Always-present top bar: WiFi, clock, sync and storage state.
+ * @brief Always-present top bar: WiFi, storage, clock, weather and sync state.
  *
  * The bar is created once by ui_core_init() and never rebuilt on page switch.
  * It only ever reads sys_status_get(), so it has no dependency on the L3
@@ -28,6 +28,7 @@ static lv_obj_t *s_wifi_label;
 static lv_obj_t *s_time_label;
 static lv_obj_t *s_sync_label;
 static lv_obj_t *s_storage_label;
+static lv_obj_t *s_weather_label;
 
 /**
  * Last text painted into each label, so ui_statusbar_refresh() can skip writes
@@ -40,11 +41,28 @@ static lv_obj_t *s_storage_label;
 static char s_wifi_text[32];
 static char s_storage_text[16];
 static char s_sync_text[32];
+static char s_weather_text[96];
 /** Clock: whether the label shows a real time, plus the fields it last showed. */
 static bool s_clock_synced;
 static int s_last_sec = -1;
 static int s_last_min = -1;
 static int s_last_hour = -1;
+
+static lv_obj_t *make_cluster(lv_obj_t *parent)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    if (box == NULL) {
+        return NULL;
+    }
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(box, 18, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
+    return box;
+}
 
 static lv_obj_t *make_group(lv_obj_t *parent, lv_obj_t **out_label)
 {
@@ -89,14 +107,7 @@ lv_obj_t *ui_statusbar_create(lv_obj_t *parent)
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);
 
     /* Left cluster: connectivity + storage */
-    lv_obj_t *left = lv_obj_create(bar);
-    lv_obj_remove_style_all(left);
-    lv_obj_set_size(left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(left, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(left, 18, 0);
-    lv_obj_remove_flag(left, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(left, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *left = make_cluster(bar);
 
     (void)make_group(left, &s_wifi_label);
     (void)make_group(left, &s_storage_label);
@@ -108,8 +119,13 @@ lv_obj_t *ui_statusbar_create(lv_obj_t *parent)
         lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT, 0);
     }
 
-    /* Right cluster: sync state */
-    (void)make_group(bar, &s_sync_label);
+    /* Right cluster: weather (city / condition / temp / humidity) + sync state.
+     * Kept in one container so the clock stays optically centred: the bar's
+     * SPACE_BETWEEN layout distributes direct children, and four of them would
+     * push the clock off centre. */
+    lv_obj_t *right = make_cluster(bar);
+    (void)make_group(right, &s_weather_label);
+    (void)make_group(right, &s_sync_label);
 
     lv_label_set_text(s_time_label, UI_STATUS_TIME_UNSYNCED);
     return bar;
@@ -219,6 +235,29 @@ esp_err_t ui_statusbar_refresh(void)
                 lv_label_set_text(s_time_label, UI_STATUS_TIME_UNSYNCED);
                 lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT_MUTED, 0);
             }
+        }
+    }
+
+    /* ---- Weather (city / condition / temperature / humidity) ---- */
+    if (s_weather_label != NULL) {
+        char text[96];
+        if (st.weather_valid) {
+            /* Temperature format matches page_weather ("%.0f°C"). The condition
+             * can be empty when the provider returned an unmapped code. */
+            if (st.weather_condition[0] != '\0') {
+                snprintf(text, sizeof(text), "%s %s %.0f°C 湿度%d%%",
+                         st.weather_city, st.weather_condition,
+                         (double)st.weather_temp, st.weather_humidity);
+            } else {
+                snprintf(text, sizeof(text), "%s %.0f°C 湿度%d%%",
+                         st.weather_city, (double)st.weather_temp, st.weather_humidity);
+            }
+        } else {
+            text[0] = '\0';
+        }
+        if (strcmp(text, s_weather_text) != 0) {
+            strlcpy(s_weather_text, text, sizeof(s_weather_text));
+            lv_label_set_text(s_weather_label, s_weather_text);
         }
     }
 

@@ -31,6 +31,9 @@ extern "C" {
 
 #define SYS_STATUS_SSID_LEN 33
 #define SYS_STATUS_IP_LEN   16
+/** City / condition strings for the status bar weather line (FR3). */
+#define SYS_STATUS_CITY_LEN      32
+#define SYS_STATUS_CONDITION_LEN 24
 
 typedef struct {
     /* WiFi (FR1) */
@@ -55,6 +58,17 @@ typedef struct {
     /* Storage (FR2/FR3 degradation) */
     bool sd_available;
     bool storage_available;
+
+    /*
+     * Weather (FR3), published by weather_service so the status bar (L2) can
+     * show city / condition / temperature / humidity without depending on the
+     * L3 service. valid is false until the first reading (fresh or cached).
+     */
+    bool weather_valid;
+    char weather_city[SYS_STATUS_CITY_LEN];
+    char weather_condition[SYS_STATUS_CONDITION_LEN];
+    float weather_temp;      /**< degrees Celsius */
+    int weather_humidity;    /**< percent */
 } sys_status_t;
 
 /**
